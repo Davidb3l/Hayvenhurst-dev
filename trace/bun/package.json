@@ -1,0 +1,30 @@
+{
+  "name": "@hayvenhurst/trace-bun",
+  "version": "0.0.4",
+  "private": true,
+  "description": "Bun/Node runtime trace collector for the Hayvenhurst code-intelligence daemon. Captures the V8 CPU-profile call tree, derives caller->callee edges, aggregates in-process, and flushes batches to the daemon.",
+  "license": "MIT",
+  "type": "module",
+  "module": "index.ts",
+  "main": "index.ts",
+  "types": "index.ts",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "bunx tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.5.0"
+  },
+  "keywords": [
+    "hayvenhurst",
+    "trace",
+    "call-graph",
+    "v8",
+    "cpu-profiler",
+    "bun"
+  ]
+}

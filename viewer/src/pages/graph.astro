@@ -1,0 +1,18 @@
+---
+import Base from "~/layouts/Base.astro";
+import GraphView from "~/components/GraphView.tsx";
+
+const url = new URL(Astro.request.url);
+const initial = url.searchParams.get("id") ?? "*";
+---
+<Base title="Graph" current="graph" desc="Interactive code graph for this project.">
+  <h1>Graph</h1>
+  <p class="muted">
+    Drag or one-finger swipe to pan, scroll or pinch to zoom, click a node to
+    inspect, double-click to re-center. Or use the keyboard: arrow keys move
+    between nodes, Enter opens the focused node, Escape clears the selection.
+    Force layout runs locally — no server compute. SVG-only rendering with
+    semantic clustering, viewport culling, and progressive level-of-detail.
+  </p>
+  <GraphView client:only="preact" initialId={initial} />
+</Base>

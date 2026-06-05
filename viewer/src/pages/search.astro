@@ -1,0 +1,21 @@
+---
+import Base from "~/layouts/Base.astro";
+import SearchBox from "~/components/SearchBox.tsx";
+import SearchResults from "~/components/SearchResults.tsx";
+
+// `/search` is a runtime-query page: the static build always runs with q=""
+// (there is no per-query prerender), so the results island must hydrate and
+// read the live `?q=` in the browser. We mount SearchResults with
+// `client:only="preact"` so it is never statically rendered with the empty
+// build-time query — it renders results client-side for `/search?q=foo`
+// regardless of the build. (BL-17 #3.)
+const url = new URL(Astro.request.url);
+const q = url.searchParams.get("q") ?? "";
+---
+<Base title="Search" current="search" desc="Search the code graph.">
+  <h1>Search</h1>
+  <div style="margin-bottom: 18px">
+    <SearchBox client:load initial={q} />
+  </div>
+  <SearchResults client:only="preact" q={q} />
+</Base>

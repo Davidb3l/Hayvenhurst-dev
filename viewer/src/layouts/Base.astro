@@ -1,0 +1,84 @@
+---
+// Base layout used by every page. Keeps HTML payload tiny.
+//
+// - Inlines global CSS via the build config (`inlineStylesheets: "always"`).
+// - Ships exactly one tiny inline script for the theme toggle (no JS island).
+// - No web fonts. System UI stack.
+//
+// Props:
+//   title  — page title
+//   desc   — meta description (optional)
+
+import "~/styles/global.css";
+
+interface Props {
+  title: string;
+  desc?: string;
+  current?: "overview" | "graph" | "claims" | "peers" | "search";
+}
+
+const { title, desc, current } = Astro.props;
+const navItems: ReadonlyArray<{ href: string; label: string; key: Props["current"] }> = [
+  { href: "/", label: "Overview", key: "overview" },
+  { href: "/graph", label: "Graph", key: "graph" },
+  { href: "/search", label: "Search", key: "search" },
+  { href: "/claims", label: "Claims", key: "claims" },
+  { href: "/peers", label: "Peers", key: "peers" },
+];
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title} · Hayvenhurst</title>
+    {desc && <meta name="description" content={desc} />}
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="color-scheme" content="dark light" />
+    <script is:inline>
+      // Theme bootstrap — runs before paint to avoid flash.
+      // 200 bytes is a tax we pay once per page; worth it.
+      (function () {
+        try {
+          var t = localStorage.getItem("hv-theme");
+          if (t === "light") document.documentElement.setAttribute("data-theme", "light");
+        } catch (_) { /* private mode, ignore */ }
+      })();
+    </script>
+  </head>
+  <body>
+    <a class="hv-skip-link" href="#main">Skip to main content</a>
+    <nav class="hv-nav" aria-label="Primary">
+      <a class="brand" href="/"><span class="dot" aria-hidden="true"></span>Hayvenhurst</a>
+      <div class="links">
+        {navItems.map((i) => (
+          <a href={i.href} aria-current={current === i.key ? "page" : undefined}>{i.label}</a>
+        ))}
+      </div>
+      <button class="hv-theme-toggle" id="hv-theme" type="button" aria-label="Toggle theme">theme</button>
+    </nav>
+    <main id="main">
+      <slot />
+    </main>
+    <footer>
+      <span class="mono">hayven</span> &middot; you're not alone.
+    </footer>
+    <script is:inline>
+      (function () {
+        var btn = document.getElementById("hv-theme");
+        if (!btn) return;
+        btn.addEventListener("click", function () {
+          var isLight = document.documentElement.getAttribute("data-theme") === "light";
+          if (isLight) {
+            document.documentElement.removeAttribute("data-theme");
+            try { localStorage.setItem("hv-theme", "dark"); } catch (_) {}
+          } else {
+            document.documentElement.setAttribute("data-theme", "light");
+            try { localStorage.setItem("hv-theme", "light"); } catch (_) {}
+          }
+        });
+      })();
+    </script>
+  </body>
+</html>

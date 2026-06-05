@@ -1,0 +1,3 @@
+# Bun runtime configuration for the Hayvenhurst daemon.
+[install]
+exact = false

@@ -1,0 +1,82 @@
+[package]
+name = "hayven-native"
+version = "0.0.4"
+edition = "2021"
+license = "MIT"
+description = "Native performance companion for the Hayvenhurst daemon"
+
+[[bin]]
+name = "hayven-native"
+path = "src/main.rs"
+
+[lib]
+name = "hayven_native"
+path = "src/lib.rs"
+# `cdylib` lets Bun FFI dlopen the shared library; `rlib` keeps integration
+# tests linkable against the Rust API. Both crate types live in the same
+# `cargo build --release` output.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_bytes = "0.11"
+rayon = "1"
+ignore = "0.4"
+blake3 = "1"
+brotli = "7"
+anyhow = "1"
+thiserror = "1"
+num_cpus = "1"
+
+tree-sitter = "0.25"
+tree-sitter-python = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-go = "0.25"
+
+# Cross-platform file-watching abstraction over inotify (Linux),
+# FSEvents (macOS), and ReadDirectoryChangesW (Windows). Pinned to the
+# last 8.x release; 9.x is RC-only at time of writing and bumps the API.
+# Justification: the alternative is three platform-specific crates plus a
+# threading/select harness — about 2 KLOC of glue that the notify crate
+# has already gotten correct (and tested) since 2014. The §16(9) CPU
+# budget (<0.1% on a 30K-file repo) drives the choice; notify dispatches
+# from the OS-native event source directly, no polling, which is the
+# only shape that meets the budget. We use the default macos_fsevent
+# feature on macOS and the implicit inotify/RDCW backends elsewhere.
+notify = "8"
+
+# Local LLM inference (ARCHITECTURE.md §18). Pure-Rust candle backend for
+# loading a quantized GGUF Gemma model and running the §18.4 `LlmOracle`
+# conflict prompt. CPU backend is the portable default that rides the
+# existing cargo/cross 5-platform matrix (§18.6); Metal/CUDA are opt-in
+# cargo features that are OFF by default so the standard release stays
+# portable and C-toolchain-free.
+candle-core = "0.10"
+candle-transformers = "0.10"
+# The tokenizer is a separate on-disk artifact (`tokenizer.json`) loaded
+# alongside the GGUF weights — candle does not embed it in the GGUF.
+tokenizers = "0.21"
+
+[features]
+default = []
+# `cargo build --release --features metal` selects the Apple Metal GPU
+# backend on macOS. OFF by default (§18.1/§18.6): CI builds the CPU
+# backend for all five platforms and only adds Metal on macOS runners.
+metal = ["candle-core/metal", "candle-transformers/metal"]
+# CUDA is likewise optional and excluded from the default release tarballs.
+cuda = ["candle-core/cuda", "candle-transformers/cuda"]
+
+[dev-dependencies]
+tempfile = "3"
+assert_cmd = "2"
+predicates = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

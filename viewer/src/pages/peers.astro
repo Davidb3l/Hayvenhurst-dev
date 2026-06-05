@@ -1,0 +1,43 @@
+---
+import Base from "~/layouts/Base.astro";
+import { mockStats } from "~/api/mocks";
+
+// `peers` is optional on StatsResponse (the live daemon never sends it); the
+// mock populates it, but default to [] to stay sound.
+const peers = mockStats().peers ?? [];
+---
+<Base title="Peers" current="peers" desc="Sync status with known peers.">
+  <h1>Peers</h1>
+  <p class="muted">
+    Other Hayvenhurst daemons configured to sync with this one. Sync transport and
+    Merkle anti-entropy ship in Week 6.
+  </p>
+  <table style="width:100%; border-collapse:collapse; margin-top:16px">
+    <thead>
+      <tr style="text-align:left">
+        <th style="padding:8px; border-bottom:1px solid var(--border)">Peer</th>
+        <th style="padding:8px; border-bottom:1px solid var(--border)">URL</th>
+        <th style="padding:8px; border-bottom:1px solid var(--border)">Status</th>
+        <th style="padding:8px; border-bottom:1px solid var(--border)">Last sync</th>
+      </tr>
+    </thead>
+    <tbody>
+      {peers.map((p) => (
+        <tr>
+          <td style="padding:8px; border-bottom:1px solid var(--border)" class="mono">{p.id}</td>
+          <td style="padding:8px; border-bottom:1px solid var(--border)"><code>{p.url}</code></td>
+          <td style="padding:8px; border-bottom:1px solid var(--border)">
+            <span class={p.status === "ok" ? "ok" : "error"}>{p.status}</span>
+          </td>
+          <td style="padding:8px; border-bottom:1px solid var(--border)" class="muted">
+            {p.last_sync ? new Date(p.last_sync).toLocaleString() : "—"}
+          </td>
+        </tr>
+      ))}
+    </tbody>
+  </table>
+  <p class="faint" style="margin-top:24px">
+    <strong>Note:</strong> placeholder view. Live peer state lands with the sync
+    transport in Week 6.
+  </p>
+</Base>

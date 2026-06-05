@@ -1,0 +1,252 @@
+name: Release
+
+# Tag-triggered: build both binaries (hayven via bun --compile, hayven-native
+# via cargo) for all 5 supported platforms, bundle into per-platform tarballs,
+# sign with Sigstore, and publish a GitHub Release.
+# Per PRD sections P0.6, P0.7, 4.10.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v0.3.0). Must already exist.'
+        required: true
+
+permissions:
+  contents: write       # create the GitHub Release
+  id-token: write       # required for Sigstore keyless signing
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64-glibc
+            runner: ubuntu-latest
+            rust_target: x86_64-unknown-linux-gnu
+            bun_target: bun-linux-x64
+            use_cross: false
+            native_bin: hayven-native
+            hayven_bin: hayven
+            # CPU-only: no GPU accel feature. CUDA is opt-in local (needs the
+            # CUDA toolkit, absent on GitHub runners) — never enabled in CI.
+            cargo_features: ''
+          - platform: linux-arm64
+            runner: ubuntu-latest
+            rust_target: aarch64-unknown-linux-gnu
+            bun_target: bun-linux-arm64
+            use_cross: true
+            native_bin: hayven-native
+            hayven_bin: hayven
+            cargo_features: ''
+          - platform: macos-x64
+            runner: macos-14
+            rust_target: x86_64-apple-darwin
+            bun_target: bun-darwin-x64
+            use_cross: false
+            native_bin: hayven-native
+            hayven_bin: hayven
+            # Apple targets ship Metal-accelerated candle (ARCHITECTURE.md §18):
+            # both arm64 and x64 macOS support the Metal backend.
+            cargo_features: metal
+          - platform: macos-arm64
+            runner: macos-14
+            rust_target: aarch64-apple-darwin
+            bun_target: bun-darwin-arm64
+            use_cross: false
+            native_bin: hayven-native
+            hayven_bin: hayven
+            cargo_features: metal
+          - platform: windows-x64
+            runner: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            bun_target: bun-windows-x64
+            use_cross: false
+            native_bin: hayven-native.exe
+            hayven_bin: hayven.exe
+            cargo_features: ''
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # If workflow_dispatch, check out the requested tag; otherwise the
+          # tag that triggered the workflow is already the ref.
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Resolve version (strip leading "v")
+        id: version
+        shell: bash
+        run: |
+          ref="${{ inputs.tag || github.ref_name }}"
+          version="${ref#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Releasing version: $version"
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.0
+
+      - name: Setup Rust toolchain (${{ matrix.rust_target }})
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Install cross (Linux ARM64 only)
+        if: matrix.use_cross
+        run: cargo install cross --locked
+
+      # ---- Build hayven (Bun compiled binary) ----
+      - name: Install daemon deps
+        working-directory: daemon
+        run: bun install --frozen-lockfile
+
+      - name: Compile hayven (Bun)
+        working-directory: daemon
+        shell: bash
+        run: |
+          mkdir -p ../dist
+          bun build ./src/cli.ts \
+            --compile \
+            --target=${{ matrix.bun_target }} \
+            --outfile ../dist/${{ matrix.hayven_bin }}
+
+      # ---- Build the viewer (bundled into the tarball so the daemon serves the UI) ----
+      # Static assets, identical across platforms; the daemon resolves viewer/dist
+      # next to the binary at runtime (daemon/src/util/paths.ts::resolveViewerDist).
+      - name: Build viewer
+        shell: bash
+        run: |
+          bun install --frozen-lockfile
+          bun run build:viewer
+
+      # ---- Build hayven-native (Rust release binary) ----
+      # The `--features` flag is added only when matrix.cargo_features is
+      # non-empty, so an empty value omits the flag entirely — `cargo build
+      # --features ""` (or a bare `--features`) is a hard error. Apple targets
+      # pass `metal`; everyone else builds the portable CPU backend (CUDA
+      # stays opt-in local — it needs a toolchain absent on GitHub runners).
+      - name: Build hayven-native (cargo)
+        if: matrix.use_cross == false
+        working-directory: native
+        shell: bash
+        run: |
+          set -euo pipefail
+          features=""
+          if [ -n "${{ matrix.cargo_features }}" ]; then
+            features="--features ${{ matrix.cargo_features }}"
+          fi
+          cargo build --release --target ${{ matrix.rust_target }} $features
+
+      - name: Build hayven-native (cross)
+        if: matrix.use_cross == true
+        working-directory: native
+        shell: bash
+        run: |
+          set -euo pipefail
+          features=""
+          if [ -n "${{ matrix.cargo_features }}" ]; then
+            features="--features ${{ matrix.cargo_features }}"
+          fi
+          cross build --release --target ${{ matrix.rust_target }} $features
+
+      - name: Stage native binary into dist/
+        shell: bash
+        run: |
+          cp "native/target/${{ matrix.rust_target }}/release/${{ matrix.native_bin }}" "dist/${{ matrix.native_bin }}"
+
+      # ---- Bundle the tarball ----
+      - name: Create release tarball
+        id: bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          stage="hayvenhurst-${version}-${{ matrix.platform }}"
+          mkdir -p "$stage"
+          cp "dist/${{ matrix.hayven_bin }}" "$stage/"
+          cp "dist/${{ matrix.native_bin }}" "$stage/"
+          cp LICENSE "$stage/"
+          cp README.md "$stage/"
+          # Bundle the built viewer beside the binary so a tarball install serves
+          # the in-browser UI (resolveViewerDist checks <exeDir>/viewer/dist).
+          mkdir -p "$stage/viewer"
+          cp -R viewer/dist "$stage/viewer/dist"
+          # Bundle the skill source beside the binary so `hayven init` can install
+          # it into ANY user project (resolveSkillSource checks <exeDir>/skill/).
+          mkdir -p "$stage/skill"
+          cp skill/hayvenhurst.md "$stage/skill/hayvenhurst.md"
+          tarball="${stage}.tar.gz"
+          tar -czf "$tarball" "$stage"
+          # Portable SHA-256: macOS/Linux ship `shasum`; the Windows Git-Bash
+          # runner does NOT (it ships coreutils `sha256sum`). The v0.0.2 release
+          # run failed here on windows-x64 with "shasum: command not found"
+          # (exit 127), which blocked the whole Publish job. Prefer whichever
+          # exists so all five platforms produce a checksum.
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "$tarball" > "${tarball}.sha256"
+          else
+            sha256sum "$tarball" > "${tarball}.sha256"
+          fi
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+          echo "checksum=${tarball}.sha256" >> "$GITHUB_OUTPUT"
+
+      # ---- Sign with Sigstore (keyless OIDC) ----
+      - name: Sign tarball with Sigstore
+        uses: sigstore/gh-action-sigstore-python@v3.0.0
+        with:
+          inputs: ${{ steps.bundle.outputs.tarball }}
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.platform }}
+          path: |
+            ${{ steps.bundle.outputs.tarball }}
+            ${{ steps.bundle.outputs.tarball }}.sig
+            ${{ steps.bundle.outputs.tarball }}.sigstore
+            ${{ steps.bundle.outputs.tarball }}.crt
+            ${{ steps.bundle.outputs.checksum }}
+          if-no-files-found: ignore
+          retention-days: 30
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: release-artifacts
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: ${{ inputs.tag || github.ref_name }}
+          # Auto-generate notes from CHANGELOG.md (latest section) and from
+          # commits since the previous tag. softprops uses GitHub's native
+          # generator when `generate_release_notes: true`.
+          generate_release_notes: true
+          # Curated, user-facing notes for this version (not the full CHANGELOG).
+          # Bump this path when cutting a new version (or rename to a generic file).
+          body_path: docs/RELEASE_NOTES_v0.0.4.md
+          files: release-artifacts/*
+          draft: false
+          prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}

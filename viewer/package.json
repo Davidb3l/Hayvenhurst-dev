@@ -1,0 +1,26 @@
+{
+  "name": "@hayvenhurst/viewer",
+  "version": "0.0.4",
+  "private": true,
+  "type": "module",
+  "description": "Astro viewer served by the Hayvenhurst daemon at localhost:7777.",
+  "license": "MIT",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "astro": "astro",
+    "typecheck": "astro check",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@astrojs/preact": "^4.0.5",
+    "astro": "^5.0.0",
+    "preact": "^10.24.0"
+  },
+  "devDependencies": {
+    "@astrojs/check": "^0.9.9",
+    "@types/bun": "^1.1.0",
+    "typescript": "^5.5.0"
+  }
+}

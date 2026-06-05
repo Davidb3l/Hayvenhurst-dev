@@ -1,0 +1,24 @@
+---
+import Base from "~/layouts/Base.astro";
+import Stats from "~/components/Stats.tsx";
+import SearchBox from "~/components/SearchBox.tsx";
+---
+<Base title="Overview" current="overview" desc="Hayvenhurst code intelligence overview.">
+  <p class="term-path rise d1">local code intelligence · <span class="live">daemon live</span></p>
+  <h1 class="rise d1">Overview<span class="term-cursor"></span></h1>
+  <p class="lede rise d2">
+    The local Hayvenhurst daemon maintains a living graph of this codebase. Jump to a node
+    from search, explore connections in the graph, or drive it from the CLI.
+  </p>
+  <div class="rise d2" style="margin: 24px 0 30px">
+    <SearchBox client:load />
+  </div>
+  <Stats client:visible />
+  <h2 class="rise d4">Get started</h2>
+  <ul class="cmds rise d5">
+    <li class="cmd"><code><span class="ps">$</span> hayven query "auth login"</code><span class="desc">semantic search from your shell</span></li>
+    <li class="cmd"><code><span class="ps">$</span> hayven neighbors auth/login_handler --depth 2</code><span class="desc">explore a node</span></li>
+    <li class="cmd"><code><span class="ps">$</span> hayven claim &lt;ids…&gt; --intent "..."</code><span class="desc">coordinate parallel agents</span></li>
+  </ul>
+  <p class="muted rise d6">See <a href="/graph">the graph</a> for a visual overview.</p>
+</Base>

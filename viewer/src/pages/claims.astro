@@ -1,0 +1,40 @@
+---
+import Base from "~/layouts/Base.astro";
+import { mockClaims } from "~/api/mocks";
+
+// Claims page is a placeholder until Week 7 (CRDT OR-Set claim board).
+// We render the mock data at build time so the page is meaningful in the
+// dial-up build without any JS.
+const { claims } = mockClaims();
+---
+<Base title="Claims" current="claims" desc="Active work claims registered with the daemon.">
+  <h1>Claims</h1>
+  <p class="muted">
+    Active claims registered by agents on this codebase. Backed by an OR-Set CRDT
+    (delivered in Week 7).
+  </p>
+  {claims.length === 0 ? (
+    <p class="faint">No active claims.</p>
+  ) : (
+    <ul style="list-style:none; padding:0">
+      {claims.map((c) => (
+        <li class="card" style="margin-bottom:10px">
+          <div><strong>{c.intent}</strong></div>
+          <div class="muted" style="font-size:.88em; margin-top:4px">
+            <span class="tag">{c.agent}</span> ·{" "}
+            <span class="mono">{c.id}</span> · expires {new Date(c.ttl).toLocaleString()}
+          </div>
+          <div style="margin-top:8px">
+            {c.scope.map((s) => (
+              <a href={`/node/${encodeURIComponent(s)}`} class="tag" style="margin-right:6px">{s}</a>
+            ))}
+          </div>
+        </li>
+      ))}
+    </ul>
+  )}
+  <p class="faint" style="margin-top:24px">
+    <strong>Note:</strong> this view is a placeholder driven by mock data. Live claim
+    state lands in Week 7.
+  </p>
+</Base>

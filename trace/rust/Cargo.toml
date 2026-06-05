@@ -1,0 +1,23 @@
+[package]
+name = "hayven-trace"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.75"
+description = "Rust runtime trace collector for the Hayvenhurst code-intelligence daemon. Captures call-graph structure only (via the `tracing` crate), aggregates in-process, and flushes batches to the daemon."
+license = "MIT"
+repository = "https://github.com/anchorsanvils/hayvenhurst"
+keywords = ["tracing", "observability", "call-graph", "code-intelligence"]
+categories = ["development-tools::profiling"]
+
+[dependencies]
+# The whole point of the Rust collector: hook the `tracing` ecosystem.
+# These are the ONLY runtime dependencies — JSON and HTTP are hand-rolled
+# (see README "Dependencies"), mirroring the Python collector's zero-dep
+# discipline (PRD §2.4 "original where it matters").
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
+
+[dev-dependencies]
+# Tests only. `serde_json` is used to PARSE the JSON our hand-rolled encoder
+# emits, proving a round-trip; it never touches the runtime path.
+serde_json = "1"

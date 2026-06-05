@@ -1,0 +1,26 @@
+---
+// Single shell page for /node/<any-id>/. Replaces the previous seed-pre-render
+// + node-shell fallback pattern.
+//
+// In static mode, Astro requires `getStaticPaths` to emit at least one entry
+// per dynamic route. We emit exactly one — the catch-all root — so the build
+// produces a single `/node/index.html` artifact. The daemon serves this file
+// for any path under `/node/`, then the client island reads the id from
+// `window.location.pathname` and fetches from the API.
+//
+// The daemon no longer needs a per-id rewrite or a viewer-supplied seed list;
+// it needs one route fallback: `GET /node/*` → `/node/index.html`. Everything
+// else (id parsing, fetch, render) is client-side.
+import Base from "~/layouts/Base.astro";
+import NodeShell from "~/components/NodeShell.tsx";
+
+export function getStaticPaths() {
+  return [{ params: { id: undefined } }];
+}
+---
+<Base title="Node" current="overview" desc="Code node detail.">
+  <p class="muted">
+    <a href="/">overview</a> / <a href="/graph">graph</a> / node
+  </p>
+  <NodeShell client:only="preact" />
+</Base>

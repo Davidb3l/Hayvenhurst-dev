@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hayven-trace"
+version = "0.0.4"
+description = "Python runtime trace collector for the Hayvenhurst code-intelligence daemon."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Hayvenhurst contributors" }]
+keywords = ["tracing", "profiling", "code-graph", "hayvenhurst"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Software Development :: Debuggers",
+  "Topic :: Software Development :: Libraries",
+]
+# Zero runtime dependencies — we use only the standard library.
+# urllib + json + threading is enough for the daemon POST.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "mypy>=1.6", "ruff>=0.5"]
+
+[project.entry-points.pytest11]
+hayven_trace = "hayven_trace.pytest_plugin"
+
+[project.urls]
+Homepage = "https://github.com/Davidb3l/hayvenhurst"
+Issues = "https://github.com/Davidb3l/hayvenhurst/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hayven_trace"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/hayven_trace", "tests", "README.md", "pyproject.toml"]
+
+[tool.mypy]
+strict = true
+files = ["src/hayven_trace", "tests"]
+python_version = "3.10"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q -ra"

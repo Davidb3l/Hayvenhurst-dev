@@ -1,0 +1,137 @@
+name: CI
+
+# Lint, type-check, and unit-test both halves of the project on every push to
+# main and on every pull request. Per PRD section P0.7.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref to save Actions minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  daemon:
+    name: Daemon (Bun / TypeScript)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: daemon
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.0
+
+      # The daemon's binary-gated suites (sync/merkle/claims/node-body/infer real
+      # path) need the native binary; without it those tests fail (not skip).
+      # Build it + point HAYVEN_NATIVE_BIN at it so the daemon suite runs in full.
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build artifacts
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            native/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('native/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build hayven-native
+        working-directory: native
+        run: cargo build --release
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Type-check (tsc — the TS lint gate)
+        run: bun run typecheck
+
+      - name: Unit tests
+        run: bun test
+        env:
+          HAYVEN_NATIVE_BIN: ${{ github.workspace }}/native/target/release/hayven-native
+
+  native:
+    name: hayven-native (Rust)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: native
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry & build artifacts
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            native/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('native/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (warnings = errors)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Unit tests
+        # Named targets, NOT `--all`/bare `--release`: the long-lived `watch`
+        # integration test is #[ignore]'d, but staying explicit keeps CI from ever
+        # hanging on a future long-lived test. (See CLAUDE.md "Dev gotchas".)
+        run: cargo test --release --lib --bin hayven-native --test infer --test parse_python --test stubs
+
+  dco:
+    name: DCO sign-off check
+    runs-on: ubuntu-latest
+    # Only meaningful on PRs (commits to main already merged a DCO-passing PR).
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout (with full history)
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Verify Signed-off-by on every commit
+        # Roll-our-own DCO check: every commit between the PR base and HEAD
+        # must contain a "Signed-off-by: Name <email>" trailer.
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for sha in $(git rev-list "$BASE_SHA".."$HEAD_SHA"); do
+            if ! git log -1 --format=%B "$sha" | grep -qE '^Signed-off-by: .+ <.+@.+>'; then
+              echo "::error::Commit $sha is missing a Signed-off-by trailer."
+              echo "  Subject: $(git log -1 --format=%s "$sha")"
+              missing=$((missing + 1))
+            fi
+          done
+          if [ "$missing" -gt 0 ]; then
+            echo "::error::$missing commit(s) without DCO sign-off. Run 'git commit --amend -s' (or rebase with -s) and force-push."
+            exit 1
+          fi
+          echo "All commits carry a Signed-off-by trailer."

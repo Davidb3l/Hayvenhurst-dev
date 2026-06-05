@@ -1,0 +1,31 @@
+{
+  "name": "@hayvenhurst/daemon",
+  "version": "0.0.4",
+  "private": true,
+  "description": "Hayvenhurst Bun daemon and `hayven` CLI.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "hayven": "./src/cli.ts",
+    "hayvend": "./src/cli.ts"
+  },
+  "scripts": {
+    "start": "bun run src/cli.ts",
+    "dev": "bun --hot run src/cli.ts daemon start",
+    "test": "bun test",
+    "typecheck": "bun tsc --noEmit",
+    "build": "bun build --compile --target=bun --outfile dist/hayven src/cli.ts"
+  },
+  "dependencies": {
+    "elysia": "^1.1.0",
+    "@noble/hashes": "^1.5.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "fast-check": "^3.22.0",
+    "typescript": "^5.5.0"
+  },
+  "peerDependencies": {
+    "typescript": "^5.5.0"
+  }
+}
