@@ -1,153 +1,166 @@
+<div align="center">
+
 # Hayvenhurst
 
-![version](https://img.shields.io/badge/version-0.0.4-blue) ![license](https://img.shields.io/badge/license-MIT-green) ![index](https://img.shields.io/badge/index-embedding--free-orange) ![setup](https://img.shields.io/badge/setup-zero--config-brightgreen) ![languages](https://img.shields.io/badge/languages-Python%20·%20TS%20·%20JS%20·%20Rust%20·%20Go-lightgrey)
+### Know which tests a change can break — before you run a single one.
 
-**The fastest way to keep an always-fresh, private structural index of a codebase — no model, no embeddings, no setup.**
+Open-source code intelligence for AI coding agents. Hayvenhurst keeps a **live structural graph** of your codebase — every function, class, call, and import, plus what actually runs at runtime — and puts it to work answering the questions grep can't.
 
-Hayvenhurst indexes your code into a structural graph (entities + call/import edges + runtime trace coverage) with a Tree-sitter parser and SQLite. There is **no embedding model, no GPU, no vector database, and nothing leaves your machine** — which makes the index *sub-second cold, instant on a cached branch, and trivially private*. It's the [Bun](https://bun.sh) approach (win on speed + zero-config), applied to code indexing.
+[![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+![status](https://img.shields.io/badge/status-pre--release%20(0.x)-orange)
+![languages](https://img.shields.io/badge/languages-Python%20·%20TS%20·%20JS%20·%20Rust%20·%20Go-blue)
+![runtime deps](https://img.shields.io/badge/runtime%20deps-0-brightgreen)
+![engine](https://img.shields.io/badge/engine-Rust%20+%20SQLite-lightgrey)
 
-## Why it's different (measured, reproducible)
+[Site](https://hayvenhurst.dev) · [Quickstart](docs/QUICKSTART.md) · [Why Hayvenhurst](docs/WHY_HAYVENHURST.md) · [Integration](docs/INTEGRATION.md) · [Architecture](ARCHITECTURE.md)
 
-Every number below comes from a committed harness ([`bench/`](bench/)), re-verified cross-language on the current build.
+</div>
 
-| | **Hayvenhurst** | Embedding-based indexer (`cocoindex-code`) |
-|---|---|---|
-| Cold index (gin, Go) | **0.23 s** | — |
-| Cold index (hono, 362 files) | **0.65 s** | 35.6 s (embeds 3,543 chunks) |
-| Cold index (fastapi, 1,120 files) | **1.6 s** | 260 s (embeds the repo) |
-| Branch switch (re-parse only the `git diff`) | **~50–150 ms** | re-syncs + re-embeds every switch |
-| Revisit a previously-seen branch | **1 ms** (cached) | 0.41 s |
-| Retrieval coverage on novel symptom queries | **3 / 3** | 0 / 3 |
-| Dependencies to run | **none** (Rust binary + SQLite) | model + torch + a vector store |
+---
 
-Because the index is **embedding-free**, building it is a parse plus a SQLite write — no model-inference tax on every index or branch diff. The asymmetry is architectural, not a tuning gap: an embedding-based indexer *must* re-embed (so the cost grows with the repo — note the gap widening from gin → hono → fastapi), while a parse-and-write index stays sub-second and caches per branch.
+## What grep can't answer
 
-### Reproduce the wedge in 60 seconds
+Grep finds text. It can't tell you **which tests a change can actually break**, **what the minimal slice of code an agent needs to understand a symbol is**, or **whether two agents editing the same repo are about to collide**. Those are structural questions, and answering them means holding a graph of the code — not a bag of lines.
+
+Hayvenhurst holds that graph. One Rust binary parses your code into entities and call/import edges, augments it with runtime trace coverage, and stores it in SQLite — with plain markdown in `.hayven/` as the source of truth. No embedding model, no GPU, no vector database, and nothing leaves your machine. That last part is a supporting property, not the pitch. The pitch is the four things the graph lets you do.
+
+---
+
+## 1 · Run only the tests a change can break
+
+`hayven affected-tests <symbol>` fuses the static call graph with **runtime traces** — what your code actually did when it ran — to select just the tests a change can reach. Static analysis alone misses tests reached through dynamic dispatch entirely; the trace-augmented map catches them.
 
 ```sh
-export HAYVEN_NATIVE_BIN="$PWD/native/target/release/hayven-native"
-git clone --depth 50 https://github.com/honojs/hono /tmp/hv-switch
-bun bench/branch-switch-cost.ts /tmp/hv-switch 3      # cold-index + branch-switch timings on a real repo
+hayven affected-tests session/validate
+# SAFE tier → 14 of 412 tests could break
 ```
 
-…which prints, on a real machine (hono, 362 files):
+> **Measured:** SAFE tier = **0 missed regressions across ~95 replayed real bugs on 4 repos**; trace recall **1.00** vs static ≈ 0. Python (pytest) and TypeScript (vitest, bun test). Add `--order` for fail-fast (earliest-fault-detection) test ordering.
+
+## 2 · Hand agents precise slices, not whole files
+
+`hayven context <symbol>` returns the minimal graph slice an agent needs — the entity, its real dependencies, line-exact — instead of pasting whole files into the context window. A drop-in proxy applies the same trick to any Anthropic / OpenAI / Gemini traffic, automatically.
+
+```sh
+hayven context session/validate
+```
+
+> **Measured:** **78.8% fewer input tokens** over a 24-turn agent loop, live-measured, with zero task failures.
+
+## 3 · Run parallel agents without collisions
+
+An **entity-scoped claim board** lets a fleet of agents edit one repo safely. Claims are scoped to entity IDs, not files — so two agents can work different functions in the same file, and work that would break another agent's assumptions is flagged *before* it lands.
+
+```sh
+hayven claim session/validate --intent "tighten TTL refresh logic"
+```
+
+> **Measured:** realized conflict rate **2.4%** vs ~22% naive — and truly-independent work is never blocked.
+
+## 4 · Always fresh, nothing to babysit
+
+A native file watcher re-parses only what changed, so the index never goes stale. Each branch caches its own index — switching back is instant and never re-embeds. Peers reconcile without a central server via CRDTs and Merkle anti-entropy. Your code never leaves the box.
+
+> **Measured:** watcher idle CPU **≤ 0.0081%** on 30K files · daemon RSS **~43 MB** · a representative day of peer sync **~5.6 KB** on the wire. Runs on a **$599 Mac mini** — or a Raspberry Pi.
+
+---
+
+## Speed, measured (not marketed)
+
+Every number below traces to a committed harness in [`bench/`](bench/). Reproduce them yourself.
+
+| | Hayvenhurst |
+|---|---|
+| Cold index — hono (362 files, 2,185 entities, 7,250 edges) | **0.65 s** |
+| Cold index — gin (Go) | **0.23 s** |
+| Cold index — django (2,967 files) | **10.6 s** |
+| Cold index — kibana (93,923 files) | **5.4 min · 3.8 GB RAM** — linear |
+| Query latency at 334k entities | **0.27 s** |
+| Branch switch (re-parse only the `git diff`) | **~48 ms** |
+| Revisit a previously-seen branch (cached) | **1 ms** |
+
+Because the index is embedding-free, building it is a parse plus a SQLite write — no model-inference tax on every index or branch diff. That's an architectural asymmetry, not a tuning gap.
+
+---
+
+## Quickstart
+
+Pre-release (`0.x`) — you build from source. There is no binary release on this repo yet.
+
+**Prerequisites:** [Bun](https://bun.sh) 1.3+ and a Rust toolchain ([rustup](https://rustup.rs/)).
+
+```sh
+git clone https://github.com/Davidb3l/Hayvenhurst-dev
+cd Hayvenhurst-dev
+
+bun install
+( cd native && cargo build --release )        # → native/target/release/hayven-native
+bun run build:viewer                           # → viewer/dist/ (so the daemon can serve the UI)
+```
+
+Run the CLI straight from source (`hayven` below stands for `bun daemon/src/cli.ts`, or the compiled `daemon/dist/hayven` after `bun run build:daemon`):
+
+```sh
+hayven doctor                                  # check Bun, native binary, FTS5, hardware
+```
+
+Then, in the project you want to index:
+
+```sh
+hayven init                                    # build the index (.hayven/ + first ingest)
+hayven query "session validation"              # full-text search over the graph
+hayven affected-tests session/validate         # tests a change to this symbol can break
+hayven context session/validate                # minimal precise slice for an agent
+
+hayven daemon start                            # serve the HTTP API + graph viewer on :7777
+hayven view                                    # open the viewer in your browser
+```
+
+Full walkthrough — including the multi-agent conflict-defense flow — in [`docs/QUICKSTART.md`](docs/QUICKSTART.md).
+
+### Install into Claude Code
+
+In Claude Code, add the marketplace and install the plugin — it ships the first-party Skill so the agent reaches for `hayven` instead of grepping:
 
 ```text
-──────── summary ────────
-cold full ingest (base):       673 ms
-full ingest WITHOUT seeding:   616 ms   (a whole-tree re-index per switch)
-seed + diff (cheap switch):     47 ms   (92% cheaper than a full re-index)
-revisit read (cached index):     0 ms   (100% cheaper — no ingest at all)
+/plugin marketplace add Davidb3l/Hayvenhurst-dev
+/plugin install hayvenhurst@hayvenhurst
 ```
 
-## Who it's for
+---
 
-Hayvenhurst is infrastructure for **builders of AI-coding and code-intelligence tools** — agents, IDEs, PR bots, CI — that need fast, private, always-fresh structural code context as a component, without paying an embedding tax on every repo / branch / worktree. (For an interactive developer typing one-off searches, `grep` is fine — that is not the wedge. We win on speed, freshness, and privacy, not on retrieval *quality*: embeddings still beat us on fuzzy semantic recall.)
+## Architecture
 
-It runs on a $599 Mac mini, costs nothing if you already have the hardware, and plugs into Claude Code through a first-party Skill.
-
-## Status
-
-**Pre-release (`0.x`).** Expect breaking changes in every `0.x` release until v1.0. The indexer, file watcher, per-branch caching, runtime trace collectors, HTTP API, viewer, and CRDT peer-sync all ship. What remains for v1.0 is the cross-platform binary release and broader real-world validation. See [`CHANGELOG.md`](CHANGELOG.md) and [`ARCHITECTURE.md`](ARCHITECTURE.md) for specifics.
-
-## What it does
-
-- **Indexes your code into a graph — fast, embedding-free.** Tree-sitter parses five languages (Python, TypeScript, JavaScript, Rust, Go) into entities (functions, classes, modules) and edges (calls, imports) and writes a SQLite index. Sub-second cold, no model, no GPU, no vector store.
-- **Stays fresh automatically.** A native file watcher re-parses only what changed, so the index never goes stale — and a per-branch cache makes switching branches a millisecond read instead of a full re-index (and never a re-embed).
-- **Augments structure with runtime traces.** Five-language collectors capture call-graph structure only (never argument or return values) and feed observed edges + per-test coverage back into the graph.
-- **Exposes structured access for the tools you build on it.** A CLI and HTTP API answer "what calls X", "what does X depend on", "which tests exercise X", and return graph-precise context slices — so an agent/IDE/bot consumes structure instead of re-reading whole files.
-- **Coordinates and syncs without a server.** An entity-scoped claim board lets parallel agents edit safely; every daemon is a peer, reconciling state via Merkle anti-entropy over plain HTTP (~5.6 KB for a representative day).
-- **Visualizes the graph.** An Astro viewer (SVG-only, level-of-detail force layout) served at `localhost:7777`.
-
-## Architecture at a glance
+The graph's source of truth is human-readable markdown in `.hayven/`; SQLite is a rebuildable index on top. One Rust binary does the parsing, watching, and inference; a Bun daemon serves the API, holds CRDT state, and runs the conflict defense.
 
 ```
             ┌─────────────────────────────────────────────┐
             │                hayvend (Bun)                 │
-   agents   │  CLI  ·  HTTP API  ·  CRDT state  ·  oracle  │
-  ───────►  │  SQLite index (FTS5)   .hayven/ markdown SoT │ ◄── peers
-   query    │  conflict defense (A/B/C)   model strata     │     (sync)
-  /claim    └───────┬──────────────────┬───────────────┬───┘
+   agents   │  CLI · HTTP API · CRDT state · claim board   │
+  ───────►  │  SQLite index (FTS5) · .hayven/ markdown SoT │ ◄── peers
+   query    └───────┬──────────────────┬───────────────┬───┘     (sync)
                     │                  │               │
-            hayven-native (Rust)   Astro viewer   hayven-trace (Python)
-            parse · watch ·        localhost:7777  sys.settrace →
-            serialize · infer                      /api/traces/observations
+            hayven-native (Rust)   graph viewer    trace collectors
+            parse · watch · infer  localhost:7777   runtime call edges
 ```
 
 | Component | Stack | Role |
 |-----------|-------|------|
-| `daemon/` | Bun + TypeScript (`hayvend`) | CLI, HTTP API, CRDT runtime, SQLite index, conflict defense, model lifecycle |
-| `native/` | Rust (`hayven-native`) | `parse`, `watch`, `serialize`, `infer` — companion binary over an NDJSON subprocess protocol |
-| `viewer/` | Astro 5 + Preact | SVG-only graph viewer with level-of-detail; served at `localhost:7777` |
-| `trace/python/` | Python (`hayven_trace`) | runtime call-graph collector (stdlib-only) |
-| `skill/` | Markdown | first-party Claude Skill |
+| `daemon/` | Bun + TypeScript (`hayvend`) | CLI, HTTP API, CRDT runtime, SQLite index, conflict defense |
+| `native/` | Rust (`hayven-native`) | `parse`, `watch`, `serialize`, `infer` — over an NDJSON subprocess protocol |
+| `viewer/` | Astro 5 + Preact | SVG-only, level-of-detail graph viewer at `localhost:7777` |
+| `trace/` | Python + JS/TS | runtime call-graph collectors (structure only — never argument or return values) |
+| `skill/`, `plugin/` | Markdown | first-party Claude Code Skill + plugin |
 
-The markdown in `.hayven/nodes/` is the source of truth; the SQLite database is a derived index you can drop and rebuild with `hayven reindex`. Design commitments and their rationale are recorded in [`ARCHITECTURE.md`](ARCHITECTURE.md).
+Design commitments and their rationale are recorded in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
-## Install / build
+**Languages:** Python · TypeScript · JavaScript · Rust · Go — plus pnpm / yarn monorepos.
 
-Install scripts and prebuilt tarballs land closer to v1.0. Until then, build from source. You will need:
-
-- [Bun](https://bun.sh) 1.3 or newer
-- A Rust toolchain (install via [rustup](https://rustup.rs/))
-
-```sh
-git clone https://github.com/Davidb3l/Hayvenhurst-dev
-cd hayvenhurst
-
-bun install                                   # workspace deps
-( cd native && cargo build --release )        # → native/target/release/hayven-native
-bun run build:viewer                          # → viewer/dist/ (so the daemon can serve the UI)
-```
-
-Run `hayven` straight from source with Bun:
-
-```sh
-bun daemon/src/cli.ts doctor                  # check Bun, native binary, FTS5, model strata
-```
-
-If you build the compiled daemon binary, the same CLI is available as a single executable:
-
-```sh
-bun run build:daemon                          # → daemon/dist/hayven
-daemon/dist/hayven doctor
-```
-
-In the quickstart below, `hayven` stands for whichever you use (`bun daemon/src/cli.ts` or the compiled `dist/hayven`).
-
-## 60-second quickstart
-
-```sh
-# 1. In your project, build the index (creates .hayven/ + first ingest)
-hayven init
-
-# 2. Search the graph
-hayven query "session validation"
-
-# 3. Walk the graph around an entity (use an id from the query output)
-hayven neighbors auth/session/validate --depth 2
-
-# 4. Start the daemon — serves the API + viewer on localhost:7777
-hayven daemon start &
-
-# 5. Open the viewer, or hit the API
-hayven view
-curl -s http://localhost:7777/api/health
-```
-
-Full walkthrough — including the multi-agent conflict-defense flow — is in [`docs/QUICKSTART.md`](docs/QUICKSTART.md).
-
-## Documentation
-
-- [`docs/QUICKSTART.md`](docs/QUICKSTART.md) — hands-on getting started: init, query, daemon, viewer, the conflict-defense flow.
-- [`docs/INTEGRATION.md`](docs/INTEGRATION.md) — how an AI coding agent integrates: the Skill, the CLI, the HTTP API, and the trace collector.
-- [`docs/WHY_HAYVENHURST.md`](docs/WHY_HAYVENHURST.md) — the design argument: why a CRDT-backed distributed graph with a local conflict oracle, and what we deliberately built ourselves.
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) — locked design commitments and contracts.
-- [`docs/DESIGN_LESSONS.md`](docs/DESIGN_LESSONS.md) — patterns distilled from real bugs found in this repo.
+---
 
 ## Philosophy
 
-Five principles, in priority order. When they conflict, earlier wins.
+Five principles, in priority order. When they conflict, the earlier one wins.
 
 1. **Egalitarian by hardware tier** — useful on a Raspberry Pi and on a 4090. Nobody is locked out.
 2. **Data-efficiency first** — every byte on the wire must justify itself. Dial-up before fiber.
@@ -157,18 +170,29 @@ Five principles, in priority order. When they conflict, earlier wins.
 
 The longer argument — and the list of dependencies we deliberately said no to — is in [`docs/WHY_HAYVENHURST.md`](docs/WHY_HAYVENHURST.md).
 
-## License
+---
 
-MIT — see [LICENSE](LICENSE). All runtime dependencies across the daemon, native binary, and viewer are permissive (MIT/Apache-2.0/BSD/ISC/CC0/Zlib/Unicode-3.0); see `CHANGELOG.md` for the one transitive build-time advisory being tracked.
+## Status
 
-## Security
+**Pre-release (`0.x`).** Expect breaking changes in every `0.x` release until v1.0. The indexer, file watcher, per-branch caching, runtime trace collectors, `affected-tests`, `context`, the claim board, HTTP API, viewer, and CRDT peer sync all ship. What remains for v1.0 is broader real-world validation and a cross-platform binary release. See [`CHANGELOG.md`](CHANGELOG.md).
 
-Please report vulnerabilities to `dev@hayvenhurst.dev`. See [SECURITY.md](SECURITY.md) for the disclosure process and the signing key.
+## Documentation
 
-## Contributing
+- [`docs/QUICKSTART.md`](docs/QUICKSTART.md) — hands-on: init, query, affected-tests, daemon, viewer, the conflict-defense flow.
+- [`docs/WHY_HAYVENHURST.md`](docs/WHY_HAYVENHURST.md) — the design argument: why a CRDT-backed distributed graph with a local conflict oracle.
+- [`docs/INTEGRATION.md`](docs/INTEGRATION.md) — wiring an AI agent in: the Skill, the CLI, the HTTP API, and the trace collector.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — locked design commitments and contracts.
 
-Hayvenhurst uses [DCO](https://developercertificate.org/). Every commit must be signed off with `git commit -s`. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full process.
+## License & contact
+
+MIT — see [LICENSE](LICENSE). All runtime dependencies across the daemon, native binary, and viewer are permissive (MIT/Apache-2.0/BSD/ISC/CC0/Zlib/Unicode-3.0).
+
+- **Site:** [hayvenhurst.dev](https://hayvenhurst.dev)
+- **Security & contact:** [`dev@hayvenhurst.dev`](mailto:dev@hayvenhurst.dev) — see [SECURITY.md](SECURITY.md).
+- **Contributing:** signed-off commits (`git commit -s`, [DCO](https://developercertificate.org/)) — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 
-*Named after Michael Jackson's family home in Encino, California. In honor of his contribution to the world — bringing light to overlooked places, fighting bad-faith systems, lifting up those without resources. This project is a small drop in that ocean.*
+<div align="center">
+<em>Named after Michael Jackson's family home in Encino, California — in honor of bringing light to overlooked places. This project is a small drop in that ocean.</em>
+</div>
