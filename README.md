@@ -2,9 +2,9 @@
 
 # Hayvenhurst
 
-### Know which tests a change can break — before you run a single one.
+### Know which tests a change can break, before you run a single one.
 
-Open-source code intelligence for AI coding agents. Hayvenhurst keeps a **live structural graph** of your codebase — every function, class, call, and import, plus what actually runs at runtime — and puts it to work answering the questions grep can't.
+Open-source code intelligence for AI coding agents. Hayvenhurst keeps a **live structural graph** of your codebase (every function, class, call, and import, plus what actually runs at runtime) and puts it to work answering the questions grep can't.
 
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 ![status](https://img.shields.io/badge/status-pre--release%20(0.x)-orange)
@@ -20,15 +20,15 @@ Open-source code intelligence for AI coding agents. Hayvenhurst keeps a **live s
 
 ## What grep can't answer
 
-Grep finds text. It can't tell you **which tests a change can actually break**, **what the minimal slice of code an agent needs to understand a symbol is**, or **whether two agents editing the same repo are about to collide**. Those are structural questions, and answering them means holding a graph of the code — not a bag of lines.
+Grep finds text. It can't tell you **which tests a change can actually break**, **what the minimal slice of code an agent needs to understand a symbol is**, or **whether two agents editing the same repo are about to collide**. Those are structural questions, and answering them means holding a graph of the code, not a bag of lines.
 
-Hayvenhurst holds that graph. One Rust binary parses your code into entities and call/import edges, augments it with runtime trace coverage, and stores it in SQLite — with plain markdown in `.hayven/` as the source of truth. No embedding model, no GPU, no vector database, and nothing leaves your machine. That last part is a supporting property, not the pitch. The pitch is the four things the graph lets you do.
+Hayvenhurst holds that graph. One Rust binary parses your code into entities and call/import edges, augments it with runtime trace coverage, and stores it in SQLite, with plain markdown in `.hayven/` as the source of truth. No embedding model, no GPU, no vector database, and nothing leaves your machine. That last part is a supporting property, not the pitch. The pitch is the four things the graph lets you do.
 
 ---
 
 ## 1 · Run only the tests a change can break
 
-`hayven affected-tests <symbol>` fuses the static call graph with **runtime traces** — what your code actually did when it ran — to select just the tests a change can reach. Static analysis alone misses tests reached through dynamic dispatch entirely; the trace-augmented map catches them.
+`hayven affected-tests <symbol>` fuses the static call graph with **runtime traces** (what your code actually did when it ran) to select just the tests a change can reach. Static analysis alone misses tests reached through dynamic dispatch entirely; the trace-augmented map catches them.
 
 ```sh
 hayven affected-tests session/validate
@@ -39,7 +39,7 @@ hayven affected-tests session/validate
 
 ## 2 · Hand agents precise slices, not whole files
 
-`hayven context <symbol>` returns the minimal graph slice an agent needs — the entity, its real dependencies, line-exact — instead of pasting whole files into the context window. A drop-in proxy applies the same trick to any Anthropic / OpenAI / Gemini traffic, automatically.
+`hayven context <symbol>` returns the minimal graph slice an agent needs (the entity, its real dependencies, line-exact) instead of pasting whole files into the context window. A drop-in proxy applies the same trick to any Anthropic / OpenAI / Gemini traffic, automatically.
 
 ```sh
 hayven context session/validate
@@ -49,19 +49,19 @@ hayven context session/validate
 
 ## 3 · Run parallel agents without collisions
 
-An **entity-scoped claim board** lets a fleet of agents edit one repo safely. Claims are scoped to entity IDs, not files — so two agents can work different functions in the same file, and work that would break another agent's assumptions is flagged *before* it lands.
+An **entity-scoped claim board** lets a fleet of agents edit one repo safely. Claims are scoped to entity IDs, not files, so two agents can work different functions in the same file, and work that would break another agent's assumptions is flagged *before* it lands.
 
 ```sh
 hayven claim session/validate --intent "tighten TTL refresh logic"
 ```
 
-> **Measured:** realized conflict rate **2.4%** vs ~22% naive — and truly-independent work is never blocked.
+> **Measured:** realized conflict rate **2.4%** vs ~22% naive, and truly-independent work is never blocked.
 
 ## 4 · Always fresh, nothing to babysit
 
-A native file watcher re-parses only what changed, so the index never goes stale. Each branch caches its own index — switching back is instant and never re-embeds. Peers reconcile without a central server via CRDTs and Merkle anti-entropy. Your code never leaves the box.
+A native file watcher re-parses only what changed, so the index never goes stale. Each branch caches its own index, so switching back is instant and never re-embeds. Peers reconcile without a central server via CRDTs and Merkle anti-entropy. Your code never leaves the box.
 
-> **Measured:** watcher idle CPU **≤ 0.0081%** on 30K files · daemon RSS **~43 MB** · a representative day of peer sync **~5.6 KB** on the wire. Runs on a **$599 Mac mini** — or a Raspberry Pi.
+> **Measured:** watcher idle CPU **≤ 0.0081%** on 30K files · daemon RSS **~43 MB** · a representative day of peer sync **~5.6 KB** on the wire. Runs on a **$599 Mac mini**, or a Raspberry Pi.
 
 ---
 
@@ -71,21 +71,21 @@ Every number below traces to a committed harness in [`bench/`](bench/). Reproduc
 
 | | Hayvenhurst |
 |---|---|
-| Cold index — hono (362 files, 2,185 entities, 7,250 edges) | **0.65 s** |
-| Cold index — gin (Go) | **0.23 s** |
-| Cold index — django (2,967 files) | **10.6 s** |
-| Cold index — kibana (93,923 files) | **5.4 min · 3.8 GB RAM** — linear |
+| Cold index: hono (362 files, 2,185 entities, 7,250 edges) | **0.65 s** |
+| Cold index: gin (Go) | **0.23 s** |
+| Cold index: django (2,967 files) | **10.6 s** |
+| Cold index: kibana (93,923 files) | **5.4 min · 3.8 GB RAM** (linear) |
 | Query latency at 334k entities | **0.27 s** |
 | Branch switch (re-parse only the `git diff`) | **~48 ms** |
 | Revisit a previously-seen branch (cached) | **1 ms** |
 
-Because the index is embedding-free, building it is a parse plus a SQLite write — no model-inference tax on every index or branch diff. That's an architectural asymmetry, not a tuning gap.
+Because the index is embedding-free, building it is a parse plus a SQLite write, with no model-inference tax on every index or branch diff. That's an architectural asymmetry, not a tuning gap.
 
 ---
 
 ## Quickstart
 
-Pre-release (`0.x`) — you build from source. There is no binary release on this repo yet.
+Pre-release (`0.x`): you build from source. There is no binary release on this repo yet.
 
 **Prerequisites:** [Bun](https://bun.sh) 1.3+ and a Rust toolchain ([rustup](https://rustup.rs/)).
 
@@ -116,11 +116,11 @@ hayven daemon start                            # serve the HTTP API + graph view
 hayven view                                    # open the viewer in your browser
 ```
 
-Full walkthrough — including the multi-agent conflict-defense flow — in [`docs/QUICKSTART.md`](docs/QUICKSTART.md).
+Full walkthrough, including the multi-agent conflict-defense flow, in [`docs/QUICKSTART.md`](docs/QUICKSTART.md).
 
 ### Install into Claude Code
 
-In Claude Code, add the marketplace and install the plugin — it ships the first-party Skill so the agent reaches for `hayven` instead of grepping:
+In Claude Code, add the marketplace and install the plugin. It ships the first-party Skill so the agent reaches for `hayven` instead of grepping:
 
 ```text
 /plugin marketplace add Davidb3l/Hayvenhurst-dev
@@ -147,14 +147,14 @@ The graph's source of truth is human-readable markdown in `.hayven/`; SQLite is 
 | Component | Stack | Role |
 |-----------|-------|------|
 | `daemon/` | Bun + TypeScript (`hayvend`) | CLI, HTTP API, CRDT runtime, SQLite index, conflict defense |
-| `native/` | Rust (`hayven-native`) | `parse`, `watch`, `serialize`, `infer` — over an NDJSON subprocess protocol |
+| `native/` | Rust (`hayven-native`) | `parse`, `watch`, `serialize`, `infer`, over an NDJSON subprocess protocol |
 | `viewer/` | Astro 5 + Preact | SVG-only, level-of-detail graph viewer at `localhost:7777` |
-| `trace/` | Python + JS/TS | runtime call-graph collectors (structure only — never argument or return values) |
+| `trace/` | Python + JS/TS | runtime call-graph collectors (structure only, never argument or return values) |
 | `skill/`, `plugin/` | Markdown | first-party Claude Code Skill + plugin |
 
 Design commitments and their rationale are recorded in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
-**Languages:** Python · TypeScript · JavaScript · Rust · Go — plus pnpm / yarn monorepos.
+**Languages:** Python · TypeScript · JavaScript · Rust · Go, plus pnpm / yarn monorepos.
 
 ---
 
@@ -162,13 +162,13 @@ Design commitments and their rationale are recorded in [`ARCHITECTURE.md`](ARCHI
 
 Five principles, in priority order. When they conflict, the earlier one wins.
 
-1. **Egalitarian by hardware tier** — useful on a Raspberry Pi and on a 4090. Nobody is locked out.
-2. **Data-efficiency first** — every byte on the wire must justify itself. Dial-up before fiber.
-3. **Local-first, cloud-optional** — your machine is the primary execution environment.
-4. **Original where it matters, boring where it doesn't** — custom CRDT serializer, off-the-shelf SQLite.
-5. **Distributable, not centralized** — every daemon is potentially a peer.
+1. **Egalitarian by hardware tier**: useful on a Raspberry Pi and on a 4090. Nobody is locked out.
+2. **Data-efficiency first**: every byte on the wire must justify itself. Dial-up before fiber.
+3. **Local-first, cloud-optional**: your machine is the primary execution environment.
+4. **Original where it matters, boring where it doesn't**: custom CRDT serializer, off-the-shelf SQLite.
+5. **Distributable, not centralized**: every daemon is potentially a peer.
 
-The longer argument — and the list of dependencies we deliberately said no to — is in [`docs/WHY_HAYVENHURST.md`](docs/WHY_HAYVENHURST.md).
+The longer argument, and the list of dependencies we deliberately said no to, is in [`docs/WHY_HAYVENHURST.md`](docs/WHY_HAYVENHURST.md).
 
 ---
 
@@ -178,21 +178,21 @@ The longer argument — and the list of dependencies we deliberately said no to 
 
 ## Documentation
 
-- [`docs/QUICKSTART.md`](docs/QUICKSTART.md) — hands-on: init, query, affected-tests, daemon, viewer, the conflict-defense flow.
-- [`docs/WHY_HAYVENHURST.md`](docs/WHY_HAYVENHURST.md) — the design argument: why a CRDT-backed distributed graph with a local conflict oracle.
-- [`docs/INTEGRATION.md`](docs/INTEGRATION.md) — wiring an AI agent in: the Skill, the CLI, the HTTP API, and the trace collector.
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) — locked design commitments and contracts.
+- [`docs/QUICKSTART.md`](docs/QUICKSTART.md): a hands-on walkthrough of init, query, affected-tests, the daemon, the viewer, and the conflict-defense flow.
+- [`docs/WHY_HAYVENHURST.md`](docs/WHY_HAYVENHURST.md): the design argument for a CRDT-backed distributed graph with a local conflict oracle.
+- [`docs/INTEGRATION.md`](docs/INTEGRATION.md): wiring an AI agent in, covering the Skill, the CLI, the HTTP API, and the trace collector.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md): the locked design commitments and contracts.
 
 ## License & contact
 
-MIT — see [LICENSE](LICENSE). All runtime dependencies across the daemon, native binary, and viewer are permissive (MIT/Apache-2.0/BSD/ISC/CC0/Zlib/Unicode-3.0).
+MIT. See [LICENSE](LICENSE). All runtime dependencies across the daemon, native binary, and viewer are permissive (MIT/Apache-2.0/BSD/ISC/CC0/Zlib/Unicode-3.0).
 
 - **Site:** [hayvenhurst.dev](https://hayvenhurst.dev)
-- **Security & contact:** [`dev@hayvenhurst.dev`](mailto:dev@hayvenhurst.dev) — see [SECURITY.md](SECURITY.md).
-- **Contributing:** signed-off commits (`git commit -s`, [DCO](https://developercertificate.org/)) — see [CONTRIBUTING.md](CONTRIBUTING.md).
+- **Security & contact:** [`dev@hayvenhurst.dev`](mailto:dev@hayvenhurst.dev). See [SECURITY.md](SECURITY.md).
+- **Contributing:** signed-off commits (`git commit -s`, [DCO](https://developercertificate.org/)). See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 
 <div align="center">
-<em>Named after Michael Jackson's family home in Encino, California — in honor of bringing light to overlooked places. This project is a small drop in that ocean.</em>
+<em>Named after Michael Jackson's family home in Encino, California, in honor of bringing light to overlooked places. This project is a small drop in that ocean.</em>
 </div>
