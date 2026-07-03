@@ -32,7 +32,7 @@ Use this key to encrypt sensitive vulnerability reports to `dev@hayvenhurst.dev`
 
 ```sh
 # Pull the key block from this file (or the GitHub repo) and import it:
-gpg --import <(curl -fsSL https://raw.githubusercontent.com/Davidb3l/Hayvenhurst/main/SECURITY.md \
+gpg --import <(curl -fsSL https://raw.githubusercontent.com/Davidb3l/Hayvenhurst-dev/main/SECURITY.md \
   | sed -n '/BEGIN PGP PUBLIC KEY BLOCK/,/END PGP PUBLIC KEY BLOCK/p')
 
 # Confirm the fingerprint matches the one above:

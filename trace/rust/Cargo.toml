@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.75"
 description = "Rust runtime trace collector for the Hayvenhurst code-intelligence daemon. Captures call-graph structure only (via the `tracing` crate), aggregates in-process, and flushes batches to the daemon."
 license = "MIT"
-repository = "https://github.com/anchorsanvils/hayvenhurst"
+repository = "https://github.com/Davidb3l/Hayvenhurst-dev"
 keywords = ["tracing", "observability", "call-graph", "code-intelligence"]
 categories = ["development-tools::profiling"]
 

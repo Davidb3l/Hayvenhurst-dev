@@ -10,7 +10,7 @@ A hands-on tour of Hayvenhurst: install, index a project, query the graph, run t
 Build from source (no install scripts yet in `0.x`):
 
 ```sh
-git clone https://github.com/Davidb3l/hayvenhurst
+git clone https://github.com/Davidb3l/Hayvenhurst-dev
 cd hayvenhurst
 
 bun install

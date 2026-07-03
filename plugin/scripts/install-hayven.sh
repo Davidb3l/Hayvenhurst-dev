@@ -28,11 +28,11 @@
 # Environment:
 #   HAYVEN_INSTALL_PREFIX   override the install prefix (same as --prefix)
 #   HAYVEN_RELEASE_TAG      pin a release tag (same as --version)
-#   HAYVEN_REPO             override owner/repo (default Davidb3l/Hayvenhurst)
+#   HAYVEN_REPO             override owner/repo (default Davidb3l/Hayvenhurst-dev)
 
 set -eu
 
-REPO="${HAYVEN_REPO:-Davidb3l/Hayvenhurst}"
+REPO="${HAYVEN_REPO:-Davidb3l/Hayvenhurst-dev}"
 TAG="${HAYVEN_RELEASE_TAG:-}"
 # Default install prefix: ${CLAUDE_PLUGIN_DATA} when invoked by the plugin
 # (persists across plugin updates), else ~/.local. We install binaries into

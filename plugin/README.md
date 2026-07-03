@@ -12,7 +12,7 @@ is X defined", "what's in module Y" — instead of grepping or reading large fil
 coordinates parallel/multi-agent work through the shared claim board.
 
 The skill bundled here is **byte-identical** to the canonical
-[`skill/hayvenhurst.md`](https://github.com/Davidb3l/Hayvenhurst/blob/main/skill/hayvenhurst.md)
+[`skill/hayvenhurst.md`](https://github.com/Davidb3l/Hayvenhurst-dev/blob/main/skill/hayvenhurst.md)
 source; a drift-guard test (`daemon/tests/plugin_skill_drift.test.ts`) keeps the two copies
 from diverging.
 
@@ -21,14 +21,14 @@ from diverging.
 ### From the Claude Code slash-command UI
 
 ```
-/plugin marketplace add Davidb3l/Hayvenhurst
+/plugin marketplace add Davidb3l/Hayvenhurst-dev
 /plugin install hayvenhurst@hayvenhurst
 ```
 
 ### From the CLI
 
 ```sh
-claude plugin marketplace add Davidb3l/Hayvenhurst
+claude plugin marketplace add Davidb3l/Hayvenhurst-dev
 claude plugin install hayvenhurst@hayvenhurst
 ```
 
@@ -42,7 +42,7 @@ git, so installing it only clones this repo's text files — the Agent Skill, th
 command, and the hook. It does **not** deliver the compiled `hayven` CLI /
 `hayven-native` binary. Those are platform-specific and large, so they are
 deliberately **not committed to the repo**; they ship as per-platform tarballs
-attached to each [GitHub release](https://github.com/Davidb3l/Hayvenhurst/releases).
+attached to each [GitHub release](https://github.com/Davidb3l/Hayvenhurst-dev/releases).
 
 > **Honest note on the limitation.** Claude Code's plugin `bin/` directory only
 > exposes executables that are *already committed to the plugin repo*. Since we
@@ -72,7 +72,7 @@ This runs [`scripts/install-hayven.sh`](scripts/install-hayven.sh), which:
    | macOS Intel (x86-64)     | `hayvenhurst-<version>-macos-x64.tar.gz`       |
    | macOS Apple Silicon      | `hayvenhurst-<version>-macos-arm64.tar.gz`     |
 
-3. downloads it from `https://github.com/Davidb3l/Hayvenhurst/releases/download/<tag>/…`,
+3. downloads it from `https://github.com/Davidb3l/Hayvenhurst-dev/releases/download/<tag>/…`,
 4. **verifies its sha256** against the published `<asset>.tar.gz.sha256`,
 5. installs `hayven` (+ `hayven-native`, plus the bundled `viewer/dist` and `skill/`)
    into the plugin's persistent data dir (`${CLAUDE_PLUGIN_DATA}/bin`, which survives
@@ -99,7 +99,7 @@ the install stays an explicit, user-consented action.
 The installer script is POSIX `sh` and covers **macOS + Linux**. A
 `windows-x64` tarball is published with every release, but Windows install is
 manual for now: download `hayvenhurst-<version>-windows-x64.tar.gz` (and its
-`.sha256`) from the [release page](https://github.com/Davidb3l/Hayvenhurst/releases),
+`.sha256`) from the [release page](https://github.com/Davidb3l/Hayvenhurst-dev/releases),
 verify the checksum, extract, and put `hayven.exe` / `hayven-native.exe` on your
 `PATH`.
 
@@ -114,7 +114,7 @@ hayven daemon start  # serves :7777
 
 If `hayven` is not installed, the skill degrades gracefully: Claude falls back to
 conventional tools (grep/find) for that turn. See the
-[Hayvenhurst README](https://github.com/Davidb3l/Hayvenhurst#readme) for more.
+[Hayvenhurst README](https://github.com/Davidb3l/Hayvenhurst-dev#readme) for more.
 
 ## What's in the plugin
 

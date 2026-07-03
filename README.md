@@ -92,7 +92,7 @@ Install scripts and prebuilt tarballs land closer to v1.0. Until then, build fro
 - A Rust toolchain (install via [rustup](https://rustup.rs/))
 
 ```sh
-git clone https://github.com/Davidb3l/hayvenhurst
+git clone https://github.com/Davidb3l/Hayvenhurst-dev
 cd hayvenhurst
 
 bun install                                   # workspace deps
