@@ -2,6 +2,10 @@
 
 All notable user-facing changes. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project adheres to [Semantic Versioning](https://semver.org/). Pre-release (`0.x`): expect breaking changes in every `0.x` until v1.0.
 
+## [0.0.5]
+
+- **One daemon serves multiple repos.** A running daemon now serves every registered project at once, not just the directory it started in. `hayven init` auto-registers each project; manage the set with `hayven daemon register <path>` / `projects` / `unregister`. The viewer gains a project switcher in the nav, and every API endpoint accepts `?project=<alias>` (defaulting to the primary). Single-repo setups are unchanged — the switcher stays hidden and nothing new is required.
+
 ## [0.0.4]
 
 - **Embedding-free index, measured fast.** Re-verified on the current build: cold index 0.65 s (hono) / 0.23 s (gin) vs ~35.6 s for an embedding-based indexer; a branch switch re-parses only the `git diff` (~48 ms); a revisit to a cached branch is a 1 ms read. No model, no GPU, no vector store, nothing leaves the machine. Reproduce: `bench/wedge-demo.sh`.

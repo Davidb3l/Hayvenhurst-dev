@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hayven-trace"
-version = "0.0.4"
+version = "0.0.5"
 description = "Python runtime trace collector for the Hayvenhurst code-intelligence daemon."
 readme = "README.md"
 requires-python = ">=3.9"

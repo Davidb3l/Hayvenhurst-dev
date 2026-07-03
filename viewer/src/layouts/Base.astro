@@ -56,6 +56,7 @@ const navItems: ReadonlyArray<{ href: string; label: string; key: Props["current
           <a href={i.href} aria-current={current === i.key ? "page" : undefined}>{i.label}</a>
         ))}
       </div>
+      <select id="hv-project" class="hv-project-select" aria-label="Select project" style="display:none"></select>
       <button class="hv-theme-toggle" id="hv-theme" type="button" aria-label="Toggle theme">theme</button>
     </nav>
     <main id="main">
@@ -78,6 +79,37 @@ const navItems: ReadonlyArray<{ href: string; label: string; key: Props["current
             try { localStorage.setItem("hv-theme", "light"); } catch (_) {}
           }
         });
+      })();
+    </script>
+    <script is:inline>
+      // Multi-project switcher. Populates the nav <select> from /api/health,
+      // persists the choice in localStorage["hv-project"], and reloads so all
+      // data re-fetches for the new project. Hidden unless there are 2+ projects.
+      (function () {
+        var sel = document.getElementById("hv-project");
+        if (!sel) return;
+        fetch("/api/health", { headers: { accept: "application/json" } })
+          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (h) {
+            var projects = h && Array.isArray(h.projects) ? h.projects : [];
+            if (projects.length < 2) return; // single-project install: stay hidden
+            var current = "";
+            try { current = localStorage.getItem("hv-project") || ""; } catch (_) {}
+            if (!current) current = (h && h.primary) || "";
+            projects.forEach(function (p) {
+              var opt = document.createElement("option");
+              opt.value = p.alias;
+              opt.textContent = p.alias;
+              if (p.alias === current) opt.selected = true;
+              sel.appendChild(opt);
+            });
+            sel.style.display = "";
+            sel.addEventListener("change", function () {
+              try { localStorage.setItem("hv-project", sel.value); } catch (_) {}
+              location.reload();
+            });
+          })
+          .catch(function () { /* daemon offline / no projects — stay hidden */ });
       })();
     </script>
   </body>

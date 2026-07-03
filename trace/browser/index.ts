@@ -45,4 +45,4 @@ export {
 } from "./src/cdp.ts";
 export { collectorOptionsFromEnv, type EnvLike } from "./src/env.ts";
 
-export const VERSION = "0.0.4";
+export const VERSION = "0.0.5";

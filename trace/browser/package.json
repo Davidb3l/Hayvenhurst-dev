@@ -1,6 +1,6 @@
 {
   "name": "@hayvenhurst/trace-browser",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "description": "Browser runtime trace collector for Hayvenhurst — captures call-graph structure via the V8 CPU profiler over the Chrome DevTools Protocol.",
   "type": "module",
   "module": "index.ts",

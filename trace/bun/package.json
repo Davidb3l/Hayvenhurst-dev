@@ -1,6 +1,6 @@
 {
   "name": "@hayvenhurst/trace-bun",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "private": true,
   "description": "Bun/Node runtime trace collector for the Hayvenhurst code-intelligence daemon. Captures the V8 CPU-profile call tree, derives caller->callee edges, aggregates in-process, and flushes batches to the daemon.",
   "license": "MIT",

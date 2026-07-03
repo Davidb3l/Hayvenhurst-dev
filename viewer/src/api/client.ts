@@ -26,6 +26,38 @@ import { mockClaims, mockHealth, mockNeighbors, mockNode, mockSearch, mockStats 
 
 const API_BASE = ""; // same-origin
 
+// Multi-project selection. The daemon serves several repos from one instance,
+// selected per-request via `?project=<alias>`. We persist the chosen alias in
+// localStorage so it survives reloads; an empty string means "daemon default".
+// Guarded for SSR / no-localStorage (this module runs in an Astro island).
+const PROJECT_KEY = "hv-project";
+
+export function getSelectedProject(): string {
+  try {
+    if (typeof localStorage === "undefined") return "";
+    return localStorage.getItem(PROJECT_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+export function setSelectedProject(alias: string): void {
+  try {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(PROJECT_KEY, alias);
+  } catch {
+    /* private mode / no storage — ignore */
+  }
+}
+
+// Appends `project=<alias>` to a request path, using `?` or `&` as appropriate.
+function withProject(path: string): string {
+  const alias = getSelectedProject();
+  if (!alias) return path;
+  const sep = path.includes("?") ? "&" : "?";
+  return `${path}${sep}project=${encodeURIComponent(alias)}`;
+}
+
 let _liveProbe: Promise<boolean> | null = null;
 
 async function isDaemonLive(): Promise<boolean> {
@@ -58,7 +90,7 @@ async function getJson<T, L = T>(
 ): Promise<T> {
   const live = await isDaemonLive();
   if (!live) return Promise.resolve(mock());
-  const r = await fetch(API_BASE + path, { headers: { accept: "application/json" } });
+  const r = await fetch(API_BASE + withProject(path), { headers: { accept: "application/json" } });
   if (!r.ok) throw new Error(`${path} → HTTP ${r.status}`);
   const json = await r.json();
   return adapt ? adapt(json as L) : (json as T);

@@ -17,6 +17,7 @@ import { join } from "node:path";
 
 import { DEFAULT_CONFIG } from "../config/defaults.ts";
 import { writeConfig } from "../config/load.ts";
+import { registerProject } from "../daemon/registry.ts";
 import { Db } from "../db/queries.ts";
 import { detectRepoRoot, hayvenPathsFor, rootConfirmDecision } from "../util/paths.ts";
 import type { ParsedArgs } from "../cli.ts";
@@ -128,6 +129,17 @@ export async function runInit(args: ParsedArgs): Promise<number> {
   if (haveAgents && ensureReflexBlock(agentsMd)) reflexTargets.push("AGENTS.md");
   if (!haveClaude && !haveAgents && ensureReflexBlock(agentsMd)) reflexTargets.push("AGENTS.md");
 
+  // Register this project in the multi-project registry (`~/.hayven/projects.json`)
+  // so a single running daemon can serve it alongside other repos — selectable in
+  // the viewer's project switcher and via `?project=<alias>`. Idempotent by root;
+  // best-effort (a registry write failure must never fail an otherwise-successful init).
+  let registeredAlias: string | null = null;
+  try {
+    registeredAlias = registerProject(root).alias;
+  } catch {
+    /* non-fatal — the registry is a convenience, not required to use the project */
+  }
+
   process.stdout.write(`Initialized Hayvenhurst project at ${paths.hayvenDir}\n`);
   process.stdout.write(`  schema_version: ${migration.toVersion}  (fts: ${migration.appliedFts ? "yes" : "no"})\n`);
   process.stdout.write(`  config:         ${paths.configFile}\n`);
@@ -137,6 +149,9 @@ export async function runInit(args: ParsedArgs): Promise<number> {
   }
   if (reflexTargets.length > 0) {
     process.stdout.write(`  reflex:         appended to ${reflexTargets.join(", ")}\n`);
+  }
+  if (registeredAlias) {
+    process.stdout.write(`  project:        registered as "${registeredAlias}" for multi-repo serving\n`);
   }
 
   // 6. First ingest. Best-effort: if native binary is missing, surface the

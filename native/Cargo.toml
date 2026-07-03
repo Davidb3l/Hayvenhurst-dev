@@ -1,6 +1,6 @@
 [package]
 name = "hayven-native"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2021"
 license = "MIT"
 description = "Native performance companion for the Hayvenhurst daemon"

@@ -246,7 +246,7 @@ jobs:
           generate_release_notes: true
           # Curated, user-facing notes for this version (not the full CHANGELOG).
           # Bump this path when cutting a new version (or rename to a generic file).
-          body_path: docs/RELEASE_NOTES_v0.0.4.md
+          body_path: docs/RELEASE_NOTES_v0.0.5.md
           files: release-artifacts/*
           draft: false
           prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}

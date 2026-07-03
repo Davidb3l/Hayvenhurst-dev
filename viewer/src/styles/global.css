@@ -228,6 +228,16 @@ h3::before { content: "// "; color: var(--fg-faint); }
 }
 .hv-theme-toggle:hover { color: var(--accent); border-color: var(--accent); }
 
+.hv-project-select {
+  font-family: var(--font-mono);
+  background: transparent; color: var(--fg-dim);
+  border: 1px solid var(--border-2); border-radius: 8px;
+  padding: 6px 10px; font-size: 0.78rem; cursor: pointer; transition: 0.15s;
+  max-width: 12rem;
+}
+.hv-project-select:hover { color: var(--accent); border-color: var(--accent); }
+.hv-project-select:focus-visible { outline: none; color: var(--accent); border-color: var(--accent); }
+
 main { max-width: var(--maxw); margin: 0 auto; padding: 40px 24px 80px; }
 
 .lede { font-size: 1.1rem; color: var(--fg-dim); max-width: 64ch; }
@@ -400,7 +410,8 @@ footer .mono, footer b { color: var(--accent); font-weight: 500; }
   /* brand + theme share the top row; nav links drop to their own full-width row */
   .hv-nav { gap: var(--space-3) var(--space-2); padding: 10px 14px; flex-wrap: wrap; }
   .hv-nav .brand { order: 1; }
-  .hv-nav .hv-theme-toggle { order: 2; margin-left: auto; }
+  .hv-nav .hv-project-select { order: 2; margin-left: auto; }
+  .hv-nav .hv-theme-toggle { order: 2; margin-left: 0; }
   .hv-nav .links { order: 3; flex: 0 0 100%; gap: 6px; overflow-x: auto; }
   main { padding: 24px 14px 60px; }
   h1 { font-size: 2rem; }

@@ -1,6 +1,6 @@
 {
   "name": "@hayvenhurst/daemon",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "private": true,
   "description": "Hayvenhurst Bun daemon and `hayven` CLI.",
   "license": "MIT",

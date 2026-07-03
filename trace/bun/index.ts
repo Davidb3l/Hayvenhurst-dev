@@ -47,7 +47,7 @@ export { HayvenTracer, DEFAULT_CONFIG } from "./src/tracer.ts";
 export type { TracerConfig } from "./src/tracer.ts";
 export { configFromEnv, isEnabled } from "./src/env.ts";
 
-export const VERSION = "0.0.4";
+export const VERSION = "0.0.5";
 
 /** Public `start` options. All optional except none — every field has a default. */
 export interface StartOptions {
