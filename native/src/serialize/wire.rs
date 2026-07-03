@@ -179,13 +179,10 @@ pub fn encode_batch(ops: &[OpRecord]) -> Result<Vec<u8>, WireError> {
     }
     let mut compressed = Vec::with_capacity(buf.len() / 2);
     {
-        let mut enc = brotli::CompressorWriter::new(
-            &mut compressed,
-            4096,
-            BROTLI_QUALITY,
-            BROTLI_WINDOW,
-        );
-        enc.write_all(&buf).map_err(|e| WireError::Brotli(e.to_string()))?;
+        let mut enc =
+            brotli::CompressorWriter::new(&mut compressed, 4096, BROTLI_QUALITY, BROTLI_WINDOW);
+        enc.write_all(&buf)
+            .map_err(|e| WireError::Brotli(e.to_string()))?;
         enc.flush().map_err(|e| WireError::Brotli(e.to_string()))?;
     }
     // Fall back to raw if compression made it bigger (rare for our shape but
@@ -362,7 +359,9 @@ fn read_seg_len_varint(cur: &mut Cursor<'_>) -> Option<Result<u32, WireError>> {
         };
         result |= ((byte & 0x7f) as u64) << shift;
         if byte & 0x80 == 0 {
-            return Some(u32::try_from(result).map_err(|_| WireError::LengthTooLarge(result, start)));
+            return Some(
+                u32::try_from(result).map_err(|_| WireError::LengthTooLarge(result, start)),
+            );
         }
         shift += 7;
         if shift >= 35 {
@@ -540,7 +539,10 @@ impl<'a> Cursor<'a> {
         // checked_add: `n` derives from an untrusted varint and could be near
         // usize::MAX; `self.pos + n` would wrap and slip past the bounds
         // check, then the slice index would panic. Reject cleanly instead.
-        let end = self.pos.checked_add(n).ok_or(WireError::Truncated(self.pos))?;
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or(WireError::Truncated(self.pos))?;
         if end > self.bytes.len() {
             return Err(WireError::Truncated(self.pos));
         }
@@ -628,7 +630,10 @@ mod tests {
                 ts_bucket: 1_700_000_000,
                 observed: 5,
                 weight: 500,
-                hlc: HlcWire { wall_ms: 1, counter: 0 },
+                hlc: HlcWire {
+                    wall_ms: 1,
+                    counter: 0,
+                },
                 writer: dummy_writer(0x01),
             },
             OpRecord::GsetObserve {
@@ -637,7 +642,10 @@ mod tests {
                 ts_bucket: 1_700_000_000,
                 observed: 3,
                 weight: 300,
-                hlc: HlcWire { wall_ms: 2, counter: 0 },
+                hlc: HlcWire {
+                    wall_ms: 2,
+                    counter: 0,
+                },
                 writer: dummy_writer(0x02),
             },
         ]);
@@ -653,13 +661,19 @@ mod tests {
                 claim_id: "c1".into(),
                 agent: "agent-x".into(),
                 payload_cbor: b"\xa1\x66intent\x65work".to_vec(),
-                hlc: HlcWire { wall_ms: 10, counter: 0 },
+                hlc: HlcWire {
+                    wall_ms: 10,
+                    counter: 0,
+                },
                 writer: dummy_writer(0x10),
             },
             OpRecord::OrRemove {
                 claim_id: "c1".into(),
                 observed_tags: tags,
-                hlc: HlcWire { wall_ms: 11, counter: 0 },
+                hlc: HlcWire {
+                    wall_ms: 11,
+                    counter: 0,
+                },
                 writer: dummy_writer(0x11),
             },
         ]);
@@ -674,7 +688,10 @@ mod tests {
                 ts_bucket: 1_700_000_000 + i,
                 observed: 1,
                 weight: 100,
-                hlc: HlcWire { wall_ms: i as u64, counter: 0 },
+                hlc: HlcWire {
+                    wall_ms: i as u64,
+                    counter: 0,
+                },
                 writer: dummy_writer(0x42),
             })
             .collect::<Vec<_>>();
@@ -709,7 +726,10 @@ mod tests {
                 ts_bucket: 1_700_000_000,
                 observed: 1,
                 weight: 100,
-                hlc: HlcWire { wall_ms: i as u64, counter: 0 },
+                hlc: HlcWire {
+                    wall_ms: i as u64,
+                    counter: 0,
+                },
                 writer: dummy_writer(0x77),
             })
             .collect::<Vec<_>>();
@@ -742,7 +762,10 @@ mod tests {
                 ts_bucket: 1_700_000_000,
                 observed: 5,
                 weight: 500,
-                hlc: HlcWire { wall_ms: 1, counter: 0 },
+                hlc: HlcWire {
+                    wall_ms: 1,
+                    counter: 0,
+                },
                 writer: dummy_writer(0x01),
             },
             OpRecord::GsetObserve {
@@ -751,7 +774,10 @@ mod tests {
                 ts_bucket: 1_700_000_060,
                 observed: 2,
                 weight: 200,
-                hlc: HlcWire { wall_ms: 2, counter: 1 },
+                hlc: HlcWire {
+                    wall_ms: 2,
+                    counter: 1,
+                },
                 writer: dummy_writer(0x02),
             },
         ];
@@ -762,13 +788,19 @@ mod tests {
                 claim_id: "c-42".into(),
                 agent: "agent-x".into(),
                 payload_cbor: b"\xa1\x66intent\x65work".to_vec(),
-                hlc: HlcWire { wall_ms: 10, counter: 0 },
+                hlc: HlcWire {
+                    wall_ms: 10,
+                    counter: 0,
+                },
                 writer: dummy_writer(0x10),
             },
             OpRecord::OrRemove {
                 claim_id: "c-42".into(),
                 observed_tags: tags,
-                hlc: HlcWire { wall_ms: 11, counter: 0 },
+                hlc: HlcWire {
+                    wall_ms: 11,
+                    counter: 0,
+                },
                 writer: dummy_writer(0x11),
             },
         ];
@@ -776,7 +808,10 @@ mod tests {
             entity_id: "auth/login".into(),
             content_hash: vec![7; 32],
             body: b"# auth/login\n\nbody".to_vec(),
-            hlc: HlcWire { wall_ms: 12, counter: 3 },
+            hlc: HlcWire {
+                wall_ms: 12,
+                counter: 3,
+            },
             writer: dummy_writer(0xa1),
         }];
 
@@ -839,7 +874,10 @@ mod tests {
             ts_bucket: 0,
             observed: 1,
             weight: 1,
-            hlc: HlcWire { wall_ms: 1, counter: 0 },
+            hlc: HlcWire {
+                wall_ms: 1,
+                counter: 0,
+            },
             writer: dummy_writer(0x01),
         }];
         let good_bytes = encode_batch(&good).unwrap();
@@ -849,7 +887,10 @@ mod tests {
             ts_bucket: 0,
             observed: 1,
             weight: 1,
-            hlc: HlcWire { wall_ms: 2, counter: 0 },
+            hlc: HlcWire {
+                wall_ms: 2,
+                counter: 0,
+            },
             writer: dummy_writer(0x02),
         }];
         let torn_bytes = encode_batch(&torn).unwrap();
@@ -874,7 +915,10 @@ mod tests {
             ts_bucket: 0,
             observed: 1,
             weight: 1,
-            hlc: HlcWire { wall_ms: 1, counter: 0 },
+            hlc: HlcWire {
+                wall_ms: 1,
+                counter: 0,
+            },
             writer: dummy_writer(0x01),
         }];
         let mut segment = Vec::new();
@@ -910,7 +954,10 @@ mod tests {
             ts_bucket: 0,
             observed: 0,
             weight: 0,
-            hlc: HlcWire { wall_ms: 0, counter: 0 },
+            hlc: HlcWire {
+                wall_ms: 0,
+                counter: 0,
+            },
             writer: dummy_writer(0),
         }])
         .unwrap();
@@ -936,12 +983,15 @@ mod tests {
         buf.extend_from_slice(&[0u8; HLC_BYTES]); // hlc (reserved zero)
         buf.extend_from_slice(&[0u8; WRITER_BYTES]); // writer
         write_varint(&mut buf, 0); // claim_id_idx -> "c"
-        // tag_count = u64::MAX so tag_count * 28 overflows usize.
+                                   // tag_count = u64::MAX so tag_count * 28 overflows usize.
         write_varint(&mut buf, u64::MAX);
         // (no tag bytes follow — decode must fail before reading them)
 
         let result = decode_batch(&buf);
-        assert!(result.is_err(), "crafted tag_count must be rejected, not panic");
+        assert!(
+            result.is_err(),
+            "crafted tag_count must be rejected, not panic"
+        );
     }
 
     /// BL-7: length/count varints are capped to u32 range. A varint encoding
@@ -992,7 +1042,10 @@ mod tests {
             ts_bucket: 0,
             observed: 0,
             weight: 0,
-            hlc: HlcWire { wall_ms: 0, counter: 0 },
+            hlc: HlcWire {
+                wall_ms: 0,
+                counter: 0,
+            },
             writer: dummy_writer(0),
         }])
         .unwrap();
@@ -1022,7 +1075,10 @@ mod tests {
                 ts_bucket: 1_700_000_000 + (i as u32 / 60) * 60,
                 observed: (i % 9) as u16 + 1,
                 weight: ((i % 9) as u16 + 1) * 100,
-                hlc: HlcWire { wall_ms: 1_700_000_000_000 + i as u64, counter: 0 },
+                hlc: HlcWire {
+                    wall_ms: 1_700_000_000_000 + i as u64,
+                    counter: 0,
+                },
                 writer: dummy_writer((i % 4) as u8),
             })
             .collect();

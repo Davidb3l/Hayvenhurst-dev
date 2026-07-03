@@ -650,7 +650,10 @@ fn astro_template_components(source: &[u8]) -> Vec<Vec<String>> {
         // (`count<Threshold`, `foo()<B`, `arr[i]<B`), where `<` is an operator.
         if i > 0 {
             let prev = body[i - 1];
-            if prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'$' || prev == b')'
+            if prev.is_ascii_alphanumeric()
+                || prev == b'_'
+                || prev == b'$'
+                || prev == b')'
                 || prev == b']'
             {
                 i = after;
@@ -807,12 +810,7 @@ struct DefinitionSpan {
 /// Foo` qn). The block is NOT added to `definitions`, so call-edge `src_name`
 /// resolution (which already attributes a method's calls to the method) is
 /// unchanged.
-fn collect_rust_impl_nodes(
-    root: Node,
-    source: &[u8],
-    rel_path: &str,
-    records: &mut Vec<Record>,
-) {
+fn collect_rust_impl_nodes(root: Node, source: &[u8], rel_path: &str, records: &mut Vec<Record>) {
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if node.kind() == "impl_item" {
@@ -984,9 +982,7 @@ fn bound_object_name(pair_node: Node, source: &[u8]) -> Option<String> {
 /// object while still skipping `{ nullable: true }`-style option bags.
 fn pair_value_is_callable(pair_node: Node) -> bool {
     matches!(
-        pair_node
-            .child_by_field_name("value")
-            .map(|v| v.kind()),
+        pair_node.child_by_field_name("value").map(|v| v.kind()),
         Some("arrow_function") | Some("function_expression")
     )
 }
@@ -1847,7 +1843,11 @@ mod tests {
         let out = extract_file("bad.py", src, Language::Python).expect("extract");
         let ws = warns(&out.records);
         assert_eq!(ws.len(), 1, "broken file should warn exactly once: {ws:?}");
-        assert!(ws[0].contains("syntax error"), "warn names a syntax error: {}", ws[0]);
+        assert!(
+            ws[0].contains("syntax error"),
+            "warn names a syntax error: {}",
+            ws[0]
+        );
     }
 
     #[test]
@@ -1891,9 +1891,7 @@ mod tests {
                     kind,
                     range,
                     ..
-                } if kind != "module" => {
-                    Some((qualified_name.clone(), kind.clone(), *range))
-                }
+                } if kind != "module" => Some((qualified_name.clone(), kind.clone(), *range)),
                 _ => None,
             })
             .collect()
@@ -1925,7 +1923,9 @@ mod tests {
             "struct `Foo` (kind class) must still exist, distinct from `impl Foo`: {nodes:?}"
         );
         assert!(
-            nodes.iter().any(|(q, k, _)| q == "Foo::bar" && k == "method"),
+            nodes
+                .iter()
+                .any(|(q, k, _)| q == "Foo::bar" && k == "method"),
             "method `Foo::bar` must still exist: {nodes:?}"
         );
     }
@@ -1976,8 +1976,7 @@ mod tests {
         let out = extract_file("m.ts", src, Language::TypeScript).expect("extract");
         let qs = node_qnames(&out.records);
         assert!(
-            qs.iter()
-                .any(|(q, k)| q == "api/search" && k == "method"),
+            qs.iter().any(|(q, k)| q == "api/search" && k == "method"),
             "object method `api/search` must be a method: {qs:?}"
         );
         assert!(qs.iter().any(|(q, _)| q == "api/health"));
@@ -1991,7 +1990,8 @@ mod tests {
         let out = extract_file("m.ts", src, Language::TypeScript).expect("extract");
         let qs = node_qnames(&out.records);
         assert!(
-            qs.iter().all(|(q, _)| q != "onClick" && !q.ends_with("/onClick")),
+            qs.iter()
+                .all(|(q, _)| q != "onClick" && !q.ends_with("/onClick")),
             "anonymous inline object methods must be skipped: {qs:?}"
         );
     }
@@ -2164,9 +2164,9 @@ builder.queryField('photosByProject', (t) =>
             .records
             .iter()
             .find_map(|r| match r {
-                Record::Edge {
-                    dst_name, kind, ..
-                } if kind == "static_call" && dst_name == "foo" => {
+                Record::Edge { dst_name, kind, .. }
+                    if kind == "static_call" && dst_name == "foo" =>
+                {
                     Some(serde_json::to_string(r).unwrap())
                 }
                 _ => None,
@@ -2235,11 +2235,9 @@ builder.queryField('photosByProject', (t) =>
                     receiver,
                     receiver_chain,
                     ..
-                } if kind == "static_call" => Some((
-                    dst_name.clone(),
-                    receiver.clone(),
-                    receiver_chain.clone(),
-                )),
+                } if kind == "static_call" => {
+                    Some((dst_name.clone(), receiver.clone(), receiver_chain.clone()))
+                }
                 _ => None,
             })
             .collect()
@@ -2268,8 +2266,7 @@ builder.queryField('photosByProject', (t) =>
         let calls = static_calls_with_chain(&out.records);
         assert!(
             calls.iter().any(|(d, _, c)| d == "run"
-                && c.as_deref()
-                    == Some(&["a".to_string(), "b".to_string(), "c".to_string()][..])),
+                && c.as_deref() == Some(&["a".to_string(), "b".to_string(), "c".to_string()][..])),
             "a.b.c.run() must carry chain [a,b,c]: {calls:?}"
         );
     }
@@ -2309,8 +2306,7 @@ builder.queryField('photosByProject', (t) =>
     fn computed_root_chain_is_skipped() {
         // `arr[i].client.run()` — root is a subscript → no chain, no receiver.
         // `getThing().client.run()` — root is a call → no chain, no receiver.
-        let src =
-            b"function f(arr, i) { arr[i].client.run(); getThing().client.run(); }\n";
+        let src = b"function f(arr, i) { arr[i].client.run(); getThing().client.run(); }\n";
         let out = extract_file("m.ts", src, Language::TypeScript).expect("extract");
         let calls = static_calls_with_chain(&out.records);
         let runs: Vec<_> = calls.iter().filter(|(d, _, _)| d == "run").collect();
@@ -2346,8 +2342,8 @@ builder.queryField('photosByProject', (t) =>
         // chain). The `receiver_chain` EXCLUDES the trailing member, so a
         // 2-part component collapses to just the immediate-object receiver.
         let src = b"---\nimport Foo from \"~/components/Foo.tsx\";\n---\n<Foo.Bar />\n";
-        let out = extract_file("viewer/src/pages/x.astro", src, Language::Astro)
-            .expect("extract astro");
+        let out =
+            extract_file("viewer/src/pages/x.astro", src, Language::Astro).expect("extract astro");
         let calls = static_calls_with_chain(&out.records);
         assert!(
             calls
@@ -2361,11 +2357,13 @@ builder.queryField('photosByProject', (t) =>
     fn astro_lowercase_html_tags_are_not_edges() {
         // Plain HTML tags (`<div>`, `<p>`) must NOT become component edges.
         let src = b"---\nimport Stats from \"~/components/Stats.tsx\";\n---\n<div><p>hi</p><span/></div>\n";
-        let out = extract_file("viewer/src/pages/y.astro", src, Language::Astro)
-            .expect("extract astro");
+        let out =
+            extract_file("viewer/src/pages/y.astro", src, Language::Astro).expect("extract astro");
         let calls = static_calls_with_chain(&out.records);
         assert!(
-            calls.iter().all(|(d, _, _)| d != "div" && d != "p" && d != "span"),
+            calls
+                .iter()
+                .all(|(d, _, _)| d != "div" && d != "p" && d != "span"),
             "lowercase HTML tags must not be edges: {calls:?}"
         );
     }
@@ -2375,8 +2373,8 @@ builder.queryField('photosByProject', (t) =>
         // Paired `<Base>…</Base>` + repeated `<Stats/>` → one edge per distinct
         // component name (the open tag; close tags / repeats deduped).
         let src = b"---\nimport Base from \"~/layouts/Base.astro\";\nimport Stats from \"~/components/Stats.tsx\";\n---\n<Base><Stats /><Stats /></Base>\n";
-        let out = extract_file("viewer/src/pages/z.astro", src, Language::Astro)
-            .expect("extract astro");
+        let out =
+            extract_file("viewer/src/pages/z.astro", src, Language::Astro).expect("extract astro");
         let calls = static_calls_with_chain(&out.records);
         let stats: Vec<_> = calls.iter().filter(|(d, _, _)| d == "Stats").collect();
         let base: Vec<_> = calls.iter().filter(|(d, _, _)| d == "Base").collect();
@@ -2391,10 +2389,8 @@ builder.queryField('photosByProject', (t) =>
         let out = extract_file("m.ts", src, Language::TypeScript).expect("extract");
         let imports = import_locals(&out.records);
         assert!(
-            imports
-                .iter()
-                .any(|(d, l)| d == "~/api/client"
-                    && l.as_deref() == Some(&["api".to_string(), "qk".to_string()][..])),
+            imports.iter().any(|(d, l)| d == "~/api/client"
+                && l.as_deref() == Some(&["api".to_string(), "qk".to_string()][..])),
             "named import must emit local [api, qk]: {imports:?}"
         );
     }
@@ -2454,7 +2450,8 @@ builder.queryField('photosByProject', (t) =>
         // Plain named, default, and namespace imports introduce NO alias → the
         // `import_aliases` field is omitted (None) so the common case is
         // byte-identical with older payloads.
-        let src = b"import { foo } from \"a\";\nimport Bar from \"b\";\nimport * as ns from \"c\";\n";
+        let src =
+            b"import { foo } from \"a\";\nimport Bar from \"b\";\nimport * as ns from \"c\";\n";
         let out = extract_file("m.ts", src, Language::TypeScript).expect("extract");
         let aliases = import_alias_lists(&out.records);
         assert!(
@@ -2466,9 +2463,7 @@ builder.queryField('photosByProject', (t) =>
             .records
             .iter()
             .find_map(|r| match r {
-                Record::Edge { dst_name, kind, .. }
-                    if kind == "import" && dst_name == "a" =>
-                {
+                Record::Edge { dst_name, kind, .. } if kind == "import" && dst_name == "a" => {
                     Some(serde_json::to_string(r).unwrap())
                 }
                 _ => None,
@@ -2538,7 +2533,9 @@ builder.queryField('photosByProject', (t) =>
         let out = extract_file("m.ts", src, Language::TypeScript).expect("extract");
         let imports = import_locals(&out.records);
         assert!(
-            imports.iter().any(|(d, l)| d == "./styles.css" && l.is_none()),
+            imports
+                .iter()
+                .any(|(d, l)| d == "./styles.css" && l.is_none()),
             "side-effect import must omit local: {imports:?}"
         );
         let line = out
@@ -2576,7 +2573,10 @@ builder.queryField('photosByProject', (t) =>
         let src = b"import os\nfrom sys import argv\n";
         let out = extract_file("m.py", src, Language::Python).expect("extract");
         let imports = import_locals(&out.records);
-        assert!(!imports.is_empty(), "python imports must still emit: {imports:?}");
+        assert!(
+            !imports.is_empty(),
+            "python imports must still emit: {imports:?}"
+        );
         assert!(
             imports.iter().all(|(_, l)| l.is_none()),
             "non-priority langs must omit local: {imports:?}"
@@ -2602,9 +2602,7 @@ builder.queryField('photosByProject', (t) =>
         records
             .iter()
             .filter_map(|r| match r {
-                Record::Edge {
-                    dst_name, kind, ..
-                } if kind == "import" => Some(dst_name.clone()),
+                Record::Edge { dst_name, kind, .. } if kind == "import" => Some(dst_name.clone()),
                 _ => None,
             })
             .collect()
@@ -2665,10 +2663,7 @@ builder.queryField('photosByProject', (t) =>
                 _ => None,
             })
             .expect("module node");
-        assert_eq!(
-            module[0], 1,
-            "module starts at line 1: {module:?}"
-        );
+        assert_eq!(module[0], 1, "module starts at line 1: {module:?}");
         assert!(
             module[1] >= 6,
             "module must span past the closing fence into the template: {module:?}"
@@ -2710,7 +2705,10 @@ builder.queryField('photosByProject', (t) =>
         // Leading blank lines before the fence are tolerated.
         let src2 = b"\n\n---\nconst c = 3;\n---\n";
         let (slice2, offset2) = astro_frontmatter(src2).expect("frontmatter present");
-        assert_eq!(offset2, 3, "content starts on line index 3 after two blanks");
+        assert_eq!(
+            offset2, 3,
+            "content starts on line index 3 after two blanks"
+        );
         assert_eq!(std::str::from_utf8(slice2).unwrap(), "const c = 3;\n");
         // No fence → None.
         assert!(astro_frontmatter(b"<div>only template</div>\n").is_none());

@@ -38,7 +38,9 @@ pub fn version_record() -> proto::Record {
 /// so a broken Cargo.toml does not panic the binary; the daemon will catch
 /// the zero-major mismatch in its own check.
 pub(crate) fn parse_semver(s: &str) -> (u32, u32, u32) {
-    let mut parts = s.split('.').map(|p| p.split(['-', '+']).next().unwrap_or(p));
+    let mut parts = s
+        .split('.')
+        .map(|p| p.split(['-', '+']).next().unwrap_or(p));
     let major = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
     let minor = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
     let patch = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);

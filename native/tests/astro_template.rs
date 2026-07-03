@@ -187,7 +187,8 @@ fn astro_lowercase_html_tags_are_not_edges() {
 
 #[test]
 fn astro_duplicate_component_usage_dedupes_to_one_edge() {
-    let src = b"---\nimport Stats from \"~/components/Stats.tsx\";\n---\n<Stats/><Stats/><Stats/>\n";
+    let src =
+        b"---\nimport Stats from \"~/components/Stats.tsx\";\n---\n<Stats/><Stats/><Stats/>\n";
     let stats: Vec<_> = dsts(src).into_iter().filter(|d| d == "Stats").collect();
     assert_eq!(stats.len(), 1, "repeated `<Stats/>` dedupes to one edge");
 }
@@ -201,16 +202,24 @@ fn astro_component_inside_html_comment_is_not_an_edge() {
     // a phantom edge that could resolve to the real `Stats` node.
     let src = b"---\nconst x = 1;\n---\n<!-- <Stats/> commented out -->\n<div>hi</div>\n";
     let d = dsts(src);
-    assert!(d.is_empty(), "no edge from a component inside a comment: {d:?}");
+    assert!(
+        d.is_empty(),
+        "no edge from a component inside a comment: {d:?}"
+    );
 }
 
 #[test]
 fn astro_comment_then_real_component_emits_only_the_real_one() {
     // The comment is skipped wholesale; a real `<Stats/>` AFTER the comment
     // still emits exactly one edge (the scan resumes past `-->`).
-    let src = b"---\nimport Stats from \"~/components/Stats.tsx\";\n---\n<!-- <Ghost/> -->\n<Stats/>\n";
+    let src =
+        b"---\nimport Stats from \"~/components/Stats.tsx\";\n---\n<!-- <Ghost/> -->\n<Stats/>\n";
     let d = dsts(src);
-    assert_eq!(d, vec!["Stats".to_string()], "only the real post-comment component: {d:?}");
+    assert_eq!(
+        d,
+        vec!["Stats".to_string()],
+        "only the real post-comment component: {d:?}"
+    );
 }
 
 #[test]

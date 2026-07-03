@@ -307,7 +307,11 @@ mod tests {
 
         let out = candidates_from_explicit_files(&root, &rels, &opts);
 
-        assert_eq!(out.len(), 1, "only the in-root file should survive: {out:#?}");
+        assert_eq!(
+            out.len(),
+            1,
+            "only the in-root file should survive: {out:#?}"
+        );
         assert!(
             out[0].path.starts_with(&root),
             "surviving candidate must be under root: {:?}",
