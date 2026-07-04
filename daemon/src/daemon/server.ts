@@ -23,6 +23,7 @@ import { lanePlannerRoutes } from "./routes/lane_planner.ts";
 import { memoryRoutes } from "./routes/memory.ts";
 import { ingestRoutes, type IngestController } from "./routes/ingest.ts";
 import { nodesRoutes } from "./routes/nodes.ts";
+import { projectsRoutes } from "./routes/projects.ts";
 import { searchRoutes } from "./routes/search.ts";
 import { statsRoutes } from "./routes/stats.ts";
 import { syncRoutes } from "./routes/sync.ts";
@@ -75,6 +76,19 @@ export interface ServerDependencies {
    * uses it to list projects; absent for single-project callers/tests.
    */
   listProjects?: (() => ProjectSummary[]) | undefined;
+  /**
+   * Multi-project only: register + open a new repo into the LIVE daemon with no
+   * restart. Resolves with the served alias and whether it was newly added.
+   */
+  addProject?: AddProjectFn | undefined;
+  /** Multi-project only: stop serving a repo (by alias or root) in the LIVE daemon. */
+  removeProject?: RemoveProjectFn | undefined;
+  /**
+   * Multi-project only: subscribe to project-set changes (add/remove). Returns an
+   * unsubscribe fn. Used by the `/api/projects/stream` SSE endpoint so an open
+   * viewer updates its switcher the instant the set changes.
+   */
+  subscribeProjects?: SubscribeProjectsFn | undefined;
 }
 
 /** One row of the multi-project `/api/health` listing. */
@@ -83,6 +97,21 @@ export interface ProjectSummary {
   root: string;
   branch: string | null;
 }
+
+/** Result of a live project add: the served alias/root, and whether it was newly
+ *  added (`false` = the daemon already served this root, returned untouched). */
+export interface ProjectAddResult {
+  alias: string;
+  root: string;
+  added: boolean;
+}
+
+/** Register + open a repo into the live daemon. Throws if `root` has no `.hayven/`. */
+export type AddProjectFn = (root: string, alias?: string) => Promise<ProjectAddResult>;
+/** Remove a served repo by alias OR root. Resolves `false` if it wasn't served. */
+export type RemoveProjectFn = (aliasOrRoot: string) => Promise<boolean>;
+/** Subscribe to project-set changes; returns an unsubscribe fn. */
+export type SubscribeProjectsFn = (listener: () => void) => () => void;
 
 export interface BuildAppOptions {
   /**
@@ -150,6 +179,7 @@ export function buildApp(deps: ServerDependencies, opts: BuildAppOptions = {}) {
     }))
     // API + WS routes register first so they win over the static catch-all.
     .use(healthRoutes(deps))
+    .use(projectsRoutes(deps))
     .use(nodesRoutes(deps))
     .use(searchRoutes(deps))
     .use(graphRoutes(deps))
@@ -178,6 +208,12 @@ export interface MultiProjectDeps {
   logger: Logger;
   daemonVersion: string;
   nativeVersion?: string | undefined;
+  /** Live add of a repo into `projects` (no restart). Wired onto the facade for the route layer. */
+  addProject?: AddProjectFn | undefined;
+  /** Live remove of a repo from `projects`. Wired onto the facade for the route layer. */
+  removeProject?: RemoveProjectFn | undefined;
+  /** Subscribe to add/remove for the SSE stream. Wired onto the facade for the route layer. */
+  subscribeProjects?: SubscribeProjectsFn | undefined;
 }
 
 /**
@@ -220,6 +256,9 @@ export function buildMultiProjectApp(multi: MultiProjectDeps) {
         root: d.paths.repoRoot,
         branch: d.dbRef?.branchKey ?? null,
       })),
+    addProject: multi.addProject,
+    removeProject: multi.removeProject,
+    subscribeProjects: multi.subscribeProjects,
   } as ServerDependencies;
 
   for (const key of ["db", "dbRef", "config", "paths", "ingest", "crdt"] as const) {

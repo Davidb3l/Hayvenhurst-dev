@@ -18,8 +18,9 @@ import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, writ
 import { join, relative } from "node:path";
 
 import { DEFAULT_CONFIG } from "../config/defaults.ts";
-import { writeConfig } from "../config/load.ts";
+import { loadConfig, writeConfig } from "../config/load.ts";
 import { registerProject } from "../daemon/registry.ts";
+import { hotAddToRunningDaemon } from "./_shared.ts";
 import { Db } from "../db/queries.ts";
 import { detectRepoRoot, hayvenPathsFor, rootConfirmDecision } from "../util/paths.ts";
 import type { ParsedArgs } from "../cli.ts";
@@ -182,6 +183,21 @@ export async function runInit(args: ParsedArgs): Promise<number> {
         "and re-run `hayven ingest` when ready.\n",
     );
     return 0;
+  }
+
+  // If a daemon is already running, hot-add this freshly-initialized repo so it
+  // appears in the switcher/routing WITHOUT a restart (the canonical "installed
+  // Hayven in a 2nd repo, see it live" flow). Best-effort — never fails init.
+  if (registeredAlias) {
+    try {
+      const cfg = loadConfig(root).config;
+      const hot = await hotAddToRunningDaemon(root, `http://${cfg.daemon_host}:${cfg.daemon_port}`);
+      if (hot.kind === "added") {
+        process.stdout.write("  daemon:         added live to the running daemon (no restart needed)\n");
+      }
+    } catch {
+      /* best-effort — a hot-add failure must never fail an otherwise-good init */
+    }
   }
 
   process.stdout.write(

@@ -69,6 +69,36 @@ export function isJson(flags: Record<string, string | boolean>): boolean {
   return flags["json"] === true || flags["json"] === "true";
 }
 
+/** Outcome of a best-effort live hot-add against a running daemon. */
+export type HotAddResult =
+  | { kind: "added"; alias: string }
+  | { kind: "exists"; alias: string }
+  | { kind: "no-daemon" }
+  | { kind: "error"; message: string };
+
+/**
+ * Best-effort: ask the daemon at `base` to serve `root` LIVE (`POST /api/projects`)
+ * so a newly-registered repo appears in the switcher/routing WITHOUT a restart.
+ * Never throws — an unreachable daemon or a route-missing (old) daemon both resolve
+ * to `no-daemon`, and the caller falls back to "loads on next start".
+ */
+export async function hotAddToRunningDaemon(root: string, base: string, alias?: string): Promise<HotAddResult> {
+  let res: Response;
+  try {
+    res = await fetch(`${base}/api/projects`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(alias ? { path: root, alias } : { path: root }),
+    });
+  } catch {
+    return { kind: "no-daemon" }; // unreachable
+  }
+  if (res.status === 404) return { kind: "no-daemon" }; // old daemon w/o the route
+  const body = (await res.json().catch(() => ({}))) as { added?: boolean; alias?: string; error?: string };
+  if (!res.ok) return { kind: "error", message: body.error ?? `daemon returned ${res.status}` };
+  return { kind: body.added ? "added" : "exists", alias: body.alias ?? alias ?? "" };
+}
+
 export type DaemonIdentityResult =
   | { ok: true; warning?: string }
   | { ok: false; message: string };

@@ -82,34 +82,70 @@ const navItems: ReadonlyArray<{ href: string; label: string; key: Props["current
       })();
     </script>
     <script is:inline>
-      // Multi-project switcher. Populates the nav <select> from /api/health,
-      // persists the choice in localStorage["hv-project"], and reloads so all
-      // data re-fetches for the new project. Hidden unless there are 2+ projects.
+      // Multi-project switcher. Populates the nav <select> and keeps it LIVE: an
+      // initial /api/health fetch, then a Server-Sent-Events subscription to
+      // /api/projects/stream so a repo added/removed on the running daemon updates
+      // the dropdown with NO manual refresh. Choice persists in
+      // localStorage["hv-project"]; changing it reloads so data re-fetches for the
+      // new project. Hidden unless there are 2+ projects.
       (function () {
         var sel = document.getElementById("hv-project");
         if (!sel) return;
-        fetch("/api/health", { headers: { accept: "application/json" } })
-          .then(function (r) { return r.ok ? r.json() : null; })
-          .then(function (h) {
-            var projects = h && Array.isArray(h.projects) ? h.projects : [];
-            if (projects.length < 2) return; // single-project install: stay hidden
-            var current = "";
-            try { current = localStorage.getItem("hv-project") || ""; } catch (_) {}
-            if (!current) current = (h && h.primary) || "";
-            projects.forEach(function (p) {
-              var opt = document.createElement("option");
-              opt.value = p.alias;
-              opt.textContent = p.alias;
-              if (p.alias === current) opt.selected = true;
-              sel.appendChild(opt);
-            });
-            sel.style.display = "";
+        var changeWired = false;
+
+        function render(h) {
+          var projects = (h && Array.isArray(h.projects)) ? h.projects : [];
+          var aliases = projects.map(function (p) { return p.alias; });
+          var stored = "";
+          try { stored = localStorage.getItem("hv-project") || ""; } catch (_) {}
+
+          // The user's selected project was removed out from under them: repoint to
+          // a valid project and reload, so the page stops showing removed/stale data
+          // instead of silently drifting to whatever ends up first in the list.
+          // (Guarded on aliases.length so a transiently-empty push never loops.)
+          if (stored && aliases.length > 0 && aliases.indexOf(stored) === -1) {
+            var fallback = (h && h.primary && aliases.indexOf(h.primary) !== -1) ? h.primary : aliases[0];
+            try { localStorage.setItem("hv-project", fallback); } catch (_) {}
+            location.reload();
+            return;
+          }
+
+          var current = stored || (h && h.primary) || "";
+          sel.innerHTML = "";
+          projects.forEach(function (p) {
+            var opt = document.createElement("option");
+            opt.value = p.alias;
+            opt.textContent = p.alias;
+            if (p.alias === current) opt.selected = true;
+            sel.appendChild(opt);
+          });
+          // Show only when there's a real choice to make.
+          sel.style.display = projects.length >= 2 ? "" : "none";
+          if (!changeWired) {
+            changeWired = true;
             sel.addEventListener("change", function () {
               try { localStorage.setItem("hv-project", sel.value); } catch (_) {}
               location.reload();
             });
-          })
-          .catch(function () { /* daemon offline / no projects — stay hidden */ });
+          }
+        }
+
+        // Initial snapshot — works even if SSE is unsupported/blocked.
+        fetch("/api/health", { headers: { accept: "application/json" } })
+          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (h) { if (h) render(h); })
+          .catch(function () { /* daemon offline — stay hidden */ });
+
+        // Live updates: the daemon pushes the project list on every add/remove.
+        try {
+          if (typeof EventSource !== "undefined") {
+            var es = new EventSource("/api/projects/stream");
+            es.onmessage = function (e) {
+              try { render(JSON.parse(e.data)); } catch (_) {}
+            };
+            // On error EventSource auto-reconnects; nothing to do.
+          }
+        } catch (_) { /* SSE unavailable — the initial fetch already ran */ }
       })();
     </script>
   </body>

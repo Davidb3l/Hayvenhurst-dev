@@ -8,6 +8,7 @@ import {
   buildMultiProjectApp,
   wireBranchAwareDb,
   type DbRef,
+  type ProjectAddResult,
   type ServerDependencies,
 } from "../daemon/server.ts";
 import {
@@ -34,7 +35,8 @@ import type { ParsedArgs } from "../cli.ts";
 import { Db } from "../db/queries.ts";
 import { activeBranchKey, resolveWriteIndex, resolveWriteIndexForKey } from "../db/branch_index.ts";
 import type { HayvenConfig } from "../config/defaults.ts";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
+import { resolve } from "node:path";
 import { hayvenPathsFor, type HayvenPaths } from "../util/paths.ts";
 import type { Logger } from "../util/log.ts";
 import { loadConfig } from "../config/load.ts";
@@ -44,8 +46,32 @@ import {
   unregisterProject,
   type ProjectEntry,
 } from "../daemon/registry.ts";
-import { requireProject } from "./_shared.ts";
+import { hotAddToRunningDaemon, requireProject } from "./_shared.ts";
 import { VERSION } from "../version.ts";
+
+/**
+ * Canonical, symlink-resolved absolute path — the identity key for a served
+ * project. `resolve` alone normalizes `.`/`..`/trailing slashes but NOT symlinks,
+ * so two symlink-equivalent roots would otherwise dedupe as distinct and open a
+ * SECOND Db on the SAME `.hayven/index.sqlite` (two writers on one WAL = corruption).
+ * Falls back to `resolve` when the path doesn't exist yet (realpath throws on ENOENT).
+ */
+function canonicalRoot(p: string): string {
+  try {
+    return realpathSync(resolve(p));
+  } catch {
+    return resolve(p);
+  }
+}
+
+/** Hard cap on repos one daemon serves live — a DoS backstop for the add endpoint
+ *  (each project opens a Db + native watcher + branch poller). */
+const MAX_LIVE_PROJECTS = 64;
+/** Grace window before a live-removed project's Db is closed, so a request that
+ *  selected it just before removal finishes reading instead of hitting a closed
+ *  handle. Bounded — a long in-flight query beyond this still races (rare; a
+ *  closed-Db read throws → a clean 500, never corruption). */
+const REMOVE_GRACE_MS = 250;
 
 /**
  * How often the daemon polls `.git/HEAD` (via {@link activeBranchKey}) to detect
@@ -274,9 +300,9 @@ export async function runDaemon(args: ParsedArgs): Promise<number> {
  * multi-project registry so a (re)started daemon serves it. Idempotent by root.
  * With no path arg, registers the cwd project.
  */
-function registerDaemonProject(args: ParsedArgs): number {
+async function registerDaemonProject(args: ParsedArgs): Promise<number> {
   const pathArg = args.positionals[1];
-  const root = pathArg ?? process.cwd();
+  const root = canonicalRoot(pathArg ?? process.cwd());
   const aliasFlag = args.flags["alias"];
   const alias = typeof aliasFlag === "string" && aliasFlag.length > 0 ? aliasFlag : undefined;
   if (aliasFlag === true) {
@@ -291,6 +317,25 @@ function registerDaemonProject(args: ParsedArgs): number {
     return 1;
   }
   process.stdout.write(`registered ${entry.alias} → ${entry.root}\n`);
+
+  // If a daemon is already up, hot-add so the repo appears WITHOUT a restart.
+  const cfg = loadConfig(root).config;
+  const base = `http://${cfg.daemon_host}:${cfg.daemon_port}`;
+  const hot = await hotAddToRunningDaemon(root, base, alias);
+  switch (hot.kind) {
+    case "added":
+      process.stdout.write(`added live to the running daemon (no restart needed)\n`);
+      break;
+    case "exists":
+      process.stdout.write(`already served by the running daemon\n`);
+      break;
+    case "error":
+      process.stderr.write(`note: daemon reachable but did not add it: ${hot.message}\n`);
+      break;
+    case "no-daemon":
+      process.stdout.write(`no running daemon — it will load on the next \`hayven daemon start\`\n`);
+      break;
+  }
   return 0;
 }
 
@@ -782,16 +827,119 @@ async function startDaemon(args: ParsedArgs): Promise<number> {
 
   const primaryRuntime = runtimes.get(primaryAlias)!;
 
+  // The LIVE served-projects map — the SAME Map object the multi-project facade
+  // reads on every request (routing + `/api/health` listing), so mutating it here
+  // is picked up with NO restart. Kept in lockstep with `runtimes` (which owns
+  // each project's `shutdown`).
+  const servedProjects = new Map<string, ServerDependencies>([...runtimes].map(([a, r]) => [a, r.deps]));
+
+  // SSE subscribers for `/api/projects/stream` — notified after any add/remove so
+  // an open viewer updates its switcher with no manual refresh.
+  const projectListeners = new Set<() => void>();
+  const notifyProjectsChanged = (): void => {
+    for (const listener of [...projectListeners]) {
+      try {
+        listener();
+      } catch (err) {
+        logger.warn("projects: SSE listener threw (ignored)", { error: (err as Error).message });
+      }
+    }
+  };
+
+  // Serialize add/remove so two concurrent requests can't interleave the map +
+  // registry mutations (or double-open the same index). Each op waits its turn;
+  // a rejection never breaks the chain for the next op.
+  let mutationChain: Promise<unknown> = Promise.resolve();
+  const serializeMutation = <T>(fn: () => Promise<T>): Promise<T> => {
+    const next = mutationChain.then(fn, fn);
+    mutationChain = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  };
+
+  const addProjectLive = (rootArg: string, aliasHint?: string): Promise<ProjectAddResult> =>
+    serializeMutation(async () => {
+      const root = canonicalRoot(rootArg);
+      // Idempotent by CANONICAL (symlink-resolved) root: if we already serve this
+      // repo, return it untouched — never double-open the same index.
+      const already = [...runtimes.values()].find((rt) => canonicalRoot(rt.deps.paths.repoRoot) === root);
+      if (already) return { alias: already.alias, root, added: false };
+
+      if (runtimes.size >= MAX_LIVE_PROJECTS) {
+        throw new Error(`project cap reached (${MAX_LIVE_PROJECTS} served) — remove one before adding another`);
+      }
+      const paths = hayvenPathsFor(root);
+      if (!existsSync(paths.hayvenDir)) {
+        throw new Error(`no .hayven/ directory at ${root} — run \`hayven init\` there first`);
+      }
+      // Persist (derives a unique alias), then build + wire the runtime and add it
+      // to the live map. `initProject` throws on a broken index — let it propagate
+      // to the caller (the route returns 400) WITHOUT mutating any map.
+      const entry = registerProject(root, aliasHint);
+      const cfg = loadConfig(root).config;
+      const runtime = initProject(entry.alias, paths, cfg);
+      runtimes.set(entry.alias, runtime);
+      servedProjects.set(entry.alias, runtime.deps);
+      logger.info("project added live", { alias: entry.alias, root });
+      notifyProjectsChanged();
+      return { alias: entry.alias, root, added: true };
+    });
+
+  const removeProjectLive = (aliasOrRoot: string): Promise<boolean> =>
+    serializeMutation(async () => {
+      const abs = canonicalRoot(aliasOrRoot);
+      let runtime = runtimes.get(aliasOrRoot);
+      if (!runtime) runtime = [...runtimes.values()].find((rt) => canonicalRoot(rt.deps.paths.repoRoot) === abs);
+      if (!runtime) return false;
+      if (runtime.alias === primaryAlias) {
+        throw new Error(`cannot remove the primary project (${primaryAlias}) — it owns the daemon's port`);
+      }
+      // 1. Stop NEW requests from selecting it (drop from the ROUTING map only).
+      servedProjects.delete(runtime.alias);
+      // 2. Give a request that selected it just before step 1 a bounded window to
+      //    finish before its Db is closed.
+      await new Promise((r) => setTimeout(r, REMOVE_GRACE_MS));
+      // 3. Shut the runtime down (drains ingest, stops watcher/poller, closes Db).
+      //    Only AFTER a clean shutdown do we drop ownership + persist + notify, so a
+      //    shutdown FAILURE leaves it in `runtimes` (still owned by shutdownAll) and
+      //    in the registry rather than orphaning a live Db.
+      try {
+        await runtime.shutdown();
+      } catch (err) {
+        throw new Error(`failed to shut down ${runtime.alias}: ${(err as Error).message}`);
+      }
+      runtimes.delete(runtime.alias);
+      unregisterProject(runtime.alias);
+      notifyProjectsChanged();
+      logger.info("project removed live", { alias: runtime.alias });
+      return true;
+    });
+
+  const subscribeProjects = (listener: () => void): (() => void) => {
+    projectListeners.add(listener);
+    return () => {
+      projectListeners.delete(listener);
+    };
+  };
+
   const app = buildMultiProjectApp({
     primary: primaryAlias,
-    projects: new Map([...runtimes].map(([a, r]) => [a, r.deps])),
+    projects: servedProjects,
     logger,
     daemonVersion: VERSION,
     nativeVersion: primaryRuntime.deps.nativeVersion,
+    addProject: addProjectLive,
+    removeProject: removeProjectLive,
+    subscribeProjects,
   });
 
   const config = primaryConfig;
   const shutdownAll = async (): Promise<void> => {
+    // Let any in-flight add/remove settle first so we snapshot a quiescent map and
+    // don't race a mutation that's mid-`initProject`/`shutdown`.
+    await mutationChain.catch(() => undefined);
     for (const rt of runtimes.values()) {
       try {
         await rt.shutdown();
