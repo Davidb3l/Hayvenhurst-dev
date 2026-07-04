@@ -733,7 +733,10 @@ fn astro_template_components(source: &[u8]) -> Vec<Vec<String>> {
         // (`count<Threshold`, `foo()<B`, `arr[i]<B`), where `<` is an operator.
         if i > 0 {
             let prev = body[i - 1];
-            if prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'$' || prev == b')'
+            if prev.is_ascii_alphanumeric()
+                || prev == b'_'
+                || prev == b'$'
+                || prev == b')'
                 || prev == b']'
             {
                 i = after;
@@ -890,12 +893,7 @@ struct DefinitionSpan {
 /// Foo` qn). The block is NOT added to `definitions`, so call-edge `src_name`
 /// resolution (which already attributes a method's calls to the method) is
 /// unchanged.
-fn collect_rust_impl_nodes(
-    root: Node,
-    source: &[u8],
-    rel_path: &str,
-    records: &mut Vec<Record>,
-) {
+fn collect_rust_impl_nodes(root: Node, source: &[u8], rel_path: &str, records: &mut Vec<Record>) {
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if node.kind() == "impl_item" {
@@ -1067,9 +1065,7 @@ fn bound_object_name(pair_node: Node, source: &[u8]) -> Option<String> {
 /// object while still skipping `{ nullable: true }`-style option bags.
 fn pair_value_is_callable(pair_node: Node) -> bool {
     matches!(
-        pair_node
-            .child_by_field_name("value")
-            .map(|v| v.kind()),
+        pair_node.child_by_field_name("value").map(|v| v.kind()),
         Some("arrow_function") | Some("function_expression")
     )
 }
@@ -1638,10 +1634,7 @@ fn require_specifier(node: &Node, source: &[u8]) -> Option<String> {
 ///
 /// Nested destructuring (`{a: {b}}`) and array patterns are skipped
 /// (conservative — no binding rather than a wrong one).
-fn require_bindings(
-    node: &Node,
-    source: &[u8],
-) -> (Option<Vec<String>>, Option<Vec<ImportAlias>>) {
+fn require_bindings(node: &Node, source: &[u8]) -> (Option<Vec<String>>, Option<Vec<ImportAlias>>) {
     let Some(parent) = node.parent() else {
         return (None, None);
     };
@@ -1669,8 +1662,16 @@ fn require_bindings(
                         collect_object_pattern_binding(child, source, &mut locals, &mut aliases);
                     }
                     (
-                        if locals.is_empty() { None } else { Some(locals) },
-                        if aliases.is_empty() { None } else { Some(aliases) },
+                        if locals.is_empty() {
+                            None
+                        } else {
+                            Some(locals)
+                        },
+                        if aliases.is_empty() {
+                            None
+                        } else {
+                            Some(aliases)
+                        },
                     )
                 }
                 _ => (None, None),
@@ -1697,8 +1698,7 @@ fn require_bindings(
             if name.kind() != "identifier" {
                 return (None, None);
             }
-            let (Ok(local), Ok(imported)) = (name.utf8_text(source), prop.utf8_text(source))
-            else {
+            let (Ok(local), Ok(imported)) = (name.utf8_text(source), prop.utf8_text(source)) else {
                 return (None, None);
             };
             let aliases = if local != imported {
@@ -1748,8 +1748,7 @@ fn collect_object_pattern_binding(
             if value.kind() != "identifier" {
                 return; // nested pattern — skip, conservative
             }
-            let (Ok(imported), Ok(local)) = (key.utf8_text(source), value.utf8_text(source))
-            else {
+            let (Ok(imported), Ok(local)) = (key.utf8_text(source), value.utf8_text(source)) else {
                 return;
             };
             locals.push(local.to_string());
@@ -1787,10 +1786,11 @@ fn target_identifier(node: Node, source: &[u8]) -> Option<String> {
         // `private_property_identifier` is a JS/TS `#private` member name
         // (`this.#dispatch(...)`); its text INCLUDES the leading `#`, matching
         // the `C.#name` entity naming, so calls to #private methods resolve.
-        "identifier" | "type_identifier" | "field_identifier" | "property_identifier"
-        | "private_property_identifier" => {
-            node.utf8_text(source).ok().map(|s| s.to_string())
-        }
+        "identifier"
+        | "type_identifier"
+        | "field_identifier"
+        | "property_identifier"
+        | "private_property_identifier" => node.utf8_text(source).ok().map(|s| s.to_string()),
         // `a.b.c` / `obj.method` — pick the rightmost identifier-ish child.
         "attribute" | "member_expression" | "field_expression" | "selector_expression" => {
             // Last named child is typically the property/field/selector.
@@ -2221,7 +2221,11 @@ mod tests {
         let out = extract_file("bad.py", src, Language::Python).expect("extract");
         let ws = warns(&out.records);
         assert_eq!(ws.len(), 1, "broken file should warn exactly once: {ws:?}");
-        assert!(ws[0].contains("syntax error"), "warn names a syntax error: {}", ws[0]);
+        assert!(
+            ws[0].contains("syntax error"),
+            "warn names a syntax error: {}",
+            ws[0]
+        );
     }
 
     #[test]
@@ -2265,9 +2269,7 @@ mod tests {
                     kind,
                     range,
                     ..
-                } if kind != "module" => {
-                    Some((qualified_name.clone(), kind.clone(), *range))
-                }
+                } if kind != "module" => Some((qualified_name.clone(), kind.clone(), *range)),
                 _ => None,
             })
             .collect()
@@ -2299,7 +2301,9 @@ mod tests {
             "struct `Foo` (kind class) must still exist, distinct from `impl Foo`: {nodes:?}"
         );
         assert!(
-            nodes.iter().any(|(q, k, _)| q == "Foo::bar" && k == "method"),
+            nodes
+                .iter()
+                .any(|(q, k, _)| q == "Foo::bar" && k == "method"),
             "method `Foo::bar` must still exist: {nodes:?}"
         );
     }
@@ -2350,8 +2354,7 @@ mod tests {
         let out = extract_file("m.ts", src, Language::TypeScript).expect("extract");
         let qs = node_qnames(&out.records);
         assert!(
-            qs.iter()
-                .any(|(q, k)| q == "api/search" && k == "method"),
+            qs.iter().any(|(q, k)| q == "api/search" && k == "method"),
             "object method `api/search` must be a method: {qs:?}"
         );
         assert!(qs.iter().any(|(q, _)| q == "api/health"));
@@ -2365,7 +2368,8 @@ mod tests {
         let out = extract_file("m.ts", src, Language::TypeScript).expect("extract");
         let qs = node_qnames(&out.records);
         assert!(
-            qs.iter().all(|(q, _)| q != "onClick" && !q.ends_with("/onClick")),
+            qs.iter()
+                .all(|(q, _)| q != "onClick" && !q.ends_with("/onClick")),
             "anonymous inline object methods must be skipped: {qs:?}"
         );
     }
@@ -2394,7 +2398,9 @@ mod tests {
         // method entity, not the module/file — chains through it resolve.
         let calls = call_src_dst(&out.records);
         assert!(
-            calls.iter().any(|(s, d)| s == "Context.get" && d == "lookup"),
+            calls
+                .iter()
+                .any(|(s, d)| s == "Context.get" && d == "lookup"),
             "call inside a field-arrow body must attribute to `Context.get`: {calls:?}"
         );
     }
@@ -2407,20 +2413,25 @@ mod tests {
         let out = extract_file("hono-base.ts", src, Language::TypeScript).expect("extract");
         let qs = node_qnames(&out.records);
         assert!(
-            qs.iter().any(|(q, k)| q == "Hono.#dispatch" && k == "method"),
+            qs.iter()
+                .any(|(q, k)| q == "Hono.#dispatch" && k == "method"),
             "`#private` method must be `Hono.#dispatch` (method): {qs:?}"
         );
         let calls = call_src_dst(&out.records);
         // Caller side: a call INSIDE #dispatch's body attributes to it (this is
         // the broken static chain from the hono bench: getPath ← Hono.#dispatch).
         assert!(
-            calls.iter().any(|(s, d)| s == "Hono.#dispatch" && d == "getPath"),
+            calls
+                .iter()
+                .any(|(s, d)| s == "Hono.#dispatch" && d == "getPath"),
             "call inside a #private body must attribute to `Hono.#dispatch`: {calls:?}"
         );
         // Callee side: `this.#dispatch(...)` emits an edge whose dst carries
         // the `#` so it can resolve to the `Hono.#dispatch` entity.
         assert!(
-            calls.iter().any(|(s, d)| s == "Hono.fetch" && d == "#dispatch"),
+            calls
+                .iter()
+                .any(|(s, d)| s == "Hono.fetch" && d == "#dispatch"),
             "`this.#dispatch()` must emit a call edge to `#dispatch`: {calls:?}"
         );
     }
@@ -2438,7 +2449,8 @@ mod tests {
             "#private field arrow must be `C.#log` (method): {qs:?}"
         );
         assert!(
-            qs.iter().all(|(q, _)| q != "C.#var" && !q.ends_with("#var")),
+            qs.iter()
+                .all(|(q, _)| q != "C.#var" && !q.ends_with("#var")),
             "#private DATA field must not be indexed: {qs:?}"
         );
         let calls = call_src_dst(&out.records);
@@ -2455,7 +2467,8 @@ mod tests {
         let out = extract_file("widget.tsx", src, Language::Tsx).expect("extract");
         let qs = node_qnames(&out.records);
         assert!(
-            qs.iter().any(|(q, k)| q == "Widget.render" && k == "method"),
+            qs.iter()
+                .any(|(q, k)| q == "Widget.render" && k == "method"),
             "TSX class-field arrow must be `Widget.render`: {qs:?}"
         );
         assert!(
@@ -2485,7 +2498,9 @@ mod tests {
             "`this.#read()` inside the field arrow must edge from `Store.get`: {calls:?}"
         );
         assert!(
-            calls.iter().any(|(s, d)| s == "Store.#read" && d == "fetchRow"),
+            calls
+                .iter()
+                .any(|(s, d)| s == "Store.#read" && d == "fetchRow"),
             "call inside JS #private body must attribute to `Store.#read`: {calls:?}"
         );
     }
@@ -2671,9 +2686,9 @@ builder.queryField('photosByProject', (t) =>
             .records
             .iter()
             .find_map(|r| match r {
-                Record::Edge {
-                    dst_name, kind, ..
-                } if kind == "static_call" && dst_name == "foo" => {
+                Record::Edge { dst_name, kind, .. }
+                    if kind == "static_call" && dst_name == "foo" =>
+                {
                     Some(serde_json::to_string(r).unwrap())
                 }
                 _ => None,
@@ -2742,11 +2757,9 @@ builder.queryField('photosByProject', (t) =>
                     receiver,
                     receiver_chain,
                     ..
-                } if kind == "static_call" => Some((
-                    dst_name.clone(),
-                    receiver.clone(),
-                    receiver_chain.clone(),
-                )),
+                } if kind == "static_call" => {
+                    Some((dst_name.clone(), receiver.clone(), receiver_chain.clone()))
+                }
                 _ => None,
             })
             .collect()
@@ -2775,8 +2788,7 @@ builder.queryField('photosByProject', (t) =>
         let calls = static_calls_with_chain(&out.records);
         assert!(
             calls.iter().any(|(d, _, c)| d == "run"
-                && c.as_deref()
-                    == Some(&["a".to_string(), "b".to_string(), "c".to_string()][..])),
+                && c.as_deref() == Some(&["a".to_string(), "b".to_string(), "c".to_string()][..])),
             "a.b.c.run() must carry chain [a,b,c]: {calls:?}"
         );
     }
@@ -2816,8 +2828,7 @@ builder.queryField('photosByProject', (t) =>
     fn computed_root_chain_is_skipped() {
         // `arr[i].client.run()` — root is a subscript → no chain, no receiver.
         // `getThing().client.run()` — root is a call → no chain, no receiver.
-        let src =
-            b"function f(arr, i) { arr[i].client.run(); getThing().client.run(); }\n";
+        let src = b"function f(arr, i) { arr[i].client.run(); getThing().client.run(); }\n";
         let out = extract_file("m.ts", src, Language::TypeScript).expect("extract");
         let calls = static_calls_with_chain(&out.records);
         let runs: Vec<_> = calls.iter().filter(|(d, _, _)| d == "run").collect();
@@ -2853,8 +2864,8 @@ builder.queryField('photosByProject', (t) =>
         // chain). The `receiver_chain` EXCLUDES the trailing member, so a
         // 2-part component collapses to just the immediate-object receiver.
         let src = b"---\nimport Foo from \"~/components/Foo.tsx\";\n---\n<Foo.Bar />\n";
-        let out = extract_file("viewer/src/pages/x.astro", src, Language::Astro)
-            .expect("extract astro");
+        let out =
+            extract_file("viewer/src/pages/x.astro", src, Language::Astro).expect("extract astro");
         let calls = static_calls_with_chain(&out.records);
         assert!(
             calls
@@ -2868,11 +2879,13 @@ builder.queryField('photosByProject', (t) =>
     fn astro_lowercase_html_tags_are_not_edges() {
         // Plain HTML tags (`<div>`, `<p>`) must NOT become component edges.
         let src = b"---\nimport Stats from \"~/components/Stats.tsx\";\n---\n<div><p>hi</p><span/></div>\n";
-        let out = extract_file("viewer/src/pages/y.astro", src, Language::Astro)
-            .expect("extract astro");
+        let out =
+            extract_file("viewer/src/pages/y.astro", src, Language::Astro).expect("extract astro");
         let calls = static_calls_with_chain(&out.records);
         assert!(
-            calls.iter().all(|(d, _, _)| d != "div" && d != "p" && d != "span"),
+            calls
+                .iter()
+                .all(|(d, _, _)| d != "div" && d != "p" && d != "span"),
             "lowercase HTML tags must not be edges: {calls:?}"
         );
     }
@@ -2882,8 +2895,8 @@ builder.queryField('photosByProject', (t) =>
         // Paired `<Base>…</Base>` + repeated `<Stats/>` → one edge per distinct
         // component name (the open tag; close tags / repeats deduped).
         let src = b"---\nimport Base from \"~/layouts/Base.astro\";\nimport Stats from \"~/components/Stats.tsx\";\n---\n<Base><Stats /><Stats /></Base>\n";
-        let out = extract_file("viewer/src/pages/z.astro", src, Language::Astro)
-            .expect("extract astro");
+        let out =
+            extract_file("viewer/src/pages/z.astro", src, Language::Astro).expect("extract astro");
         let calls = static_calls_with_chain(&out.records);
         let stats: Vec<_> = calls.iter().filter(|(d, _, _)| d == "Stats").collect();
         let base: Vec<_> = calls.iter().filter(|(d, _, _)| d == "Base").collect();
@@ -2898,10 +2911,8 @@ builder.queryField('photosByProject', (t) =>
         let out = extract_file("m.ts", src, Language::TypeScript).expect("extract");
         let imports = import_locals(&out.records);
         assert!(
-            imports
-                .iter()
-                .any(|(d, l)| d == "~/api/client"
-                    && l.as_deref() == Some(&["api".to_string(), "qk".to_string()][..])),
+            imports.iter().any(|(d, l)| d == "~/api/client"
+                && l.as_deref() == Some(&["api".to_string(), "qk".to_string()][..])),
             "named import must emit local [api, qk]: {imports:?}"
         );
     }
@@ -2961,7 +2972,8 @@ builder.queryField('photosByProject', (t) =>
         // Plain named, default, and namespace imports introduce NO alias → the
         // `import_aliases` field is omitted (None) so the common case is
         // byte-identical with older payloads.
-        let src = b"import { foo } from \"a\";\nimport Bar from \"b\";\nimport * as ns from \"c\";\n";
+        let src =
+            b"import { foo } from \"a\";\nimport Bar from \"b\";\nimport * as ns from \"c\";\n";
         let out = extract_file("m.ts", src, Language::TypeScript).expect("extract");
         let aliases = import_alias_lists(&out.records);
         assert!(
@@ -2973,9 +2985,7 @@ builder.queryField('photosByProject', (t) =>
             .records
             .iter()
             .find_map(|r| match r {
-                Record::Edge { dst_name, kind, .. }
-                    if kind == "import" && dst_name == "a" =>
-                {
+                Record::Edge { dst_name, kind, .. } if kind == "import" && dst_name == "a" => {
                     Some(serde_json::to_string(r).unwrap())
                 }
                 _ => None,
@@ -3045,7 +3055,9 @@ builder.queryField('photosByProject', (t) =>
         let out = extract_file("m.ts", src, Language::TypeScript).expect("extract");
         let imports = import_locals(&out.records);
         assert!(
-            imports.iter().any(|(d, l)| d == "./styles.css" && l.is_none()),
+            imports
+                .iter()
+                .any(|(d, l)| d == "./styles.css" && l.is_none()),
             "side-effect import must omit local: {imports:?}"
         );
         let line = out
@@ -3080,7 +3092,12 @@ builder.queryField('photosByProject', (t) =>
     // ── CommonJS `require()` → import edges ─────────────────────────────────
 
     /// `(src_name, dst_name, local, aliases)` of one import edge.
-    type ImportEdgeView = (String, String, Option<Vec<String>>, Option<Vec<ImportAlias>>);
+    type ImportEdgeView = (
+        String,
+        String,
+        Option<Vec<String>>,
+        Option<Vec<ImportAlias>>,
+    );
 
     /// Collect an {@link ImportEdgeView} for every import edge.
     fn cjs_imports(records: &[Record]) -> Vec<ImportEdgeView> {
@@ -3140,7 +3157,10 @@ builder.queryField('photosByProject', (t) =>
         assert_eq!(imports.len(), 1, "{imports:?}");
         let (_, dst, local, aliases) = &imports[0];
         assert_eq!(dst, "./y");
-        assert_eq!(local.as_deref(), Some(&["a".to_string(), "c".to_string()][..]));
+        assert_eq!(
+            local.as_deref(),
+            Some(&["a".to_string(), "c".to_string()][..])
+        );
         assert_eq!(
             aliases.as_deref(),
             Some(
@@ -3211,7 +3231,10 @@ builder.queryField('photosByProject', (t) =>
         assert_eq!(imports.len(), 1, "{imports:?}");
         let (_, _, local, aliases) = &imports[0];
         assert_eq!(local.as_deref(), Some(&["thing".to_string()][..]));
-        assert!(aliases.is_none(), "same-name member pick needs no alias pair");
+        assert!(
+            aliases.is_none(),
+            "same-name member pick needs no alias pair"
+        );
     }
 
     #[test]
@@ -3273,7 +3296,10 @@ builder.queryField('photosByProject', (t) =>
         let out = extract_file("m.js", src, Language::JavaScript).expect("extract");
         let imports = cjs_imports(&out.records);
         assert_eq!(imports.len(), 1, "{imports:?}");
-        assert_eq!(imports[0].0, "load", "nested require anchors on the enclosing definition");
+        assert_eq!(
+            imports[0].0, "load",
+            "nested require anchors on the enclosing definition"
+        );
         assert_eq!(imports[0].1, "./lazy");
     }
 
@@ -3381,7 +3407,10 @@ exports.etag = mkGenerator({ weak: false });\n";
         let src = b"import os\nfrom sys import argv\n";
         let out = extract_file("m.py", src, Language::Python).expect("extract");
         let imports = import_locals(&out.records);
-        assert!(!imports.is_empty(), "python imports must still emit: {imports:?}");
+        assert!(
+            !imports.is_empty(),
+            "python imports must still emit: {imports:?}"
+        );
         assert!(
             imports.iter().all(|(_, l)| l.is_none()),
             "non-priority langs must omit local: {imports:?}"
@@ -3407,9 +3436,7 @@ exports.etag = mkGenerator({ weak: false });\n";
         records
             .iter()
             .filter_map(|r| match r {
-                Record::Edge {
-                    dst_name, kind, ..
-                } if kind == "import" => Some(dst_name.clone()),
+                Record::Edge { dst_name, kind, .. } if kind == "import" => Some(dst_name.clone()),
                 _ => None,
             })
             .collect()
@@ -3470,10 +3497,7 @@ exports.etag = mkGenerator({ weak: false });\n";
                 _ => None,
             })
             .expect("module node");
-        assert_eq!(
-            module[0], 1,
-            "module starts at line 1: {module:?}"
-        );
+        assert_eq!(module[0], 1, "module starts at line 1: {module:?}");
         assert!(
             module[1] >= 6,
             "module must span past the closing fence into the template: {module:?}"
@@ -3515,7 +3539,10 @@ exports.etag = mkGenerator({ weak: false });\n";
         // Leading blank lines before the fence are tolerated.
         let src2 = b"\n\n---\nconst c = 3;\n---\n";
         let (slice2, offset2) = astro_frontmatter(src2).expect("frontmatter present");
-        assert_eq!(offset2, 3, "content starts on line index 3 after two blanks");
+        assert_eq!(
+            offset2, 3,
+            "content starts on line index 3 after two blanks"
+        );
         assert_eq!(std::str::from_utf8(slice2).unwrap(), "const c = 3;\n");
         // No fence → None.
         assert!(astro_frontmatter(b"<div>only template</div>\n").is_none());
@@ -3523,4 +3550,3 @@ exports.etag = mkGenerator({ weak: false });\n";
         assert!(astro_frontmatter(b"---\nconst d = 4;\n").is_none());
     }
 }
-

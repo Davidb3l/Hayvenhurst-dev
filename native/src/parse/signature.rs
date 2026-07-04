@@ -480,9 +480,7 @@ fn go_signature(def_node: Node, source: &[u8]) -> Option<Signature> {
                 }
                 let name_count = {
                     let mut c = child.walk();
-                    let n = child
-                        .children_by_field_name("name", &mut c)
-                        .count();
+                    let n = child.children_by_field_name("name", &mut c).count();
                     n.max(1)
                 };
                 for _ in 0..name_count {
@@ -497,7 +495,12 @@ fn go_signature(def_node: Node, source: &[u8]) -> Option<Signature> {
         .and_then(|n| go_result_type(n, source))
         .filter(|s| !s.is_empty());
 
-    let visibility = if name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+    let visibility = if name
+        .chars()
+        .next()
+        .map(|c| c.is_uppercase())
+        .unwrap_or(false)
+    {
         Visibility::Public
     } else {
         Visibility::Private
@@ -631,7 +634,9 @@ mod tests {
                     // mirroring `extract.rs`.
                     let sig_node = if matches!(
                         dn.kind(),
-                        "variable_declarator" | "pair" | "public_field_definition"
+                        "variable_declarator"
+                            | "pair"
+                            | "public_field_definition"
                             | "field_definition"
                     ) {
                         dn.child_by_field_name("value").unwrap_or(dn)
@@ -661,7 +666,12 @@ mod tests {
 
     #[test]
     fn python_leading_underscore_is_private() {
-        let s = sig_of("def _helper(x):\n    return x\n", Language::Python, "_helper").unwrap();
+        let s = sig_of(
+            "def _helper(x):\n    return x\n",
+            Language::Python,
+            "_helper",
+        )
+        .unwrap();
         assert_eq!(s.visibility, Visibility::Private);
         assert_eq!(s.arity, 1);
     }
@@ -916,12 +926,7 @@ mod tests {
 
     #[test]
     fn rust_pub_super_is_restricted() {
-        let s = sig_of(
-            "pub(super) fn helper() {}\n",
-            Language::Rust,
-            "helper",
-        )
-        .unwrap();
+        let s = sig_of("pub(super) fn helper() {}\n", Language::Rust, "helper").unwrap();
         assert_eq!(s.visibility, Visibility::Restricted);
     }
 

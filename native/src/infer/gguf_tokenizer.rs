@@ -323,8 +323,8 @@ fn build_unigram_tokenizer(vocab: &GgufVocab, arch: &ModelArch) -> Result<Tokeni
     // precompiled_charsmap absent from the GGUF, and a generic NFKC pass is a
     // *different* normalization than SPM's — closer-to-correct is to do the
     // minimal documented fallback than to guess a fuller one.
-    let collapse_spaces = Replace::new(" {2,}", " ")
-        .map_err(|e| anyhow!("build space-collapse normalizer: {e}"))?;
+    let collapse_spaces =
+        Replace::new(" {2,}", " ").map_err(|e| anyhow!("build space-collapse normalizer: {e}"))?;
     let normalizer = NormalizerSequence::new(vec![NormalizerWrapper::Replace(collapse_spaces)]);
     tokenizer.with_normalizer(Some(normalizer));
 
@@ -533,10 +533,11 @@ mod tests {
     /// ids: 0 <unk>(UNKNOWN) 1 <bos>(CONTROL) 2 <eos>(CONTROL)
     ///      3 "▁hello"(NORMAL) 4 "▁world"(NORMAL) 5 "▁"(NORMAL) 6 "<0x0A>"(BYTE)
     fn synthetic_metadata() -> HashMap<String, Value> {
-        let tokens = [
-            "<unk>", "<bos>", "<eos>", "▁hello", "▁world", "▁", "<0x0A>",
-        ];
-        let token_vals: Vec<Value> = tokens.iter().map(|t| Value::String(t.to_string())).collect();
+        let tokens = ["<unk>", "<bos>", "<eos>", "▁hello", "▁world", "▁", "<0x0A>"];
+        let token_vals: Vec<Value> = tokens
+            .iter()
+            .map(|t| Value::String(t.to_string()))
+            .collect();
         let scores: Vec<Value> = [0.0f32, 0.0, 0.0, -1.0, -2.0, -3.0, 0.0]
             .iter()
             .map(|s| Value::F32(*s))
@@ -561,7 +562,10 @@ mod tests {
             "tokenizer.ggml.model".to_string(),
             Value::String("llama".to_string()),
         );
-        md.insert("tokenizer.ggml.tokens".to_string(), Value::Array(token_vals));
+        md.insert(
+            "tokenizer.ggml.tokens".to_string(),
+            Value::Array(token_vals),
+        );
         md.insert("tokenizer.ggml.scores".to_string(), Value::Array(scores));
         md.insert("tokenizer.ggml.token_type".to_string(), Value::Array(types));
         md.insert("tokenizer.ggml.bos_token_id".to_string(), Value::U32(1));
@@ -586,7 +590,10 @@ mod tests {
 
     #[test]
     fn model_type_dispatch() {
-        assert_eq!(GgmlTokenizerModel::parse("llama"), GgmlTokenizerModel::Llama);
+        assert_eq!(
+            GgmlTokenizerModel::parse("llama"),
+            GgmlTokenizerModel::Llama
+        );
         assert_eq!(GgmlTokenizerModel::parse("gpt2"), GgmlTokenizerModel::Bpe);
         assert_eq!(GgmlTokenizerModel::parse("bpe"), GgmlTokenizerModel::Bpe);
         match GgmlTokenizerModel::parse("t5") {
@@ -836,8 +843,7 @@ mod tests {
             types.push(token_type::BYTE);
         }
 
-        let token_vals: Vec<Value> =
-            tokens.iter().map(|t| Value::String(t.clone())).collect();
+        let token_vals: Vec<Value> = tokens.iter().map(|t| Value::String(t.clone())).collect();
         let score_vals: Vec<Value> = scores.iter().map(|s| Value::F32(*s)).collect();
         let type_vals: Vec<Value> = types.iter().map(|t| Value::I32(*t)).collect();
 
@@ -846,9 +852,18 @@ mod tests {
             "tokenizer.ggml.model".to_string(),
             Value::String("llama".to_string()),
         );
-        md.insert("tokenizer.ggml.tokens".to_string(), Value::Array(token_vals));
-        md.insert("tokenizer.ggml.scores".to_string(), Value::Array(score_vals));
-        md.insert("tokenizer.ggml.token_type".to_string(), Value::Array(type_vals));
+        md.insert(
+            "tokenizer.ggml.tokens".to_string(),
+            Value::Array(token_vals),
+        );
+        md.insert(
+            "tokenizer.ggml.scores".to_string(),
+            Value::Array(score_vals),
+        );
+        md.insert(
+            "tokenizer.ggml.token_type".to_string(),
+            Value::Array(type_vals),
+        );
         md.insert("tokenizer.ggml.bos_token_id".to_string(), Value::U32(1));
         md.insert("tokenizer.ggml.eos_token_id".to_string(), Value::U32(2));
         md.insert("tokenizer.ggml.unknown_token_id".to_string(), Value::U32(0));
@@ -870,7 +885,10 @@ mod tests {
         let text = "hello\n\n\nworld";
         let enc = tok.encode(text, false).expect("encode multiline");
         let decoded = tok.decode(enc.get_ids(), false).expect("decode multiline");
-        assert_eq!(decoded, text, "Gemma 2/3 path must round-trip multi-newline");
+        assert_eq!(
+            decoded, text,
+            "Gemma 2/3 path must round-trip multi-newline"
+        );
     }
 
     #[test]
@@ -904,7 +922,9 @@ mod tests {
             // never immediately wrapping a `\n` piece.
             let toks = enc.get_tokens();
             assert!(
-                !toks.iter().any(|t| t.contains('\u{2581}') && t.contains('\n')),
+                !toks
+                    .iter()
+                    .any(|t| t.contains('\u{2581}') && t.contains('\n')),
                 "no token may mix the space marker with a newline: {toks:?}"
             );
         }

@@ -211,7 +211,15 @@ Read claim A and my intended work — is there a plausible way our edits break e
 
     let output = Command::cargo_bin("hayven-native")
         .expect("locate built binary")
-        .args(["infer", "--model", &model_dir, "--max-tokens", "64", "--temp", "0.0"])
+        .args([
+            "infer",
+            "--model",
+            &model_dir,
+            "--max-tokens",
+            "64",
+            "--temp",
+            "0.0",
+        ])
         .write_stdin(prompt)
         .assert()
         .success()
@@ -220,7 +228,10 @@ Read claim A and my intended work — is there a plausible way our edits break e
         .clone();
 
     let completion = String::from_utf8(output).expect("utf-8 completion");
-    assert!(!completion.is_empty(), "verdict completion must be non-empty");
+    assert!(
+        !completion.is_empty(),
+        "verdict completion must be non-empty"
+    );
     // parseVerdict's contract: the FIRST yes/no word-boundary token wins. Assert
     // such a token exists so the oracle gets a real verdict (not the fallback).
     let lower = completion.to_lowercase();

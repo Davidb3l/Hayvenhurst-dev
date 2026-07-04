@@ -319,7 +319,11 @@ mod tests {
 
         let out = candidates_from_explicit_files(&root, &rels, &opts);
 
-        assert_eq!(out.len(), 1, "only the in-root file should survive: {out:#?}");
+        assert_eq!(
+            out.len(),
+            1,
+            "only the in-root file should survive: {out:#?}"
+        );
         assert!(
             out[0].path.starts_with(&root),
             "surviving candidate must be under root: {:?}",
@@ -348,16 +352,37 @@ mod tests {
         };
 
         // Default: vendored dirs pruned, first-party kept.
-        let def = names(&WalkOptions { include_vendored: false, ..WalkOptions::default() });
-        assert!(def.contains(&"main.go".to_string()), "first-party must be indexed: {def:?}");
-        assert!(!def.contains(&"dep.go".to_string()), "vendor/ must be skipped by default: {def:?}");
-        assert!(!def.contains(&"tp.go".to_string()), "third_party/ must be skipped by default: {def:?}");
+        let def = names(&WalkOptions {
+            include_vendored: false,
+            ..WalkOptions::default()
+        });
+        assert!(
+            def.contains(&"main.go".to_string()),
+            "first-party must be indexed: {def:?}"
+        );
+        assert!(
+            !def.contains(&"dep.go".to_string()),
+            "vendor/ must be skipped by default: {def:?}"
+        );
+        assert!(
+            !def.contains(&"tp.go".to_string()),
+            "third_party/ must be skipped by default: {def:?}"
+        );
 
         // Opt-in: vendored dirs now included.
-        let inc = names(&WalkOptions { include_vendored: true, ..WalkOptions::default() });
+        let inc = names(&WalkOptions {
+            include_vendored: true,
+            ..WalkOptions::default()
+        });
         assert!(inc.contains(&"main.go".to_string()));
-        assert!(inc.contains(&"dep.go".to_string()), "vendor/ must be indexed with include_vendored: {inc:?}");
-        assert!(inc.contains(&"tp.go".to_string()), "third_party/ must be indexed with include_vendored: {inc:?}");
+        assert!(
+            inc.contains(&"dep.go".to_string()),
+            "vendor/ must be indexed with include_vendored: {inc:?}"
+        );
+        assert!(
+            inc.contains(&"tp.go".to_string()),
+            "third_party/ must be indexed with include_vendored: {inc:?}"
+        );
     }
 
     /// Test-fixture apps (`*/test/fixtures/…`), `examples/`, and
@@ -370,20 +395,34 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
         std::fs::create_dir_all(root.join("pkg/test/fixtures/app/src")).expect("mkdir fixture app");
-        std::fs::write(root.join("pkg/test/fixtures/app/src/x.ts"), b"export const x = 1;\n").expect("write x");
+        std::fs::write(
+            root.join("pkg/test/fixtures/app/src/x.ts"),
+            b"export const x = 1;\n",
+        )
+        .expect("write x");
         // NESTED fixture layout (netlify's shape on astro): the test dir is an
         // ANCESTOR, not the direct parent — must still be pruned.
-        std::fs::create_dir_all(root.join("pkg/test/functions/fixtures/mw/src")).expect("mkdir nested fixture");
-        std::fs::write(root.join("pkg/test/functions/fixtures/mw/src/n.ts"), b"export const n = 1;\n").expect("write n");
+        std::fs::create_dir_all(root.join("pkg/test/functions/fixtures/mw/src"))
+            .expect("mkdir nested fixture");
+        std::fs::write(
+            root.join("pkg/test/functions/fixtures/mw/src/n.ts"),
+            b"export const n = 1;\n",
+        )
+        .expect("write n");
         std::fs::create_dir_all(root.join("pkg/examples")).expect("mkdir examples");
         std::fs::write(root.join("pkg/examples/y.ts"), b"export const y = 1;\n").expect("write y");
         std::fs::create_dir_all(root.join("benchmark")).expect("mkdir benchmark");
         std::fs::write(root.join("benchmark/z.ts"), b"export const z = 1;\n").expect("write z");
         // Controls: `fixtures` NOT under a test dir + a non-fixture test subdir.
         std::fs::create_dir_all(root.join("src/fixtures")).expect("mkdir src fixtures");
-        std::fs::write(root.join("src/fixtures/keep.ts"), b"export const k = 1;\n").expect("write keep");
+        std::fs::write(root.join("src/fixtures/keep.ts"), b"export const k = 1;\n")
+            .expect("write keep");
         std::fs::create_dir_all(root.join("src/test/other")).expect("mkdir test other");
-        std::fs::write(root.join("src/test/other/keep2.ts"), b"export const k2 = 1;\n").expect("write keep2");
+        std::fs::write(
+            root.join("src/test/other/keep2.ts"),
+            b"export const k2 = 1;\n",
+        )
+        .expect("write keep2");
 
         let names = |opts: &WalkOptions| -> Vec<String> {
             walker::discover(root, opts)
@@ -394,17 +433,41 @@ mod tests {
 
         // Default: fixture-like dirs pruned; the controls survive.
         let def = names(&WalkOptions::default());
-        assert!(!def.contains(&"x.ts".to_string()), "test/fixtures must be skipped by default: {def:?}");
-        assert!(!def.contains(&"n.ts".to_string()), "NESTED test/*/fixtures must be skipped by default: {def:?}");
-        assert!(!def.contains(&"y.ts".to_string()), "examples/ must be skipped by default: {def:?}");
-        assert!(!def.contains(&"z.ts".to_string()), "benchmark/ must be skipped by default: {def:?}");
-        assert!(def.contains(&"keep.ts".to_string()), "src/fixtures (non-test parent) must ALWAYS be indexed: {def:?}");
-        assert!(def.contains(&"keep2.ts".to_string()), "non-fixture test subdirs must ALWAYS be indexed: {def:?}");
+        assert!(
+            !def.contains(&"x.ts".to_string()),
+            "test/fixtures must be skipped by default: {def:?}"
+        );
+        assert!(
+            !def.contains(&"n.ts".to_string()),
+            "NESTED test/*/fixtures must be skipped by default: {def:?}"
+        );
+        assert!(
+            !def.contains(&"y.ts".to_string()),
+            "examples/ must be skipped by default: {def:?}"
+        );
+        assert!(
+            !def.contains(&"z.ts".to_string()),
+            "benchmark/ must be skipped by default: {def:?}"
+        );
+        assert!(
+            def.contains(&"keep.ts".to_string()),
+            "src/fixtures (non-test parent) must ALWAYS be indexed: {def:?}"
+        );
+        assert!(
+            def.contains(&"keep2.ts".to_string()),
+            "non-fixture test subdirs must ALWAYS be indexed: {def:?}"
+        );
 
         // Opt-in: everything is included.
-        let inc = names(&WalkOptions { include_fixtures: true, ..WalkOptions::default() });
+        let inc = names(&WalkOptions {
+            include_fixtures: true,
+            ..WalkOptions::default()
+        });
         for f in ["x.ts", "n.ts", "y.ts", "z.ts", "keep.ts", "keep2.ts"] {
-            assert!(inc.contains(&f.to_string()), "{f} must be indexed with include_fixtures: {inc:?}");
+            assert!(
+                inc.contains(&f.to_string()),
+                "{f} must be indexed with include_fixtures: {inc:?}"
+            );
         }
     }
 
@@ -418,7 +481,8 @@ mod tests {
         // Repo root deliberately nested under an off-repo dir named `test`.
         let root = dir.path().join("test/repo");
         std::fs::create_dir_all(root.join("fixtures")).expect("mkdir fixtures");
-        std::fs::write(root.join("fixtures/rooty.ts"), b"export const r = 1;\n").expect("write rooty");
+        std::fs::write(root.join("fixtures/rooty.ts"), b"export const r = 1;\n")
+            .expect("write rooty");
 
         let def: Vec<String> = walker::discover(&root, &WalkOptions::default())
             .into_iter()
