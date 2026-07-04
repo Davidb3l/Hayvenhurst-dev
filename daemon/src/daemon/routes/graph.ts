@@ -42,6 +42,14 @@ export function graphRoutes(deps: ServerDependencies) {
       set.status = 404;
       return null;
     }
+    // A `/`-looking id (a structured node id) that only FUZZY-resolved is almost
+    // certainly a typo — 404 rather than confidently answer for a DIFFERENT node
+    // (parity with the `impact`/`refs`/`importers` CLI guard). A bare term (no
+    // `/`) keeps the fuzzy convenience and echoes `resolved` as before.
+    if (r.resolved && rawId.includes("/")) {
+      set.status = 404;
+      return null;
+    }
     return r;
   };
 

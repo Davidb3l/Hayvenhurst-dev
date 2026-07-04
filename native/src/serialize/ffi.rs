@@ -265,8 +265,12 @@ mod tests {
         let mut enc_ptr: *mut u8 = ptr::null_mut();
         let mut enc_len: usize = 0;
         unsafe {
-            let rc =
-                hayven_crdt_encode_batch(json.as_ptr(), json.len(), &mut enc_ptr, &mut enc_len);
+            let rc = hayven_crdt_encode_batch(
+                json.as_ptr(),
+                json.len(),
+                &mut enc_ptr,
+                &mut enc_len,
+            );
             assert_eq!(rc, OK);
         }
         let bytes = unsafe { std::slice::from_raw_parts(enc_ptr, enc_len).to_vec() };
@@ -275,8 +279,12 @@ mod tests {
         let mut dec_ptr: *mut u8 = ptr::null_mut();
         let mut dec_len: usize = 0;
         unsafe {
-            let rc =
-                hayven_crdt_decode_batch(bytes.as_ptr(), bytes.len(), &mut dec_ptr, &mut dec_len);
+            let rc = hayven_crdt_decode_batch(
+                bytes.as_ptr(),
+                bytes.len(),
+                &mut dec_ptr,
+                &mut dec_len,
+            );
             assert_eq!(rc, OK);
         }
         let json2 = unsafe { std::slice::from_raw_parts(dec_ptr, dec_len).to_vec() };
@@ -293,20 +301,14 @@ mod tests {
                 ts_bucket: 0,
                 observed: 1,
                 weight: 100,
-                hlc: HlcWire {
-                    wall_ms: 1,
-                    counter: 0,
-                },
+                hlc: HlcWire { wall_ms: 1, counter: 0 },
                 writer: vec![1; 16],
             },
             OpRecord::Lww {
                 entity_id: "auth/login".into(),
                 content_hash: vec![2; 32],
                 body: b"hello".to_vec(),
-                hlc: HlcWire {
-                    wall_ms: 2,
-                    counter: 0,
-                },
+                hlc: HlcWire { wall_ms: 2, counter: 0 },
                 writer: vec![1; 16],
             },
         ];
@@ -323,20 +325,14 @@ mod tests {
             ts_bucket: 0,
             observed: 1,
             weight: 1,
-            hlc: HlcWire {
-                wall_ms: 1,
-                counter: 0,
-            },
+            hlc: HlcWire { wall_ms: 1, counter: 0 },
             writer: vec![1; 16],
         }];
         let batch2 = vec![OpRecord::Lww {
             entity_id: "x".into(),
             content_hash: vec![3; 32],
             body: b"hi".to_vec(),
-            hlc: HlcWire {
-                wall_ms: 2,
-                counter: 0,
-            },
+            hlc: HlcWire { wall_ms: 2, counter: 0 },
             writer: vec![1; 16],
         }];
         let mut segment = Vec::new();
@@ -358,8 +354,9 @@ mod tests {
 
         let mut p: *mut u8 = ptr::null_mut();
         let mut l: usize = 0;
-        let rc =
-            unsafe { hayven_crdt_decode_segment(segment.as_ptr(), segment.len(), &mut p, &mut l) };
+        let rc = unsafe {
+            hayven_crdt_decode_segment(segment.as_ptr(), segment.len(), &mut p, &mut l)
+        };
         assert_eq!(rc, OK);
         let json = unsafe { std::slice::from_raw_parts(p, l).to_vec() };
         unsafe { hayven_crdt_free(p, l) };
@@ -380,7 +377,9 @@ mod tests {
         let bad = b"not json";
         let mut p: *mut u8 = ptr::null_mut();
         let mut l: usize = 0;
-        let rc = unsafe { hayven_crdt_encode_batch(bad.as_ptr(), bad.len(), &mut p, &mut l) };
+        let rc = unsafe {
+            hayven_crdt_encode_batch(bad.as_ptr(), bad.len(), &mut p, &mut l)
+        };
         assert_eq!(rc, ERR_PARSE);
     }
 }

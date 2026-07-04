@@ -320,6 +320,22 @@ fn ts_visibility(def_node: Node, name: &str, source: &[u8]) -> Visibility {
             return Visibility::Public;
         }
     }
+    // A CLASS-FIELD arrow method (`private handler = () => {}`): `def_node` is
+    // the arrow/function-expression VALUE, but the accessibility modifier lives
+    // on the enclosing field definition (`public_field_definition` in the TS
+    // grammar / `field_definition` in JS), so check the parent wrapper too.
+    if let Some(p) = def_node.parent() {
+        if matches!(p.kind(), "public_field_definition" | "field_definition") {
+            if let Some(modifier) = first_child_of_kind(p, "accessibility_modifier", source) {
+                if modifier == "private" || modifier == "protected" {
+                    return Visibility::Private;
+                }
+                if modifier == "public" {
+                    return Visibility::Public;
+                }
+            }
+        }
+    }
     // Top-level `export function` / `export default function` — the parent of the
     // function_declaration is an export_statement.
     let mut cur = def_node.parent();
@@ -464,7 +480,9 @@ fn go_signature(def_node: Node, source: &[u8]) -> Option<Signature> {
                 }
                 let name_count = {
                     let mut c = child.walk();
-                    let n = child.children_by_field_name("name", &mut c).count();
+                    let n = child
+                        .children_by_field_name("name", &mut c)
+                        .count();
                     n.max(1)
                 };
                 for _ in 0..name_count {
@@ -479,12 +497,7 @@ fn go_signature(def_node: Node, source: &[u8]) -> Option<Signature> {
         .and_then(|n| go_result_type(n, source))
         .filter(|s| !s.is_empty());
 
-    let visibility = if name
-        .chars()
-        .next()
-        .map(|c| c.is_uppercase())
-        .unwrap_or(false)
-    {
+    let visibility = if name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
         Visibility::Public
     } else {
         Visibility::Private
@@ -590,7 +603,8 @@ mod tests {
                 | "definition.method"
                 | "definition.class"
                 | "definition.arrow"
-                | "definition.pair" => def_idxs.push(i as u32),
+                | "definition.pair"
+                | "definition.field" => def_idxs.push(i as u32),
                 _ => {}
             }
         }
@@ -611,10 +625,15 @@ mod tests {
             if let (Some(nn), Some(dn)) = (name_node, def_node) {
                 let nm = text(nn, src);
                 if nm == want_name {
-                    // Arrow/pair captures wrap the callable in a declarator/pair;
-                    // the contract lives on the `value` (arrow_function /
-                    // function_expression), mirroring `extract.rs`.
-                    let sig_node = if matches!(dn.kind(), "variable_declarator" | "pair") {
+                    // Arrow/pair/class-field captures wrap the callable in a
+                    // declarator/pair/field wrapper; the contract lives on the
+                    // `value` (arrow_function / function_expression),
+                    // mirroring `extract.rs`.
+                    let sig_node = if matches!(
+                        dn.kind(),
+                        "variable_declarator" | "pair" | "public_field_definition"
+                            | "field_definition"
+                    ) {
                         dn.child_by_field_name("value").unwrap_or(dn)
                     } else {
                         dn
@@ -642,12 +661,7 @@ mod tests {
 
     #[test]
     fn python_leading_underscore_is_private() {
-        let s = sig_of(
-            "def _helper(x):\n    return x\n",
-            Language::Python,
-            "_helper",
-        )
-        .unwrap();
+        let s = sig_of("def _helper(x):\n    return x\n", Language::Python, "_helper").unwrap();
         assert_eq!(s.visibility, Visibility::Private);
         assert_eq!(s.arity, 1);
     }
@@ -810,6 +824,79 @@ mod tests {
     }
 
     #[test]
+    fn ts_class_field_arrow_signature() {
+        // Class-field arrow methods (`class Context { get = (key: string):
+        // unknown => … }`) were an explicit residual false-negative of the
+        // contract-diff oracle — now extracted like any other arrow, with the
+        // same param/return tokens.
+        let s = sig_of(
+            "export class Context {\n  get = (key: string): unknown => {\n    return key;\n  };\n}\n",
+            Language::TypeScript,
+            "get",
+        )
+        .expect("class-field arrow should yield a signature");
+        assert_eq!(s.arity, 1);
+        assert_eq!(s.params, vec!["string"]);
+        assert_eq!(s.return_type.as_deref(), Some("unknown"));
+        // No accessibility modifier + not `#`-named → unknown (module-private
+        // but possibly reachable), same posture as a plain class method.
+        assert_eq!(s.visibility, Visibility::Unknown);
+    }
+
+    #[test]
+    fn ts_private_modifier_class_field_arrow_is_private() {
+        // The accessibility modifier lives on the FIELD wrapper, not the arrow
+        // value the signature is read from — must still be seen.
+        let s = sig_of(
+            "class C {\n  private handler = (x: number): void => {};\n}\n",
+            Language::TypeScript,
+            "handler",
+        )
+        .unwrap();
+        assert_eq!(s.visibility, Visibility::Private);
+        assert_eq!(s.params, vec!["number"]);
+    }
+
+    #[test]
+    fn ts_hash_private_method_and_field_arrow_are_private() {
+        let method = sig_of(
+            "class Hono {\n  #dispatch(request: Request): Response {\n    return request as unknown as Response;\n  }\n}\n",
+            Language::TypeScript,
+            "#dispatch",
+        )
+        .expect("#private method should yield a signature");
+        assert_eq!(method.arity, 1);
+        assert_eq!(method.params, vec!["Request"]);
+        assert_eq!(method.return_type.as_deref(), Some("Response"));
+        assert_eq!(method.visibility, Visibility::Private);
+
+        let field = sig_of(
+            "class C {\n  #log = (msg: string): void => {};\n}\n",
+            Language::TypeScript,
+            "#log",
+        )
+        .expect("#private field arrow should yield a signature");
+        assert_eq!(field.params, vec!["string"]);
+        assert_eq!(field.visibility, Visibility::Private);
+    }
+
+    #[test]
+    fn js_class_field_arrow_signature_arity_only() {
+        // Plain JS `field_definition` (grammar field `property:`) — arity + raw
+        // param text, no types, consistent with the other JS arrow shapes.
+        let s = sig_of(
+            "class Store {\n  get = (key, fallback) => fallback;\n}\n",
+            Language::JavaScript,
+            "get",
+        )
+        .expect("JS class-field arrow should yield a signature");
+        assert_eq!(s.arity, 2);
+        assert_eq!(s.params, vec!["key", "fallback"]);
+        assert_eq!(s.return_type, None);
+        assert_eq!(s.visibility, Visibility::Unknown);
+    }
+
+    #[test]
     fn rust_pub_crate_is_restricted_not_public() {
         let s = sig_of(
             "pub(crate) fn helper(x: i32) -> i32 { x }\n",
@@ -829,7 +916,12 @@ mod tests {
 
     #[test]
     fn rust_pub_super_is_restricted() {
-        let s = sig_of("pub(super) fn helper() {}\n", Language::Rust, "helper").unwrap();
+        let s = sig_of(
+            "pub(super) fn helper() {}\n",
+            Language::Rust,
+            "helper",
+        )
+        .unwrap();
         assert_eq!(s.visibility, Visibility::Restricted);
     }
 

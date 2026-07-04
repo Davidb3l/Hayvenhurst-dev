@@ -3,7 +3,7 @@ import { describe, expect, it } from "bun:test";
 import { deriveEntityId, nodeMarkdownPath, scopeForFile, unresolvedEdgeId } from "../src/graph/idScheme.ts";
 
 describe("scopeForFile", () => {
-  it("returns the path under the first `src/` segment", () => {
+  it("elides the first `src/` segment for a root-level src (single-repo shape unchanged)", () => {
     expect(scopeForFile("src/auth/login.ts")).toBe("auth");
     expect(scopeForFile("src/auth/sub/login.ts")).toBe("auth/sub");
   });
@@ -15,6 +15,26 @@ describe("scopeForFile", () => {
   it("returns the empty string for top-level files", () => {
     expect(scopeForFile("index.ts")).toBe("");
     expect(scopeForFile("./README.md")).toBe("");
+  });
+
+  // Monorepo P0 (bench/monorepo-astro-RESULTS.md §2a): the OLD rule dropped
+  // everything before the first `src/`, so every package's `src/` root
+  // collapsed onto the same scope — `packages/{vercel,netlify}/src/lib/nft.ts`
+  // both became `lib/nft`, ids are the PK, and 22% of astro's files silently
+  // vanished (337 `src/pages/index.astro` → ONE node). The path BEFORE `src/`
+  // must be retained.
+  it("keeps the pre-`src/` package prefix (monorepo collision fix)", () => {
+    expect(scopeForFile("packages/vercel/src/lib/nft.ts")).toBe("packages/vercel/lib");
+    expect(scopeForFile("packages/netlify/src/lib/nft.ts")).toBe("packages/netlify/lib");
+    expect(scopeForFile("packages/vercel/src/lib/nft.ts")).not.toBe(
+      scopeForFile("packages/netlify/src/lib/nft.ts"),
+    );
+    // Files directly under a package's src/.
+    expect(scopeForFile("packages/astro/src/index.ts")).toBe("packages/astro");
+  });
+
+  it("elides only the FIRST `src/` segment (nested src stays)", () => {
+    expect(scopeForFile("packages/a/src/gen/src/x.ts")).toBe("packages/a/gen/src");
   });
 });
 
@@ -30,6 +50,20 @@ describe("deriveEntityId", () => {
 
   it("falls back to filename when qualified_name is empty", () => {
     expect(deriveEntityId("src/util/x.py", "")).toBe("util/x");
+  });
+
+  it("monorepo: sibling packages' same-named files derive DISTINCT ids", () => {
+    const vercel = deriveEntityId("packages/vercel/src/lib/nft.ts", "copyDependenciesToFunction", {
+      moduleName: "nft",
+      kind: "function",
+    });
+    const netlify = deriveEntityId("packages/netlify/src/lib/nft.ts", "copyDependenciesToFunction", {
+      moduleName: "nft",
+      kind: "function",
+    });
+    expect(vercel).toBe("packages/vercel/lib/nft/copyDependenciesToFunction");
+    expect(netlify).toBe("packages/netlify/lib/nft/copyDependenciesToFunction");
+    expect(vercel).not.toBe(netlify);
   });
 
   describe("module-prefix disambiguation", () => {

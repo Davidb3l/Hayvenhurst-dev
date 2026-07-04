@@ -89,10 +89,7 @@ pub fn run(opts: InferOptions) -> i32 {
             // model's bytes.
             let stdout = std::io::stdout();
             let mut lock = stdout.lock();
-            if let Err(err) = lock
-                .write_all(completion.as_bytes())
-                .and_then(|()| lock.flush())
-            {
+            if let Err(err) = lock.write_all(completion.as_bytes()).and_then(|()| lock.flush()) {
                 eprintln!("hayven-native infer: failed to write completion to stdout: {err:#}");
                 return 1;
             }
@@ -227,7 +224,10 @@ fn generate(opts: &InferOptions, prompt: &str) -> Result<String> {
         .decode(&generated, true)
         .map_err(|e| anyhow::anyhow!("decode completion: {e}"))?;
 
-    eprintln!("hayven-native infer: generated {} tokens", generated.len());
+    eprintln!(
+        "hayven-native infer: generated {} tokens",
+        generated.len()
+    );
     Ok(completion)
 }
 
@@ -240,9 +240,7 @@ fn generate(opts: &InferOptions, prompt: &str) -> Result<String> {
 fn validate_arch_loadable(arch: &gguf_tokenizer::ModelArch) -> Result<()> {
     use gguf_tokenizer::ModelArch;
     if arch.is_loadable_by_quantized_gemma3() {
-        eprintln!(
-            "hayven-native infer: model architecture = {arch:?} (loadable by quantized_gemma3)"
-        );
+        eprintln!("hayven-native infer: model architecture = {arch:?} (loadable by quantized_gemma3)");
         return Ok(());
     }
     match arch {
@@ -310,7 +308,10 @@ fn resolve_artifacts(model_dir: &Path) -> Result<(PathBuf, Option<PathBuf>)> {
 /// is present, else reconstructing it from the GGUF's embedded
 /// `tokenizer.ggml.*` metadata (BL-14). The fidelity boundary of the from-GGUF
 /// path is documented on `gguf_tokenizer`.
-fn load_tokenizer(sidecar: Option<&Path>, content: &gguf_file::Content) -> Result<Tokenizer> {
+fn load_tokenizer(
+    sidecar: Option<&Path>,
+    content: &gguf_file::Content,
+) -> Result<Tokenizer> {
     match sidecar {
         Some(path) => {
             eprintln!(
@@ -416,9 +417,7 @@ mod tests {
         let (gguf, sidecar) = resolve_artifacts(dir.path()).expect("both present ok");
         assert!(gguf.ends_with(MODEL_GGUF_FILENAME));
         assert!(
-            sidecar
-                .expect("sidecar present")
-                .ends_with(TOKENIZER_FILENAME),
+            sidecar.expect("sidecar present").ends_with(TOKENIZER_FILENAME),
             "sidecar path must point at tokenizer.json"
         );
     }

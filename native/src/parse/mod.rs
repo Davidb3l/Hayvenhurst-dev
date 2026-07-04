@@ -52,6 +52,14 @@ pub struct ParseOptions {
     /// `false` — when unset the stream is byte-for-byte the legacy Node/Edge
     /// output. Additive only: the contract-diff conflict oracle consumes these.
     pub emit_signatures: bool,
+    /// Index dependency-source dirs (`vendor/`, `Godeps/`, `third_party/`) too.
+    /// Default false (first-party only). Ignored on the explicit-files path.
+    pub include_vendored: bool,
+    /// Index test-fixture / example / benchmark dirs (`test/fixtures/`,
+    /// `examples/`, `benchmark(s)/`) too. Default false — fixture apps are
+    /// throwaway scaffolds (27.6% of astro's index) that dilute search.
+    /// Ignored on the explicit-files path.
+    pub include_fixtures: bool,
 }
 
 /// Emit one progress record every N files. Small enough that the daemon
@@ -74,6 +82,8 @@ pub fn run(opts: ParseOptions) -> Result<i32> {
     let walk_opts = WalkOptions {
         languages: opts.languages.clone(),
         max_file_size: opts.max_file_size,
+        include_vendored: opts.include_vendored,
+        include_fixtures: opts.include_fixtures,
     };
 
     let candidates: Vec<Candidate> = if let Some(files) = &opts.explicit_files {
@@ -294,6 +304,8 @@ mod tests {
         let opts = WalkOptions {
             languages: HashSet::new(),
             max_file_size: 1 << 20,
+            include_vendored: false,
+            include_fixtures: false,
         };
         let rels = vec![
             "inside.py".to_string(),
@@ -307,16 +319,114 @@ mod tests {
 
         let out = candidates_from_explicit_files(&root, &rels, &opts);
 
-        assert_eq!(
-            out.len(),
-            1,
-            "only the in-root file should survive: {out:#?}"
-        );
+        assert_eq!(out.len(), 1, "only the in-root file should survive: {out:#?}");
         assert!(
             out[0].path.starts_with(&root),
             "surviving candidate must be under root: {:?}",
             out[0].path
         );
         assert!(out[0].path.ends_with("inside.py"));
+    }
+
+    /// Vendored dependency dirs are skipped by default and included only when
+    /// `include_vendored` is set; first-party code is always indexed.
+    #[test]
+    fn vendored_dirs_skipped_by_default_included_on_opt_in() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("main.go"), b"package main\n").expect("write main");
+        std::fs::create_dir_all(root.join("vendor/dep")).expect("mkdir vendor");
+        std::fs::write(root.join("vendor/dep/dep.go"), b"package dep\n").expect("write dep");
+        std::fs::create_dir_all(root.join("third_party")).expect("mkdir third_party");
+        std::fs::write(root.join("third_party/tp.go"), b"package tp\n").expect("write tp");
+
+        let names = |opts: &WalkOptions| -> Vec<String> {
+            walker::discover(root, opts)
+                .into_iter()
+                .map(|c| c.path.file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+
+        // Default: vendored dirs pruned, first-party kept.
+        let def = names(&WalkOptions { include_vendored: false, ..WalkOptions::default() });
+        assert!(def.contains(&"main.go".to_string()), "first-party must be indexed: {def:?}");
+        assert!(!def.contains(&"dep.go".to_string()), "vendor/ must be skipped by default: {def:?}");
+        assert!(!def.contains(&"tp.go".to_string()), "third_party/ must be skipped by default: {def:?}");
+
+        // Opt-in: vendored dirs now included.
+        let inc = names(&WalkOptions { include_vendored: true, ..WalkOptions::default() });
+        assert!(inc.contains(&"main.go".to_string()));
+        assert!(inc.contains(&"dep.go".to_string()), "vendor/ must be indexed with include_vendored: {inc:?}");
+        assert!(inc.contains(&"tp.go".to_string()), "third_party/ must be indexed with include_vendored: {inc:?}");
+    }
+
+    /// Test-fixture apps (`*/test/fixtures/…`), `examples/`, and
+    /// `benchmark(s)/` are skipped by default and included only with
+    /// `include_fixtures` — measured 27.6% index bloat on withastro/astro.
+    /// A first-party `src/fixtures/` (parent is NOT a test dir) and other
+    /// non-fixture test subdirs are ALWAYS indexed.
+    #[test]
+    fn fixture_dirs_skipped_by_default_included_on_opt_in() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("pkg/test/fixtures/app/src")).expect("mkdir fixture app");
+        std::fs::write(root.join("pkg/test/fixtures/app/src/x.ts"), b"export const x = 1;\n").expect("write x");
+        // NESTED fixture layout (netlify's shape on astro): the test dir is an
+        // ANCESTOR, not the direct parent — must still be pruned.
+        std::fs::create_dir_all(root.join("pkg/test/functions/fixtures/mw/src")).expect("mkdir nested fixture");
+        std::fs::write(root.join("pkg/test/functions/fixtures/mw/src/n.ts"), b"export const n = 1;\n").expect("write n");
+        std::fs::create_dir_all(root.join("pkg/examples")).expect("mkdir examples");
+        std::fs::write(root.join("pkg/examples/y.ts"), b"export const y = 1;\n").expect("write y");
+        std::fs::create_dir_all(root.join("benchmark")).expect("mkdir benchmark");
+        std::fs::write(root.join("benchmark/z.ts"), b"export const z = 1;\n").expect("write z");
+        // Controls: `fixtures` NOT under a test dir + a non-fixture test subdir.
+        std::fs::create_dir_all(root.join("src/fixtures")).expect("mkdir src fixtures");
+        std::fs::write(root.join("src/fixtures/keep.ts"), b"export const k = 1;\n").expect("write keep");
+        std::fs::create_dir_all(root.join("src/test/other")).expect("mkdir test other");
+        std::fs::write(root.join("src/test/other/keep2.ts"), b"export const k2 = 1;\n").expect("write keep2");
+
+        let names = |opts: &WalkOptions| -> Vec<String> {
+            walker::discover(root, opts)
+                .into_iter()
+                .map(|c| c.path.file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+
+        // Default: fixture-like dirs pruned; the controls survive.
+        let def = names(&WalkOptions::default());
+        assert!(!def.contains(&"x.ts".to_string()), "test/fixtures must be skipped by default: {def:?}");
+        assert!(!def.contains(&"n.ts".to_string()), "NESTED test/*/fixtures must be skipped by default: {def:?}");
+        assert!(!def.contains(&"y.ts".to_string()), "examples/ must be skipped by default: {def:?}");
+        assert!(!def.contains(&"z.ts".to_string()), "benchmark/ must be skipped by default: {def:?}");
+        assert!(def.contains(&"keep.ts".to_string()), "src/fixtures (non-test parent) must ALWAYS be indexed: {def:?}");
+        assert!(def.contains(&"keep2.ts".to_string()), "non-fixture test subdirs must ALWAYS be indexed: {def:?}");
+
+        // Opt-in: everything is included.
+        let inc = names(&WalkOptions { include_fixtures: true, ..WalkOptions::default() });
+        for f in ["x.ts", "n.ts", "y.ts", "z.ts", "keep.ts", "keep2.ts"] {
+            assert!(inc.contains(&f.to_string()), "{f} must be indexed with include_fixtures: {inc:?}");
+        }
+    }
+
+    /// The fixture-ancestor check is scoped to the WALK ROOT: a repo that
+    /// happens to live under a directory named `test` on the user's disk must
+    /// not have its first-party `fixtures/` skipped (only repo-relative
+    /// ancestors count).
+    #[test]
+    fn fixture_ancestor_check_is_scoped_to_the_walk_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Repo root deliberately nested under an off-repo dir named `test`.
+        let root = dir.path().join("test/repo");
+        std::fs::create_dir_all(root.join("fixtures")).expect("mkdir fixtures");
+        std::fs::write(root.join("fixtures/rooty.ts"), b"export const r = 1;\n").expect("write rooty");
+
+        let def: Vec<String> = walker::discover(&root, &WalkOptions::default())
+            .into_iter()
+            .map(|c| c.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            def.contains(&"rooty.ts".to_string()),
+            "fixtures/ with no IN-REPO test ancestor must be indexed even when the repo lives under an off-repo `test/` dir: {def:?}"
+        );
     }
 }

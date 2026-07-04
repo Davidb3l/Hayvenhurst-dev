@@ -11,6 +11,18 @@ import { warnIfStale } from "../db/freshness.ts";
 import { refsSummary, resolveNodeId, sitesOf } from "../db/graph_walk.ts";
 import { isJson, openProjectDb, requireProject } from "./_shared.ts";
 
+/**
+ * Does `rawId` LOOK like a structured node id rather than a loose search term?
+ * The id scheme is slash-separated (e.g. `werkzeug/http/dump_cookie`), so a `/`
+ * is a strong signal the user typed an exact id — which means a fuzzy FTS
+ * substitution when it isn't found exactly is almost certainly a typo, not a
+ * convenience. A bare term (no `/`, e.g. `dump_cookie`) is a legitimate loose
+ * term and keeps the fuzzy-resolve behavior.
+ */
+function looksLikeExactId(rawId: string): boolean {
+  return rawId.includes("/");
+}
+
 export async function runRefs(args: ParsedArgs): Promise<number> {
   const rawId = args.positionals[0];
   if (!rawId) {
@@ -31,6 +43,17 @@ export async function runRefs(args: ParsedArgs): Promise<number> {
     if (!resolved) {
       process.stderr.write(
         `No node with id \`${rawId}\` — try \`hayven query ${rawId}\` to fuzzy-find it.\n`,
+      );
+      return 1;
+    }
+    // A `/`-containing input LOOKS like a structured node id. If no node has it
+    // EXACTLY, a fuzzy top-FTS-hit substitution is almost certainly a typo, not
+    // what the user meant — proceeding would print a confident, WRONG references
+    // list for an unrelated symbol. Treat it as not-found (mirrors the
+    // fully-not-found path above) so a typo can't masquerade as a real answer.
+    if (resolved.resolved && looksLikeExactId(rawId)) {
+      process.stderr.write(
+        `No node with id \`${rawId}\` — try \`hayven query ${rawId}\` to search.\n`,
       );
       return 1;
     }

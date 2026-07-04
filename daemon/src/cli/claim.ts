@@ -13,7 +13,7 @@
  */
 import { createHash } from "node:crypto";
 
-import { assertDaemonServesProject, requireProject } from "./_shared.ts";
+import { assertDaemonServesProject, reportIdentity, requireProject } from "./_shared.ts";
 import { isJson } from "./_shared.ts";
 import type { ParsedArgs } from "../cli.ts";
 
@@ -51,11 +51,7 @@ export async function runClaim(args: ParsedArgs): Promise<number> {
   // Guard against mutating a DIFFERENT project's daemon (every project defaults
   // to port 7777). Verify the daemon at `base` serves this repo before POSTing.
   const identity = await assertDaemonServesProject(base, ctx);
-  if (!identity.ok) {
-    process.stderr.write(`error: ${identity.message}\n`);
-    return 1;
-  }
-  if (identity.warning) process.stderr.write(`warning: ${identity.warning}\n`);
+  if (!reportIdentity(identity)) return 1;
 
   const ttlSeconds = Math.max(1, Number(args.flags["ttl"]) || 3600);
   const force = args.flags["force"] === true || args.flags["force"] === "true";

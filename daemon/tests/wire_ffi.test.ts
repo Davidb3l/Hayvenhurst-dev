@@ -72,15 +72,11 @@ function findCdylib(): string | null {
 const bin = findBinary();
 const lib = findCdylib();
 
-// The FFI transport is OPT-IN (subprocess is the shipping default); these
-// byte-identity tests run only when it's explicitly enabled, per policy
-// ("skip unless the cdylib is built AND HAYVEN_FFI=1"). Beyond needing both
-// artifacts, we require HAYVEN_FFI=1 in the environment: on some Bun versions
-// bun:ffi segfaults the process when calling into the cdylib (an upstream Bun
-// bug, not our code), so default CI — which never sets HAYVEN_FFI — must skip
-// these rather than crash. Run them deliberately with `HAYVEN_FFI=1 bun test`.
-const canRun =
-  process.env["HAYVEN_FFI"] === "1" && bin !== null && lib !== null;
+// We need BOTH transports to compare them. Require BOTH artifacts AND an explicit
+// opt-in: on some Bun versions bun:ffi segfaults calling into the cdylib (an
+// upstream Bun bug, not our code), so default CI — which never sets HAYVEN_FFI —
+// must skip these rather than crash. Run them deliberately with `HAYVEN_FFI=1 bun test`.
+const canRun = process.env["HAYVEN_FFI"] === "1" && bin !== null && lib !== null;
 const maybeDescribe = canRun ? describe : describe.skip;
 
 const W = (n: number) => {

@@ -73,7 +73,13 @@ export function affectedTestsRoutes(deps: ServerDependencies) {
     // (the query uses its built-in default test detection). traceOnly/limit/depth
     // are all honored.
     const opts: AffectedTestsOpts = {};
-    if (boolParam(query["trace_only"])) opts.traceOnly = true;
+    if (boolParam(query["trace_only"])) {
+      opts.traceOnly = true;
+      // Safety by default (mirrors the CLI): never return ZERO tests for a changed
+      // symbol with no per-test coverage — fall back to its reachable set unless
+      // `strict_observed=true` is passed (to surface coverage gaps).
+      if (!boolParam(query["strict_observed"])) opts.fallbackReachableWhenEmpty = true;
+    }
     const limit = numParam(query["limit"]);
     if (limit !== undefined) opts.limit = limit;
     const depth = numParam(query["depth"]);
@@ -91,6 +97,14 @@ export function affectedTestsRoutes(deps: ServerDependencies) {
       ...head,
       roots: result.roots,
       count: result.tests.length,
+      // ADDITIVE: the differentiated value — tests reached ONLY via runtime
+      // dispatch (a grep/static search would miss these). Per-test `dispatchOnly`
+      // / `staticReachable` ship on each `tests[]` entry.
+      dispatchOnlyCount: result.dispatchOnlyCount,
+      // ADDITIVE: hub honesty — when the affected set is a large fraction of all
+      // test nodes, this map degrades toward "run almost everything".
+      hub: result.hub,
+      blastRadiusFraction: result.blastRadiusFraction,
       traceEdgeCount: result.traceEdgeCount,
       note: result.note,
       tests: result.tests,

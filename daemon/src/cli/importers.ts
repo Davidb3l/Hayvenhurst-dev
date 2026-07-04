@@ -10,6 +10,12 @@ import { warnIfStale } from "../db/freshness.ts";
 import { importersOf, resolveNodeId } from "../db/graph_walk.ts";
 import { isJson, openProjectDb, requireProject } from "./_shared.ts";
 
+/** A `/`-containing input is a structured node id (the id scheme is slash-
+ *  separated); a bare term is a loose search query. Mirrors impact/refs. */
+function looksLikeExactId(rawId: string): boolean {
+  return rawId.includes("/");
+}
+
 export async function runImporters(args: ParsedArgs): Promise<number> {
   const rawId = args.positionals[0];
   if (!rawId) {
@@ -30,6 +36,16 @@ export async function runImporters(args: ParsedArgs): Promise<number> {
     if (!resolved) {
       process.stderr.write(
         `No node with id \`${rawId}\` — try \`hayven query ${rawId}\` to fuzzy-find it.\n`,
+      );
+      return 1;
+    }
+    // A `/`-looking id (structured node id) that only FUZZY-resolved is almost
+    // certainly a typo — proceeding would answer for a DIFFERENT module. Error out
+    // (mirrors impact/refs so a fat-fingered id can't masquerade as a real answer);
+    // a bare term keeps the fuzzy convenience.
+    if (resolved.resolved && looksLikeExactId(rawId)) {
+      process.stderr.write(
+        `No node with id \`${rawId}\` — try \`hayven query ${rawId}\` to search.\n`,
       );
       return 1;
     }

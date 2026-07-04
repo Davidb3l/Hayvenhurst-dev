@@ -189,7 +189,12 @@ export function claimsRoutes(deps: ServerDependencies) {
       // does NOT change the gate: an adjacency conflict is still a soft 202
       // (force-able), never a hard 409 — edge adjacency must not block
       // truly-independent work (§16(4)).
-      const adjacentClaims = findAdjacent(input.scope, active, neighbors);
+      const adjacentClaims = findAdjacent(
+        input.scope,
+        active,
+        neighbors,
+        deps.config.conflict?.adjacency ?? "module+edge",
+      );
       const conflictVerdicts: ConflictVerdict[] = [];
       if (adjacentClaims.length > 0) {
         const incomingCtx = {

@@ -7,9 +7,17 @@
  * Format for entities defined inside a module (functions, classes, methods):
  *   `<scope>/<module_name>/<qualified_name>`
  *
- * `<scope>` is the directory under the project's first `src/` segment. If
- * the file is not under `src/`, the scope is the file's directory path
- * relative to the repo root (or the empty string for top-level files).
+ * `<scope>` is the file's directory path relative to the repo root with the
+ * FIRST `src/` segment elided (or the empty string for top-level files). For a
+ * single-src-root repo this is identical to the historical "directory under
+ * the first `src/`" rule (`src/auth/login.ts` → `auth`), so single-package ids
+ * are unchanged. For a monorepo the path BEFORE `src/` is retained
+ * (`packages/vercel/src/lib/nft.ts` → `packages/vercel/lib`), which is the
+ * monorepo P0 fix: the old rule dropped everything before `src/`, so hundreds
+ * of per-package `src/` roots collapsed onto the same ids (`src/lib/nft.ts` in
+ * vercel and netlify both → `lib/nft`) and, ids being the SQLite PRIMARY KEY,
+ * last-write-wins silently erased 22% of a real monorepo's files from the
+ * index. Ids must be unique per file by construction.
  *
  * The module-name segment is required to disambiguate same-named entities
  * in sibling files (`src/parse/hash.rs` and `src/parse/extract.rs` can both
@@ -22,6 +30,8 @@
  *   lib/util/x.py      module    qn="x"                -> lib/util/x
  *   lib/util/x.py      function  qn="helper"           -> lib/util/x/helper
  *   index.ts           module    qn="index"            -> index
+ *   packages/vercel/src/lib/nft.ts   module qn="nft"   -> packages/vercel/lib/nft
+ *   packages/netlify/src/lib/nft.ts  module qn="nft"   -> packages/netlify/lib/nft
  *
  * BL-16 — module-dot vs `Class.method` dot. A dot in the qualified name is
  * ambiguous: it can be a class/method separator (`Session.refresh`) OR a module
@@ -60,10 +70,13 @@ export function scopeForFile(repoRelFile: string): string {
   if (parts.length === 0) return "";
   const dirParts = parts.slice(0, -1);
 
-  // If the path includes a `src/` segment, use everything after the FIRST one.
+  // Elide the FIRST `src/` segment, KEEPING everything before it. A
+  // single-src-root repo is unchanged (`src/auth` → `auth`); a monorepo keeps
+  // its package prefix (`packages/vercel/src/lib` → `packages/vercel/lib`), so
+  // sibling packages' same-named files can never collide on an id.
   const srcIdx = dirParts.indexOf("src");
   if (srcIdx >= 0) {
-    return dirParts.slice(srcIdx + 1).join(POSIX_SEP);
+    return [...dirParts.slice(0, srcIdx), ...dirParts.slice(srcIdx + 1)].join(POSIX_SEP);
   }
   return dirParts.join(POSIX_SEP);
 }

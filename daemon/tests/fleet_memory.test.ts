@@ -18,6 +18,9 @@
  * `now` is injected everywhere so the suite is deterministic with no real clock.
  */
 import { describe, expect, it } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { Db } from "../src/db/queries.ts";
 import {
@@ -27,6 +30,7 @@ import {
   pruneExpired,
   recordMemory,
   searchMemory,
+  searchMemorySubstring,
   type MemoryNote,
 } from "../src/db/fleet_memory.ts";
 
@@ -252,6 +256,100 @@ describe("fleet_memory: forgetMemory", () => {
   });
 });
 
+describe("fleet_memory: searchMemory FTS+expansion recall (substring MISSES, FTS HITS)", () => {
+  it("recalls an identifier note (authHandler/auth_handler) for the query 'auth handler'", () => {
+    const db = freshDb();
+    // Two notes whose identifiers contain the query words run TOGETHER (camelCase
+    // / snake_case). A contiguous-substring LIKE can't bridge the space in the
+    // query; identifier tokenization in the expansion floor can.
+    recordMemory(db, { kind: "gotcha", note: "the authHandler swallows 401s silently", now: 10, id: "h-camel" });
+    recordMemory(db, { kind: "note", note: "auth_handler must run before the rate limiter", now: 20, id: "h-snake" });
+    recordMemory(db, { kind: "note", note: "unrelated note about the parser", now: 30, id: "h-other" });
+
+    // Baseline substring misses BOTH (no contiguous "auth handler" run anywhere).
+    expect(searchMemorySubstring(db, "auth handler", 100)).toEqual([]);
+
+    // FTS+expansion recalls both identifier notes, newest first, and never the
+    // unrelated note.
+    expect(searchMemory(db, "auth handler", 100).map((n) => n.id)).toEqual(["h-snake", "h-camel"]);
+  });
+
+  it("recalls a 'cfg' note for the query 'config' via the abbreviation table", () => {
+    const db = freshDb();
+    recordMemory(db, { kind: "note", note: "remember to reload cfg after a hot swap", now: 10, id: "abbr" });
+    recordMemory(db, { kind: "note", note: "nothing relevant here", now: 20, id: "noise" });
+
+    // Substring can't bridge config ↔ cfg (no shared contiguous run).
+    expect(searchMemorySubstring(db, "config", 100)).toEqual([]);
+    // The abbrev partner (config → cfg) is OR-ed into the MATCH → hit.
+    expect(searchMemory(db, "config", 100).map((n) => n.id)).toEqual(["abbr"]);
+  });
+
+  it("recalls a multi-token note where only SOME words overlap (relaxed fallback)", () => {
+    const db = freshDb();
+    // The precise AND-of-all-words path can't match (no single note has every
+    // word), but the relaxed fallback ORs the content words after dropping the
+    // English stopword "the", so the best-overlap note still surfaces.
+    recordMemory(db, { kind: "decision", note: "merkle anti-entropy converges peers", now: 10, id: "mt" });
+    recordMemory(db, { kind: "note", note: "completely different subject", now: 20, id: "mt-noise" });
+
+    expect(searchMemorySubstring(db, "how do peers converge", 100)).toEqual([]);
+    expect(searchMemory(db, "how do peers converge", 100).map((n) => n.id)).toEqual(["mt"]);
+  });
+});
+
+describe("fleet_memory: searchMemory FTS path preserves LIVE/order/limit/fallback", () => {
+  it("excludes expired notes through the FTS path", () => {
+    const db = freshDb();
+    // Both notes contain the query identifier; one is expired at read time.
+    recordMemory(db, { kind: "note", note: "the authHandler is live", now: 1_000, id: "live" });
+    // ttl 1s, created at 1000ms → expires at 2000ms.
+    recordMemory(db, { kind: "note", note: "the authHandler is stale", ttl: 1, now: 1_000, id: "stale" });
+
+    // At 1500ms both are live; at 50_000ms only the permanent-ish one survives.
+    expect(searchMemory(db, "auth handler", 1_500).map((n) => n.id).sort()).toEqual(["live", "stale"]);
+    expect(searchMemory(db, "auth handler", 50_000).map((n) => n.id)).toEqual(["live"]);
+  });
+
+  it("returns newest-first and honors the limit cap through the FTS path", () => {
+    const db = freshDb();
+    recordMemory(db, { kind: "note", note: "authHandler one", now: 1, id: "f1" });
+    recordMemory(db, { kind: "note", note: "authHandler two", now: 2, id: "f2" });
+    recordMemory(db, { kind: "note", note: "authHandler three", now: 3, id: "f3" });
+
+    // All three, newest first.
+    expect(searchMemory(db, "authHandler", 100).map((n) => n.id)).toEqual(["f3", "f2", "f1"]);
+    // Cap to the newest 2.
+    expect(searchMemory(db, "authHandler", 100, 2).map((n) => n.id)).toEqual(["f3", "f2"]);
+  });
+
+  it("falls back to the substring path for punctuation-only input (empty MATCH)", () => {
+    const db = freshDb();
+    // A note whose text literally contains the punctuation run, so the substring
+    // fallback can match it — proving the empty-MATCH path routed to substring.
+    recordMemory(db, { kind: "note", note: "edge case: a->b transition", now: 10, id: "punct" });
+    recordMemory(db, { kind: "note", note: "no arrows here", now: 20, id: "no-punct" });
+
+    // "->" sanitizes to an EMPTY FTS MATCH (no word chars) → substring fallback,
+    // which finds the literal "->" run.
+    expect(searchMemory(db, "->", 100).map((n) => n.id)).toEqual(["punct"]);
+    // And it agrees with calling the substring baseline directly.
+    expect(searchMemory(db, "->", 100).map((n) => n.id)).toEqual(
+      searchMemorySubstring(db, "->", 100).map((n) => n.id),
+    );
+  });
+
+  it("FTS path stays at LEAST as good as substring for an exact contiguous term", () => {
+    const db = freshDb();
+    recordMemory(db, { kind: "gotcha", note: "The Watcher Hangs on FSEvents", now: 10, id: "x1" });
+    recordMemory(db, { kind: "note", note: "unrelated content", now: 20, id: "x2" });
+
+    // An exact word that substring already matched must still match via FTS.
+    expect(searchMemorySubstring(db, "watcher", 100).map((n) => n.id)).toEqual(["x1"]);
+    expect(searchMemory(db, "watcher", 100).map((n) => n.id)).toEqual(["x1"]);
+  });
+});
+
 describe("fleet_memory: deterministic id derivation", () => {
   it("derives the same id for identical fields+now and a different id for a different now", () => {
     const db = freshDb();
@@ -277,5 +375,43 @@ describe("fleet_memory: deterministic id derivation", () => {
     // The derived id is non-empty and prefixed (sanity on the hashing path).
     expect(a.id.length).toBeGreaterThan(0);
     expect(a.id.startsWith("mem_")).toBe(true);
+  });
+});
+
+describe("fleet memory FTS sync on a non-migrated write connection (the CLI path)", () => {
+  // The daemonless `hayven memory` CLI opens the index via openProjectDb → a fresh
+  // `new Db(path)` WITHOUT calling migrate(). recordMemory writes via INSERT OR
+  // REPLACE; the fleet_memory_fts delete-then-insert sync only nets correctly when
+  // recursive_triggers is ON, which the Db constructor now sets on every WRITE
+  // connection (not just migrated ones). Regression guard: a same-id re-record on a
+  // non-migrated connection must NOT leave a duplicate FTS row.
+  it("a same-id re-record does not duplicate the FTS row (no migrate on reopen)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "hayven-mem-fts-"));
+    const path = join(dir, "index.sqlite");
+    try {
+      // Create + migrate once (as `init`/`ingest` would), then close.
+      const seed = new Db(path);
+      seed.migrate();
+      seed.close();
+
+      // Reopen WITHOUT migrate — exactly what openProjectDb does for the CLI.
+      const db = new Db(path);
+      const input = { kind: "note" as const, note: "authHandler validates the bearer token", now: 1000 };
+      recordMemory(db, input); // INSERT
+      recordMemory(db, input); // same fields+now → same id → INSERT OR REPLACE
+
+      // FTS recall returns the note exactly ONCE (no stale/duplicate FTS row).
+      const hits = searchMemory(db, "auth handler", 1000);
+      expect(hits.length).toBe(1);
+      // And the raw FTS table holds a single row for that id.
+      const id = hits[0]!.id;
+      const ftsCount = db.handle
+        .query<{ c: number }, [string]>("SELECT COUNT(*) c FROM fleet_memory_fts WHERE id = ?")
+        .get(id)!.c;
+      expect(ftsCount).toBe(1);
+      db.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

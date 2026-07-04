@@ -133,4 +133,69 @@ maybe("branch-aware ingest (E2E, native binary)", () => {
     await runIngest({ positionals: [], flags: { cwd: repo, full: true } });
     expect(nodeCount(fp)).toBe(seededNodes);
   });
+
+  // P2 scale fix: a SAME-BRANCH `hayven ingest` (no switch, no --full) must
+  // re-parse ONLY the changed files, not the whole repo — so a refresh on a
+  // 39K-file repo costs the diff, not a 5.5-min full rebuild. `git diff <head>`
+  // compares the WORKING TREE, so an UNCOMMITTED edit counts.
+  function ingestJson(flags: Record<string, unknown>): Promise<any> {
+    return (async () => {
+      let out = "";
+      const orig = process.stdout.write.bind(process.stdout);
+      (process.stdout as unknown as { write: (s: string) => boolean }).write = (s: string) => {
+        out += s;
+        return true;
+      };
+      try {
+        await runIngest({ positionals: [], flags: flags as never });
+      } finally {
+        (process.stdout as unknown as { write: typeof orig }).write = orig;
+      }
+      return JSON.parse(out);
+    })();
+  }
+
+  test("same-branch refresh re-parses ONLY the changed file (incremental, not full)", async () => {
+    await runInit({ positionals: [], flags: { cwd: repo } });
+    const paths = hayvenPathsFor(repo);
+    const bp = branchSqlitePath(paths, "main");
+    const before = nodeCount(bp);
+
+    // Edit ONE file in place WITHOUT committing (the agent-mid-work case).
+    writeFileSync(
+      join(repo, "a.ts"),
+      "export function funcA() {\n  return funcB();\n}\nexport function funcC() {\n  return funcA();\n}\n",
+    );
+
+    const res = await ingestJson({ cwd: repo, json: true });
+    // The headline assertion: the native parser saw only the 1 changed file.
+    expect(res.filesTotal).toBe(1);
+    // …and the graph is correct: the new entity is present, the rest preserved.
+    expect(hasNode(bp, "funcC")).toBe(true);
+    expect(hasNode(bp, "funcA")).toBe(true);
+    expect(hasNode(bp, "funcB")).toBe(true);
+    expect(nodeCount(bp)).toBe(before + 1);
+  });
+
+  test("same-branch refresh with NO changes is a fast no-op (0 reparsed)", async () => {
+    await runInit({ positionals: [], flags: { cwd: repo } });
+    const res = await ingestJson({ cwd: repo, json: true });
+    expect(res.incremental).toBe(true);
+    expect(res.reparsed).toBe(0);
+  });
+
+  test("incremental same-branch graph equals a full rebuild (correctness)", async () => {
+    await runInit({ positionals: [], flags: { cwd: repo } });
+    const paths = hayvenPathsFor(repo);
+    const bp = branchSqlitePath(paths, "main");
+
+    writeFileSync(join(repo, "b.ts"), "export function funcB() {\n  return 2;\n}\nexport function funcD() {\n  return 9;\n}\n");
+    await runIngest({ positionals: [], flags: { cwd: repo } }); // incremental
+    const incrementalNodes = nodeCount(bp);
+    expect(hasNode(bp, "funcD")).toBe(true);
+
+    // A --full rebuild of the same working tree must yield the same node count.
+    await runIngest({ positionals: [], flags: { cwd: repo, full: true } });
+    expect(nodeCount(bp)).toBe(incrementalNodes);
+  });
 });

@@ -175,3 +175,65 @@ export function deriveEdges(profile: CpuProfile, resolver: NameResolver): Derive
   }
   return out;
 }
+
+/** A covered entity in a profile window: its resolved name + summed samples. */
+export interface CoveredName {
+  name: string;
+  observed: number;
+}
+
+/**
+ * Derive the ENTITIES a profile window executed (for per-test coverage).
+ *
+ * Unlike {@link deriveEdges} — which needs a kept CALLER and a kept CALLEE —
+ * this collects every kept frame that appears anywhere in the call tree with a
+ * non-zero subtree sample sum (i.e. control was in that function, or something
+ * it called, during at least one sample). That difference is load-bearing for
+ * vitest: test bodies are anonymous `it()` callbacks that V8 reports with
+ * `functionName === ""`, so a project function called DIRECTLY from a test body
+ * often has NO kept caller and yields no edge — but it still appears here, so
+ * per-test attribution by WINDOW BOUNDARY (this module's caller tags the whole
+ * window with the current test) sidesteps the anonymous-frame blindness.
+ *
+ * `observed` is the summed subtree hit count across the frame's tree positions
+ * (same honest sample-count semantics as edges), clamped to {@link UINT16_MAX}.
+ */
+export function deriveCoverage(profile: CpuProfile, resolver: NameResolver): CoveredName[] {
+  const nodes = profile?.nodes;
+  if (!Array.isArray(nodes) || nodes.length === 0) return [];
+
+  const byId = new Map<number, ProfileNode>();
+  for (const n of nodes) byId.set(n.id, n);
+
+  // Subtree hit-count sum per node (memoized; defensive cycle guard) — the
+  // same accumulation deriveEdges uses for callee weights.
+  const subtreeSum = new Map<number, number>();
+  const computing = new Set<number>();
+  const sumOf = (id: number): number => {
+    const cached = subtreeSum.get(id);
+    if (cached !== undefined) return cached;
+    if (computing.has(id)) return 0;
+    computing.add(id);
+    const node = byId.get(id);
+    let total = node?.hitCount ?? 0;
+    for (const childId of node?.children ?? []) total += sumOf(childId);
+    computing.delete(id);
+    subtreeSum.set(id, total);
+    return total;
+  };
+
+  const counts = new Map<string, number>();
+  for (const n of nodes) {
+    const name = resolver.nameOf(n.callFrame);
+    if (name === null) continue;
+    const observed = sumOf(n.id);
+    if (observed <= 0) continue; // present in the tree but never sampled
+    counts.set(name, (counts.get(name) ?? 0) + observed);
+  }
+
+  const out: CoveredName[] = [];
+  for (const [name, observed] of counts) {
+    out.push({ name, observed: Math.min(observed, UINT16_MAX) });
+  }
+  return out;
+}

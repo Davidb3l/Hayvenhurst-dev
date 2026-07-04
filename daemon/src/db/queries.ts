@@ -12,6 +12,7 @@ import {
   type ResolvedTraceEdge,
 } from "../graph/traceResolve.ts";
 import { migrate, type MigrationResult } from "./migrations.ts";
+import { FTS_SQL, FTS_TRIGGERS_SQL } from "./schema.ts";
 
 export interface NodeRow {
   id: string;
@@ -92,6 +93,17 @@ export class Db {
 
   constructor(path: string, opts: { readonly?: boolean } = {}) {
     this.handle = new Database(path, { readonly: opts.readonly ?? false, create: !opts.readonly });
+    // recursive_triggers is a PER-CONNECTION setting REQUIRED for the
+    // fleet_memory→fleet_memory_fts sync to stay correct: `recordMemory` writes via
+    // INSERT OR REPLACE, and SQLite only fires the AFTER DELETE trigger on a REPLACE
+    // when recursive_triggers is ON (otherwise a re-record leaves a stale/duplicate
+    // FTS row). SCHEMA_SQL sets it too, but `migrate()` is NOT called on every write
+    // path — the daemonless `hayven memory` CLI opens via `openProjectDb` WITHOUT
+    // migrating — so we set it here on every WRITE connection to make the sync
+    // correct universally. Skipped for readonly (triggers never fire), and safe
+    // globally: `fleet_memory` is the ONLY INSERT OR REPLACE in the schema and no
+    // trigger fires another trigger (so no recursion is introduced).
+    if (!(opts.readonly ?? false)) this.handle.exec("PRAGMA recursive_triggers = ON");
   }
 
   migrate(): MigrationResult {
@@ -106,6 +118,49 @@ export class Db {
   transaction<T>(fn: () => T): T {
     const tx = this.handle.transaction(fn);
     return tx();
+  }
+
+  /**
+   * Run `fn` with the nodes→`nodes_fts` sync triggers DROPPED, then recreate
+   * them. Use this around any BULK node delete.
+   *
+   * Why: `nodes_fts` is a trigram FTS5 table with `id UNINDEXED`, so the per-row
+   * AFTER DELETE trigger (`DELETE FROM nodes_fts WHERE id = old.id`) full-SCANS
+   * the entire FTS table ONCE PER deleted node — O(deleted × total). Measured on
+   * a 135K-node index: deleting ~1K nodes took 26s via the trigger vs 0.7s when
+   * the FTS rows are deleted SET-BASED with the trigger off (~40×). `fn` MUST
+   * delete the matching `nodes_fts` rows itself (the trigger won't fire). Callers
+   * run inside a transaction so a throw rolls back the DROP (triggers restored);
+   * `migrate()` also re-ensures them on open as a backstop. */
+  private withoutFtsTriggers<T>(fn: () => T): T {
+    this.handle.exec(
+      "DROP TRIGGER IF EXISTS nodes_fts_ai;" +
+        "DROP TRIGGER IF EXISTS nodes_fts_ad;" +
+        "DROP TRIGGER IF EXISTS nodes_fts_au;",
+    );
+    try {
+      return fn();
+    } finally {
+      this.handle.exec(FTS_TRIGGERS_SQL);
+    }
+  }
+
+  /**
+   * Clear the whole graph (nodes + edges + the FTS index) for a from-scratch
+   * re-ingest. Bypasses the per-row FTS delete trigger (see
+   * {@link withoutFtsTriggers}) and clears the FTS index by DROP+recreate (O(1),
+   * vs `DELETE FROM nodes` firing the trigger once per node = O(nodes × FTS
+   * scan) — the >30min `--full` pathology on a populated large index). `nodes_fts`
+   * is a regular (non-contentless) FTS5 table, so the `'delete-all'` command is
+   * unavailable; dropping + re-creating the empty table is the fast clear. The
+   * subsequent re-insert repopulates it through the (recreated) INSERT trigger. */
+  clearGraph(): void {
+    this.transaction(() => {
+      this.withoutFtsTriggers(() => {
+        this.handle.exec("DELETE FROM edges; DELETE FROM nodes; DROP TABLE IF EXISTS nodes_fts;");
+        this.handle.exec(FTS_SQL); // recreate the empty FTS table
+      });
+    });
   }
 
   /* ---------- node CRUD ---------- */
@@ -186,7 +241,17 @@ export class Db {
       const before = this.handle
         .query<{ c: number }, [string]>("SELECT COUNT(*) AS c FROM nodes WHERE file = ?")
         .get(file);
-      this.handle.query("DELETE FROM nodes WHERE file = ?").run(file);
+      // Delete the FTS rows SET-BASED with the per-row trigger bypassed: the
+      // trigger's `WHERE id = old.id` scans the whole trigram FTS table per node
+      // (id is UNINDEXED) → O(deleted × total). One `id IN (…)` statement is a
+      // single scan instead (measured ~40× faster on a 135K-node index). MUST
+      // run BEFORE deleting the nodes (the subquery reads them).
+      this.withoutFtsTriggers(() => {
+        this.handle
+          .query("DELETE FROM nodes_fts WHERE id IN (SELECT id FROM nodes WHERE file = ?)")
+          .run(file);
+        this.handle.query("DELETE FROM nodes WHERE file = ?").run(file);
+      });
       return before?.c ?? 0;
     });
   }

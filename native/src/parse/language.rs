@@ -41,7 +41,10 @@ impl Language {
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext {
             "py" => Some(Self::Python),
-            "ts" => Some(Self::TypeScript),
+            // `.cts` (CommonJS TS) / `.mts` (ESM TS) are plain TypeScript to
+            // the grammar — only the module system differs, and both ESM
+            // `import` and CJS `require()` extraction work on either.
+            "ts" | "cts" | "mts" => Some(Self::TypeScript),
             "tsx" => Some(Self::Tsx),
             "js" | "mjs" | "cjs" | "jsx" => Some(Self::JavaScript),
             "rs" => Some(Self::Rust),
@@ -118,5 +121,23 @@ impl Language {
             Self::Go,
             Self::Astro,
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cts_mts_map_to_typescript() {
+        // `.cts` (CommonJS TS) / `.mts` (ESM TS) — added with CJS require()
+        // support so `.cts` files are walked + parsed at all.
+        assert_eq!(Language::from_extension("cts"), Some(Language::TypeScript));
+        assert_eq!(Language::from_extension("mts"), Some(Language::TypeScript));
+        // Pre-existing mappings unchanged.
+        assert_eq!(Language::from_extension("cjs"), Some(Language::JavaScript));
+        assert_eq!(Language::from_extension("mjs"), Some(Language::JavaScript));
+        assert_eq!(Language::from_extension("ts"), Some(Language::TypeScript));
+        assert_eq!(Language::from_extension("unknown"), None);
     }
 }

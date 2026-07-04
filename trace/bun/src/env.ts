@@ -19,13 +19,15 @@ export function isEnabled(env: Record<string, string | undefined> = process.env)
  * Build a {@link TracerConfig} from the environment, layering env over the
  * passed overrides over the defaults.
  *
- * | Env var                  | Default                  |
- * |--------------------------|--------------------------|
- * | `HAYVEN_TRACE`           | unset (set 1 to enable)  |
- * | `HAYVEN_TRACE_URL`       | `http://localhost:7777`  |
- * | `HAYVEN_TRACE_INTERVAL`  | `30` (seconds)           |
- * | `HAYVEN_TRACE_PROJECT`   | (empty; `:`-separated)   |
- * | `HAYVEN_TRACE_RATE`      | `1` (envelope sample_rate)|
+ * | Env var                     | Default                          |
+ * |-----------------------------|----------------------------------|
+ * | `HAYVEN_TRACE`              | unset (set 1 to enable)          |
+ * | `HAYVEN_TRACE_URL`          | `http://localhost:7777`          |
+ * | `HAYVEN_TRACE_INTERVAL`     | `30` (seconds)                   |
+ * | `HAYVEN_TRACE_PROJECT`      | (empty; `:`-separated)           |
+ * | `HAYVEN_TRACE_RATE`         | `1` (envelope sample_rate)       |
+ * | `HAYVEN_TRACE_SAMPLING_US`  | `1000` (V8 sampling interval µs; use 100 for test-suite tracing) |
+ * | `HAYVEN_TRACE_MODULE_ROOT`  | `process.cwd()` (path-qualified module hints; set "" to disable) |
  */
 export function configFromEnv(
   overrides: Partial<TracerConfig> = {},
@@ -41,6 +43,13 @@ export function configFromEnv(
 
   const rate = Number(env.HAYVEN_TRACE_RATE);
   if (Number.isInteger(rate) && rate >= 1) cfg.sampleRate = rate;
+
+  const samplingUs = Number(env.HAYVEN_TRACE_SAMPLING_US);
+  if (Number.isInteger(samplingUs) && samplingUs >= 1) cfg.samplingIntervalUs = samplingUs;
+
+  // Explicitly-set empty string DISABLES path qualification (bare basenames).
+  const moduleRoot = env.HAYVEN_TRACE_MODULE_ROOT;
+  if (moduleRoot !== undefined) cfg.moduleRoot = moduleRoot.trim();
 
   const project = env.HAYVEN_TRACE_PROJECT?.trim();
   if (project) {

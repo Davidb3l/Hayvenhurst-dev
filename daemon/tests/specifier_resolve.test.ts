@@ -77,8 +77,37 @@ describe("SpecifierResolver — relative + extensionless", () => {
     expect(r.resolve("daemon/src/graph/ingest.ts", "../widgets")).toBe("widgets/index");
   });
 
+  it("resolves a PACKAGE-ROOT import (`..` / `../`) to the root index module", () => {
+    // The idiomatic CJS test-suite import: `var express = require('..')` from
+    // test/*.js targets <repo>/index.js. The normalized base is "" — the probe
+    // must not join a leading slash (byFile keys are repo-relative without
+    // one), or the root index can never resolve (68 measured dangles on
+    // express before the fix).
+    const withRoot = new SpecifierResolver(
+      [...nodes, mod("index.js", "index")],
+      "",
+    );
+    expect(withRoot.resolve("test/res.send.js", "..")).toBe("index");
+    expect(withRoot.resolve("test/acceptance/auth.js", "../../")).toBe("index");
+  });
+
   it("resolves a `.js` specifier to a `.ts` source", () => {
     expect(r.resolve("daemon/src/graph/ingest.ts", "./idScheme.js")).toBe("graph/idScheme");
+  });
+
+  it("resolves a relative BUILT-artifact specifier (`../dist/x.js`) to its src source", () => {
+    // Monorepo tests import the package's build output (`../dist/index.js`);
+    // dist/ is always walker-skipped, so only the src twin is indexed.
+    const pkgNodes: GraphNode[] = [
+      mod("packages/remark/test/units.test.js", "packages/remark/test/units.test"),
+      mod("packages/remark/src/index.ts", "packages/remark/index"),
+    ];
+    const rr = new SpecifierResolver(pkgNodes, "");
+    expect(rr.resolve("packages/remark/test/units.test.js", "../dist/index.js")).toBe(
+      "packages/remark/index",
+    );
+    // A dist specifier with NO src twin stays unresolved (no invented target).
+    expect(rr.resolve("packages/remark/test/units.test.js", "../dist/nope.js")).toBeNull();
   });
 
   it("leaves a bare/external specifier UNRESOLVED", () => {
@@ -97,16 +126,17 @@ describe("SpecifierResolver — relative + extensionless", () => {
 
   it("falls back to a file-stem-derived module id when a file has NO `module` node", () => {
     // `useQuery.ts` is parsed as a top-level `function` (arrow-const default
-    // export) with id `components/useQuery` and NO synthetic `module` node — yet
-    // `./useQuery` should still resolve to that real entity id.
+    // export) with NO synthetic `module` node — yet `./useQuery` should still
+    // resolve to that real entity id. Ids carry the monorepo-safe `viewer/`
+    // prefix (scopeForFile retains the pre-`src/` path).
     const noModuleNodes: GraphNode[] = [
-      mod("viewer/src/components/SearchResults.tsx", "components/SearchResults"),
-      entity("viewer/src/components/useQuery.ts", "components/useQuery", "useQuery"),
+      mod("viewer/src/components/SearchResults.tsx", "viewer/components/SearchResults"),
+      entity("viewer/src/components/useQuery.ts", "viewer/components/useQuery", "useQuery"),
       // A sibling entity in the same file (must not perturb the derived mapping).
-      entity("viewer/src/components/useQuery.ts", "components/useQuery/sub", "sub"),
+      entity("viewer/src/components/useQuery.ts", "viewer/components/useQuery/sub", "sub"),
     ];
     const rr = new SpecifierResolver(noModuleNodes, "");
-    expect(rr.resolve("viewer/src/components/SearchResults.tsx", "./useQuery")).toBe("components/useQuery");
+    expect(rr.resolve("viewer/src/components/SearchResults.tsx", "./useQuery")).toBe("viewer/components/useQuery");
   });
 
   it("does NOT invent a target for a module-less file with no matching id", () => {
@@ -118,6 +148,92 @@ describe("SpecifierResolver — relative + extensionless", () => {
     ];
     const rr = new SpecifierResolver(nodes2, "");
     expect(rr.resolve("daemon/src/a/caller.ts", "./other")).toBeNull();
+  });
+});
+
+describe("SpecifierResolver — dotted Python-style internal imports", () => {
+  // Mirror the real werkzeug layout: files under `src/werkzeug/…`; the
+  // package `__init__.py` module id doubles its last segment
+  // (`werkzeug/werkzeug`), plain modules are slash-scoped (`werkzeug/exceptions`).
+  const nodes: GraphNode[] = [
+    mod("src/werkzeug/__init__.py", "werkzeug/werkzeug"),
+    mod("src/werkzeug/exceptions.py", "werkzeug/exceptions"),
+    mod("src/werkzeug/_reloader.py", "werkzeug/_reloader"),
+    // A package with an __init__ (datastructures/ dir): id doubles the segment.
+    mod("src/werkzeug/datastructures/__init__.py", "werkzeug/datastructures/datastructures"),
+    // Symbol nodes inside a module (Python parses classes as `class` entities).
+    entity("src/werkzeug/exceptions.py", "werkzeug/exceptions/HTTPException", "HTTPException", "class"),
+    entity("src/werkzeug/_reloader.py", "werkzeug/_reloader/WatchdogReloaderLoop", "WatchdogReloaderLoop", "class"),
+  ];
+  const r = new SpecifierResolver(nodes, "");
+  // Importing file is irrelevant for a bare dotted specifier (absolute import).
+  const from = "src/werkzeug/serving.py";
+
+  it("resolves `from pkg.mod import Symbol` to the SYMBOL node (longest match)", () => {
+    expect(r.resolve(from, "werkzeug.exceptions.HTTPException")).toBe(
+      "werkzeug/exceptions/HTTPException",
+    );
+    expect(r.resolve(from, "werkzeug._reloader.WatchdogReloaderLoop")).toBe(
+      "werkzeug/_reloader/WatchdogReloaderLoop",
+    );
+  });
+
+  it("resolves a bare dotted MODULE import to its module id", () => {
+    expect(r.resolve(from, "werkzeug.exceptions")).toBe("werkzeug/exceptions");
+  });
+
+  it("resolves a dotted PACKAGE import (dir with __init__.py) to the package module id", () => {
+    // `import werkzeug.datastructures` → the package's __init__ module node,
+    // whose id doubles the last segment.
+    expect(r.resolve(from, "werkzeug.datastructures")).toBe(
+      "werkzeug/datastructures/datastructures",
+    );
+  });
+
+  it("resolves a top-level package import to its __init__ module id", () => {
+    expect(r.resolve(from, "werkzeug")).toBe("werkzeug/werkzeug");
+  });
+
+  it("falls back to the LONGEST matching module prefix when the symbol has no node (re-export)", () => {
+    // `from werkzeug import Request` — no `werkzeug/werkzeug/Request` node
+    // exists (it's a re-export), so it resolves to the package module.
+    expect(r.resolve(from, "werkzeug.Request")).toBe("werkzeug/werkzeug");
+  });
+
+  it("leaves a dotted specifier with an EXTERNAL leading segment UNRESOLVED", () => {
+    // Standard library / third-party — no internal package matches.
+    expect(r.resolve(from, "os.path")).toBeNull();
+    expect(r.resolve(from, "IPython.Shell.IPShellEmbed")).toBeNull();
+    expect(r.resolve(from, "collections.abc.Mapping")).toBeNull();
+    // A leading segment that partially collides but isn't a package.
+    expect(r.resolve(from, "werkzeugx.thing")).toBeNull();
+  });
+
+  it("does NOT treat scoped/scheme/relative specifiers as dotted-internal", () => {
+    // `@scope/pkg` (dotless after scope) stays external; `node:fs` scheme too.
+    expect(r.resolve(from, "@scope/pkg")).toBeNull();
+    expect(r.resolve(from, "node:fs")).toBeNull();
+  });
+
+  it("does not resolve a dotted specifier when the module index is empty", () => {
+    const empty = new SpecifierResolver([mod("src/a/b.ts", "a/b")], "");
+    // `a.b` is not a Python module path here — no importPath key `a` beyond
+    // `a/b`, and `werkzeug.*` has no package at all.
+    expect(empty.resolve("src/a/b.ts", "werkzeug.exceptions")).toBeNull();
+  });
+
+  it("regression — TS relative/alias resolution is unaffected by the dotted probe", () => {
+    // A `.ts` relative import with a dot in the extension must NOT be captured
+    // by the dotted probe (it's handled by the relative branch first).
+    const tsNodes: GraphNode[] = [
+      mod("daemon/src/graph/ingest.ts", "graph/ingest"),
+      mod("daemon/src/graph/types.ts", "graph/types"),
+    ];
+    const rr = new SpecifierResolver(tsNodes, "");
+    expect(rr.resolve("daemon/src/graph/ingest.ts", "./types.ts")).toBe("graph/types");
+    // A genuinely external dotted-looking bare npm-ish name with no internal
+    // package stays external.
+    expect(rr.resolve("daemon/src/graph/ingest.ts", "preact")).toBeNull();
   });
 });
 
@@ -332,9 +448,10 @@ describe("resolveEdges — Astro template component-usage edges", () => {
   // imported MODULE itself.
   const nodes: GraphNode[] = [
     // `Stats.tsx`'s default export is a function node sharing the file's derived
-    // module id `components/Stats` (matches the real graph — see dogfood).
-    entity("viewer/src/components/Stats.tsx", "components/Stats", "Stats"),
-    mod("viewer/src/pages/index.astro", "pages/index"),
+    // module id `viewer/components/Stats` (matches the real graph — see dogfood;
+    // scopeForFile retains the monorepo-safe pre-`src/` prefix).
+    entity("viewer/src/components/Stats.tsx", "viewer/components/Stats", "Stats"),
+    mod("viewer/src/pages/index.astro", "viewer/pages/index"),
   ];
 
   function root(): string {
@@ -367,6 +484,6 @@ describe("resolveEdges — Astro template component-usage edges", () => {
     ];
     const { resolved } = resolveEdges(nodes, raw, { repoRoot: root() });
     const callEdge = resolved.find((e) => e.kind === "static_call");
-    expect(callEdge?.dst).toBe("components/Stats");
+    expect(callEdge?.dst).toBe("viewer/components/Stats");
   });
 });

@@ -7,6 +7,8 @@
 import type { Database } from "bun:sqlite";
 
 import {
+  FTS_FLEET_MEMORY_SQL,
+  FTS_FLEET_MEMORY_TRIGGERS_SQL,
   FTS_SQL,
   FTS_TRIGGERS_SQL,
   SCHEMA_SQL,
@@ -69,6 +71,17 @@ export function migrate(db: Database): MigrationResult {
 
     db.exec(FTS_SQL);
     db.exec(FTS_TRIGGERS_SQL);
+
+    // v6 → v7 (fleet-memory FTS recall): create the `fleet_memory_fts` trigram
+    // table + its sync triggers, then BACKFILL it from any existing
+    // `fleet_memory` rows so `searchMemory`'s FTS path works on a pre-v7 DB
+    // WITHOUT a reingest. `CREATE … IF NOT EXISTS` makes the create idempotent;
+    // the backfill is version-gated (only when the table is newly empty but
+    // `fleet_memory` already has rows) so it never duplicates on a re-run.
+    db.exec(FTS_FLEET_MEMORY_SQL);
+    db.exec(FTS_FLEET_MEMORY_TRIGGERS_SQL);
+    backfillFleetMemoryFts(db);
+
     appliedFts = true;
   }
 
@@ -174,6 +187,44 @@ function rebuildFtsWithPathColumn(db: Database): void {
   }
 }
 
+/**
+ * v6 → v7 (fleet-memory FTS recall): backfill `fleet_memory_fts` from the
+ * existing `fleet_memory` rows.
+ *
+ * The table + triggers are created just before this runs, but the triggers only
+ * mirror FUTURE writes — a DB that already accumulated notes before v7 would have
+ * an EMPTY FTS index and `searchMemory`'s FTS path would silently return nothing
+ * for those rows. We close that gap once: when the FTS index is empty but the
+ * base table has rows, copy every (id, note) across. Idempotent + safe to run on
+ * every start:
+ *   - if `fleet_memory_fts` already has ANY row (a normal populated DB, or a
+ *     prior backfill), it's a no-op (the count guard short-circuits);
+ *   - a fresh DB has no `fleet_memory` rows, so the SELECT is empty anyway.
+ * The count guard (rather than an unconditional INSERT) is what keeps a populated
+ * v7 DB from double-inserting on the next start. Wrapped in a transaction so a
+ * crash mid-backfill leaves the index empty and the backfill simply re-runs.
+ */
+function backfillFleetMemoryFts(db: Database): void {
+  const ftsCount = db
+    .query<{ n: number }, []>("SELECT COUNT(*) AS n FROM fleet_memory_fts")
+    .get();
+  if ((ftsCount?.n ?? 0) > 0) return; // already populated — nothing to backfill.
+
+  const memCount = db
+    .query<{ n: number }, []>("SELECT COUNT(*) AS n FROM fleet_memory")
+    .get();
+  if ((memCount?.n ?? 0) === 0) return; // fresh / empty base table — nothing to copy.
+
+  db.exec("BEGIN");
+  try {
+    db.exec("INSERT INTO fleet_memory_fts(id, note) SELECT id, note FROM fleet_memory");
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+}
+
 export function currentUserVersion(db: Database): number {
   const row = db.query<{ user_version: number }, []>("PRAGMA user_version").get();
   return row?.user_version ?? 0;
@@ -213,7 +264,11 @@ export function dropAll(db: Database): void {
     DROP TRIGGER IF EXISTS nodes_fts_ai;
     DROP TRIGGER IF EXISTS nodes_fts_ad;
     DROP TRIGGER IF EXISTS nodes_fts_au;
+    DROP TRIGGER IF EXISTS fleet_memory_fts_ai;
+    DROP TRIGGER IF EXISTS fleet_memory_fts_ad;
     DROP TABLE  IF EXISTS nodes_fts;
+    DROP TABLE  IF EXISTS fleet_memory_fts;
+    DROP TABLE  IF EXISTS fleet_memory;
     DROP TABLE  IF EXISTS edges;
     DROP TABLE  IF EXISTS call_sites;
     DROP TABLE  IF EXISTS claims;

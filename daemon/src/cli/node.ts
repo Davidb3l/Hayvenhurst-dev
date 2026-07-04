@@ -13,7 +13,7 @@
  */
 import { readFileSync } from "node:fs";
 
-import { assertDaemonServesProject, isJson, requireProject } from "./_shared.ts";
+import { assertDaemonServesProject, isJson, reportIdentity, requireProject } from "./_shared.ts";
 import type { ParsedArgs } from "../cli.ts";
 
 export async function runNode(args: ParsedArgs): Promise<number> {
@@ -58,11 +58,7 @@ export async function runNode(args: ParsedArgs): Promise<number> {
   // node body writes to the LWW op-log via the daemon — refuse if the daemon at
   // this port serves a DIFFERENT repo (verified foreign-write footgun).
   const identity = await assertDaemonServesProject(base, ctx);
-  if (!identity.ok) {
-    process.stderr.write(`error: ${identity.message}\n`);
-    return 1;
-  }
-  if (identity.warning) process.stderr.write(`warning: ${identity.warning}\n`);
+  if (!reportIdentity(identity)) return 1;
 
   let res: Response;
   try {

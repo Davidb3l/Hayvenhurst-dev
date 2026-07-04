@@ -213,6 +213,201 @@ describe("TraceNameResolver — module-hint disambiguation (the `queries:close` 
     // the hint pass never runs.
     expect(resolver.resolve("db.queries.Db.close")).toBe("db/queries/Db.close");
   });
+
+  it("picks the MORE-SPECIFIC candidate over one sharing only the generic top segment (the `decorators:command` recall bug)", () => {
+    // `command` is ambiguous: the real decorator `click/decorators/command` vs the
+    // unrelated method `click/core/Group.command`. BOTH ids share the generic
+    // top-package segment `click`, but only the true target also shares the
+    // specific `decorators`. The old any-segment rule scored both as "aligned" →
+    // manufactured a tie → dropped the coverage row (a real recall hole). Scoring
+    // by # of shared hint segments resolves to the more-specific candidate.
+    const r = new TraceNameResolver([
+      node("click/decorators/command", "command", "command"),
+      node("click/core/Group.command", "command", "Group.command"),
+      node("tests/test_basic/command", "command", "command"),
+    ]);
+    expect(r.resolve("click.decorators:command")).toBe("click/decorators/command");
+  });
+
+  it("still stays UNRESOLVED on an EQUAL-score tie (scoring does not weaken the discipline)", () => {
+    // Both candidates share exactly the hint segment `click` and nothing more →
+    // equal top score → unresolved, never an arbitrary pick.
+    const r = new TraceNameResolver([
+      node("click/decorators/command", "command", "command"),
+      node("click/core/command", "command", "command"),
+    ]);
+    expect(r.resolve("click:command")).toBeNull();
+  });
+});
+
+describe("TraceNameResolver — path-suffix hints (the hono `router:match` ambiguity)", () => {
+  /**
+   * The hono shape (bench/affected-tests-typescript-RESULTS.md §3): FIVE router
+   * modules share the file basename `router.ts`, each defining a `match` method,
+   * so the bare name `match` is 5-way ambiguous and a basename-only module hint
+   * (`router`) ties every candidate. A PATH-QUALIFIED hint
+   * (`router/reg-exp-router/router`) must pick the right one: the longest hint
+   * suffix appearing contiguously in the id wins.
+   */
+  const HONO_FIXTURE: IndexedNode[] = [
+    node("router/reg-exp-router/router/RegExpRouter.match", "match", "RegExpRouter.match"),
+    node("router/smart-router/router/SmartRouter.match", "match", "SmartRouter.match"),
+    node("router/trie-router/router/TrieRouter.match", "match", "TrieRouter.match"),
+    node("router/linear-router/router/LinearRouter.match", "match", "LinearRouter.match"),
+    node("router/pattern-router/router/PatternRouter.match", "match", "PatternRouter.match"),
+  ];
+  const resolver = new TraceNameResolver(HONO_FIXTURE);
+
+  it("basename-only hint stays UNRESOLVED across 5 same-basename modules (never guess)", () => {
+    // The measured hono failure mode: the collector hinted only `router`, which
+    // every candidate contains → 5-way tie → correctly refuses.
+    expect(resolver.resolve("router:match")).toBeNull();
+  });
+
+  it("path-qualified hint resolves via longest-suffix-wins", () => {
+    expect(resolver.resolve("router/reg-exp-router/router:match")).toBe(
+      "router/reg-exp-router/router/RegExpRouter.match",
+    );
+    expect(resolver.resolve("router/smart-router/router:match")).toBe(
+      "router/smart-router/router/SmartRouter.match",
+    );
+  });
+
+  it("a PARTIAL path suffix still discriminates (`reg-exp-router/router` beats bare `router`)", () => {
+    // The hint need not be the full module path — a 2-segment suffix already
+    // matches only one candidate with run 2 (the rest score 1 on `router`).
+    expect(resolver.resolve("reg-exp-router/router:match")).toBe(
+      "router/reg-exp-router/router/RegExpRouter.match",
+    );
+  });
+
+  it("drops a file-extension token from a path-shaped hint (`…/router.ts` scores as `…/router`)", () => {
+    // A collector hinting with the literal file path emits `router.ts`, whose
+    // `ts` token can never match an id segment; it must not zero the suffix.
+    expect(resolver.resolve("router/trie-router/router.ts:match")).toBe(
+      "router/trie-router/router/TrieRouter.match",
+    );
+  });
+
+  it("`index`-everywhere: a path-qualified hint picks the right same-basename `index` module", () => {
+    const r = new TraceNameResolver([
+      node("jsx/dom/index/upgradeWebSocket", "upgradeWebSocket", "upgradeWebSocket"),
+      node("adapter/deno/index/upgradeWebSocket", "upgradeWebSocket", "upgradeWebSocket"),
+    ]);
+    expect(r.resolve("index:upgradeWebSocket")).toBeNull(); // basename-only → tie
+    expect(r.resolve("jsx/dom/index:upgradeWebSocket")).toBe(
+      "jsx/dom/index/upgradeWebSocket",
+    );
+    expect(r.resolve("adapter/deno/index:upgradeWebSocket")).toBe(
+      "adapter/deno/index/upgradeWebSocket",
+    );
+  });
+
+  it("a LONGER matched suffix beats a shorter one on equal shared-segment counts", () => {
+    // Both ids contain `router`, but only one contains the contiguous
+    // `regexp/router` run — the longer suffix must win outright.
+    const r = new TraceNameResolver([
+      node("lib/regexp/router/dispatch", "dispatch", "dispatch"),
+      node("lib/other/router/regexp/dispatch", "dispatch", "dispatch"),
+    ]);
+    // Hint `regexp/router`: candidate 1 has the contiguous run (len 2); candidate
+    // 2 contains both segments but NOT as the hint-ordered contiguous suffix, so
+    // it scores (1, 2) vs (2, 2) — the suffix axis is primary.
+    expect(r.resolve("regexp/router:dispatch")).toBe("lib/regexp/router/dispatch");
+  });
+
+  it("equal suffix AND shared scores stay UNRESOLVED, independent of insertion order", () => {
+    const a = node("pkg/mod/router/handle", "handle", "handle");
+    const b = node("lib/mod/router/handle", "handle", "handle");
+    for (const fixture of [[a, b], [b, a]]) {
+      const r = new TraceNameResolver(fixture);
+      // `mod/router` appears contiguously in BOTH ids → (2, 2) tie both ways.
+      expect(r.resolve("mod/router:handle")).toBeNull();
+    }
+  });
+
+  it("deeper-rooted ids (src/ prefix) still match a repo-relative hint suffix", () => {
+    // The id may be rooted deeper than the hint (`src/…`); the contiguous-run
+    // match is position-independent, so the suffix still lands.
+    const r = new TraceNameResolver([
+      node("src/router/reg-exp-router/router/RegExpRouter.match", "match", "RegExpRouter.match"),
+      node("src/router/smart-router/router/SmartRouter.match", "match", "SmartRouter.match"),
+    ]);
+    expect(r.resolve("router/reg-exp-router/router:match")).toBe(
+      "src/router/reg-exp-router/router/RegExpRouter.match",
+    );
+  });
+});
+
+describe("TraceNameResolver — ambiguous dotted stems (the vitest `index.test` ×44 ceiling)", () => {
+  /**
+   * The Bun collector attributes per-test coverage to the TEST FILE's module
+   * node, whose qualified name is the dotted stem (`index.test`) — shared by
+   * 44 files on hono, so the trailing 2-segment join is AMBIGUOUS and, before
+   * this pass, conservatively dropped (measured 39 correct / 95 dropped / 0
+   * wrong). The path-qualified name the collector emits must now disambiguate
+   * through the SAME hint scoring, keyed on the retained qualified candidates.
+   */
+  const VITEST_FIXTURE: IndexedNode[] = [
+    node("jsx/dom/index.test", "index.test", "index.test"),
+    node("middleware/basic-auth/index.test", "index.test", "index.test"),
+    node("adapter/deno/index.test", "index.test", "index.test"),
+  ];
+  const resolver = new TraceNameResolver(VITEST_FIXTURE);
+
+  it("a bare ambiguous stem stays UNRESOLVED (no hint, no guess)", () => {
+    expect(resolver.resolve("index.test")).toBeNull();
+  });
+
+  it("path-qualified stems resolve each same-stem test file uniquely", () => {
+    expect(resolver.resolve("src/jsx/dom/index.test")).toBe("jsx/dom/index.test");
+    expect(resolver.resolve("src/middleware/basic-auth/index.test")).toBe(
+      "middleware/basic-auth/index.test",
+    );
+    expect(resolver.resolve("src/adapter/deno/index.test")).toBe(
+      "adapter/deno/index.test",
+    );
+  });
+
+  it("a genuinely tied qualified stem still refuses, insertion-order independent", () => {
+    const a = node("pkg/dom/index.test", "index.test", "index.test");
+    const b = node("lib/dom/index.test", "index.test", "index.test");
+    for (const fixture of [[a, b], [b, a]]) {
+      const r = new TraceNameResolver(fixture);
+      expect(r.resolve("dom/index.test")).toBeNull(); // `dom` run of 1 in both → tie
+    }
+  });
+
+  it("multi-dot stems resolve via the 3-segment trailing join", () => {
+    const r = new TraceNameResolver([
+      node("utils/common.case.test", "common.case.test", "common.case.test"),
+      node("jsx/dom/index.test", "index.test", "index.test"),
+    ]);
+    // Unique 3-segment stem: exact byQualified hit at n=3.
+    expect(r.resolve("src/utils/common.case.test")).toBe("utils/common.case.test");
+  });
+
+  it("ambiguous multi-dot stems disambiguate by path at the 3-segment join", () => {
+    const r = new TraceNameResolver([
+      node("client/common.case.test", "common.case.test", "common.case.test"),
+      node("server/common.case.test", "common.case.test", "common.case.test"),
+    ]);
+    expect(r.resolve("common.case.test")).toBeNull(); // no hint → refuse
+    expect(r.resolve("src/client/common.case.test")).toBe("client/common.case.test");
+    expect(r.resolve("src/server/common.case.test")).toBe("server/common.case.test");
+  });
+
+  it("the 2-segment exact-unique precedence is unchanged (methods still win outright)", () => {
+    // A unique `Class.method` qualified join must keep winning before any
+    // stem-candidate scoring is consulted.
+    const r = new TraceNameResolver([
+      node("auth/session/Session.refresh", "refresh", "Session.refresh"),
+      node("jsx/dom/index.test", "index.test", "index.test"),
+    ]);
+    expect(r.resolve("worker_3/auth.session:Session.refresh")).toBe(
+      "auth/session/Session.refresh",
+    );
+  });
 });
 
 describe("Db.resolvedTraceEdges (read-time join)", () => {

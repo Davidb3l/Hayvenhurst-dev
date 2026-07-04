@@ -72,12 +72,44 @@ NOT promoted — we don't explode the index with one-off option bags.
 ### Nested arrow/function-expr ids are qualified by their enclosing definition
 A helper defined inside another function (`function outer(){ const inner = () =>
 … }`) is emitted as `outer/inner` (`arrow_qualified_name` walks enclosing
-`class_declaration`/`function_declaration`/`method_definition`/arrow-const
-ancestors). The separator is `/` (the project entity-id separator), not the
-language `.`/`::`, because these are synthetic nav ids. WHAT WE STILL SKIP:
-anonymous one-off callbacks (`arr.map(x => …)`), and class-field arrows
-(`class C { handler = () => {} }`, a `public_field_definition`, not a
-`variable_declarator`/`pair`) — a documented blind spot.
+`class_declaration`/`function_declaration`/`method_definition`/arrow-const/
+class-field-arrow ancestors). The separator is `/` (the project entity-id
+separator), not the language `.`/`::`, because these are synthetic nav ids.
+WHAT WE STILL SKIP: anonymous one-off callbacks (`arr.map(x => …)`). Class-field
+arrows are NO LONGER skipped — see the next section.
+
+### Class-field arrow methods and `#private` methods ARE extracted (2026-07-01)
+Two modern class idioms the queries used to miss entirely (found on hono, where
+they hid the ENTIRE `Context` API and `Hono.#dispatch` — see
+`bench/affected-tests-typescript-RESULTS.md` §5(3)):
+
+- **Class-field arrows** — `class Context { get = (key) => {…} }`. The grammar
+  spells these as a field definition, NOT a `method_definition`. Node-name
+  gotcha: the TS grammar calls it `public_field_definition` (even for
+  `#private`/`private`-modifier fields) with the name under the `name:` field;
+  the JS grammar calls it `field_definition` with the name under `property:`.
+  Both are captured as `@definition.field` and promoted to **`method`** nodes
+  named with the class-method convention (`Context.get`, dot separator, via
+  `qualified_name` — NOT the `/`-separated arrow id). Only CALLABLE-valued
+  fields match (`value:` is an `arrow_function`/`function_expression`); data
+  fields (`#var = new Map()`) stay unindexed. Like arrow/pair, the *signature*
+  is read from the `value` node; an accessibility modifier (`private handler =
+  …`) lives on the field wrapper, so `ts_visibility` checks the parent too.
+- **`#private` methods** — `class Hono { #dispatch(…) {…} }`. A normal
+  `method_definition` whose `name:` is a `private_property_identifier`; the
+  leading `#` is part of the node text, so the entity is `Hono.#dispatch` and
+  visibility is `private`. `target_identifier` also accepts
+  `private_property_identifier` so `this.#dispatch(…)` emits a call edge with
+  `dst_name:"#dispatch"` (receiver `this`) — both call directions through
+  private methods resolve.
+
+Caller-side effect worth knowing: both idioms now appear in `definitions`, so
+calls INSIDE their bodies attribute to the method entity (`Hono.#dispatch →
+getPath`) instead of leaking to the enclosing class node — this is what repairs
+static call chains that previously dead-ended at these members. A nested
+`const res = (h) => …` inside a field-arrow body is qualified through the field
+(`Context/html/res`), no longer colliding with a same-named real member
+(`Context.res`).
 
 ### Single-parameter parenthesis-free arrows
 `x => x + 1` carries its lone param under the **singular** `parameter` field, not
@@ -139,6 +171,65 @@ wire when `None`, so side-effect imports and non-JS langs are byte-identical to
 before. Pairing `receiver` (call site) with `local` (import site) is what lets
 the daemon resolve `api.search()` → the `search` member of whatever `~/api/client`
 binds to `api`.
+
+### CommonJS `require()` IS an import edge (2026-07-02) — recognized in the `@call` arm, not a query pattern
+Plain-JS CommonJS produced ZERO import edges (measured on express: every
+`require` collapsed to one `?:require` static_call and refs/impact were blind).
+Now a `require("<string literal>")` call in any JS-family grammar
+(JS/TS/TSX/Astro frontmatter — covers `.js`/`.cjs`/`.mjs`/`.ts`/`.cts`/`.mts`)
+is emitted as an **`import` edge** with the string literal as `dst_name`, the
+exact ESM wire shape (daemon's SpecifierResolver needs no changes).
+
+Grammar/implementation notes:
+- **No query change for require** — `(call_expression) @call` already matches
+  every require call, so `extract.rs` intercepts inside the `@call` handling
+  (`require_specifier`) BEFORE the static_call path and `continue`s. One source
+  construct → one edge: a recognized require does NOT also emit a call (mirrors
+  ESM `import` statements). Only the bare identifier `require` with EXACTLY one
+  plain `string` argument matches; `require(expr)`, `require("./" + x)`,
+  template strings (even substitution-free — the grammar spells them
+  `template_string`, and we conservatively skip them), extra args,
+  `require.resolve(…)`, and `ctx.require(…)` all keep the legacy
+  unresolved-CALL behavior — never invent an edge.
+- **Binding forms → `local`/`import_aliases`** (`require_bindings`), mirroring
+  the ESM fields so Tier-2 member-call resolution works identically:
+  `const x = require('./y')` → `local:["x"]`; destructuring
+  `const {a, b: c} = require('./y')` → `local:["a","c"]` +
+  `import_aliases:[{local:"c",imported:"b"}]` (pattern kinds:
+  `shorthand_property_identifier_pattern`, `pair_pattern`,
+  `object_assignment_pattern` for `{a = 1}` — recurse on `left`,
+  `rest_pattern` for `{...rest}` — treated as a namespace-ish local); member
+  pick `const z = require('./y').thing` → `local:["z"]` +
+  `{local:"z",imported:"thing"}` (≙ `import { thing as z }`); bare
+  `require('./y')` and `module.exports = require('./y')` → no local;
+  `require('debug')('express')` binds the CALL result, not the module → no
+  local (conservative).
+- **TS `import foo = require("./bar")`** is an `import_statement` whose
+  specifier lives on the `import_require_clause` child's `source:` field, NOT
+  on the statement — `js_imports` falls through to the clause. The binding is
+  the clause's bare `(identifier)` child (the grammar exposes NO `name:` field
+  on it). The require call INSIDE the clause is also matched by `@call`;
+  `require_specifier` skips it (parent kind check) or the import would be
+  emitted twice.
+- **`exports.foo = function(){}` / `module.exports.foo = (x) => …`** are
+  indexed as `function` definitions (`@definition.cjs_export` in the queries;
+  the whole `assignment_expression` is the span so body calls attribute to the
+  entity). The query matches ANY `<member>.<prop> = <callable literal>`;
+  `extract.rs::cjs_export_target` promotes ONLY objects spelled exactly
+  `exports` or `module.exports` — prototype patching (`Foo.prototype.bar =
+  fn`), test monkey-patching (`res.end = fn`), and `this.handler = fn` are NOT
+  exports and are skipped (indexing them would poison package-scoped name
+  resolution). Non-callable exports (`exports.methods = […]`) and call-valued
+  exports (`exports.etag = mkGen()`) stay unindexed, mirroring the
+  arrow/pair/field callable-only policy.
+- **Known residuals** (verified on express, 2026-07-02):
+  `require('..')`/`require('../')` (package-root import, 68 edges on express)
+  emits a correct raw-specifier edge but the DAEMON's `probeModule` can't
+  resolve an empty joined path — a daemon fix, out of native's scope. The
+  `module.exports = res; res.send = fn` aliased-surface idiom is not indexed
+  (needs data-flow the extractor deliberately does not do). `module.exports =
+  { foo: fn }` object-literal pairs are not promoted (the object is bound to
+  `module.exports`, not a declarator — `bound_object_name` returns None).
 
 ## Astro (`.astro` — NO Astro grammar; frontmatter parsed as TypeScript)
 
@@ -254,13 +345,13 @@ Per-language fidelity — what each language CAN and CANNOT express:
   single return stays bare (`int`).
 
 Residual FALSE-NEGATIVE classes the signature signal cannot see (documented so
-the next maintainer doesn't mistake them for bugs): **class-field arrows**
-(`class C { handler = () => {} }`) and anonymous one-off callbacks are still not
-captured (the former is a `public_field_definition`, not a `variable_declarator`/
-`pair`); dynamic dispatch, decorators / HOFs that re-wrap a callable,
-cross-language FFI references, and re-exports remain invisible to a pure-signature
-diff. (Arrow-function / `const f = () =>` consts and bound object methods are NO
-LONGER in this list — they are now extracted with full signatures.)
+the next maintainer doesn't mistake them for bugs): anonymous one-off callbacks
+are still not captured; dynamic dispatch, decorators / HOFs that re-wrap a
+callable, cross-language FFI references, and re-exports remain invisible to a
+pure-signature diff. (Arrow-function / `const f = () =>` consts, bound object
+methods, AND — as of 2026-07-01 — **class-field arrows** (`class C { handler =
+() => {} }`) and `#private` methods are NO LONGER in this list — they are now
+extracted with full signatures, `#`-named members reading as `private`.)
 
 ## How to add a new language
 

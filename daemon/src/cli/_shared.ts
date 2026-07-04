@@ -134,3 +134,27 @@ export async function assertDaemonServesProject(
   }
   return { ok: true };
 }
+
+/**
+ * Uniform handling for an {@link assertDaemonServesProject} result, so every
+ * mutating CLI command treats it the same way: a hard mismatch (`ok:false`) prints
+ * the error and signals ABORT; a soft `warning` (an old daemon that can't prove its
+ * identity) prints a `note:` to stderr but signals PROCEED. Funnel the result
+ * through this instead of hand-checking `!identity.ok` — that pattern silently
+ * DROPS the warning, so a command talking to an unverifiable daemon gives the user
+ * no heads-up.
+ *
+ * Returns `true` when the caller should PROCEED, `false` when it should abort (the
+ * error has already been written). `write` is injectable for testing.
+ */
+export function reportIdentity(
+  identity: DaemonIdentityResult,
+  write: (s: string) => void = (s) => void process.stderr.write(s),
+): boolean {
+  if (!identity.ok) {
+    write(`error: ${identity.message}\n`);
+    return false;
+  }
+  if (identity.warning) write(`note: ${identity.warning}\n`);
+  return true;
+}

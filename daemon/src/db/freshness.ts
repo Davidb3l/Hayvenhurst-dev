@@ -192,7 +192,7 @@ const SOURCE_EXTENSIONS = new Set([
 ]);
 
 /** True iff `path` (a repo-relative path from `git diff`) is a source file. */
-function isSourcePath(path: string): boolean {
+export function isSourcePath(path: string): boolean {
   const slash = path.lastIndexOf("/");
   const dot = path.lastIndexOf(".");
   // A leading-dot dotfile with no later dot (".gitignore") has no extension.

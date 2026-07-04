@@ -43,11 +43,23 @@ type wireObservation struct {
 	Kind     string `json:"kind"`
 }
 
-// wirePayload is the POST envelope. sample_rate is envelope-level.
+// wireCoverage is the on-wire shape of a single per-test coverage cell. Fields
+// match the daemon's RawTestCoverage EXACTLY (test, entity, weight); see
+// daemon/src/daemon/routes/traces.ts. The daemon accepts coverage-only batches.
+type wireCoverage struct {
+	Test   string `json:"test"`
+	Entity string `json:"entity"`
+	Weight int    `json:"weight"`
+}
+
+// wirePayload is the POST envelope. sample_rate is envelope-level. TestCoverage
+// is additive (omitted when empty) — older daemons ignore an unknown field and
+// the current daemon stores it independently of `observations`.
 type wirePayload struct {
 	Source       string            `json:"source"`
 	SampleRate   int               `json:"sample_rate"`
 	Observations []wireObservation `json:"observations"`
+	TestCoverage []wireCoverage    `json:"test_coverage,omitempty"`
 }
 
 // Flusher drains an Aggregator on an interval and POSTs the batch to the
@@ -56,6 +68,7 @@ type wirePayload struct {
 // code). The transport is injectable for testing.
 type Flusher struct {
 	agg        *Aggregator
+	cov        *CoverageAggregator
 	url        string
 	interval   time.Duration
 	sampleRate int
@@ -110,6 +123,17 @@ func WithSender(s Sender) FlusherOption {
 	return func(f *Flusher) {
 		if s != nil {
 			f.sender = s
+		}
+	}
+}
+
+// WithCoverage attaches a per-test CoverageAggregator. When set, FlushOnce
+// drains it alongside the edge aggregate and includes the rows as
+// `test_coverage` in the POST. nil leaves the flusher edge-only (back-compat).
+func WithCoverage(c *CoverageAggregator) FlusherOption {
+	return func(f *Flusher) {
+		if c != nil {
+			f.cov = c
 		}
 	}
 }
@@ -199,16 +223,26 @@ func (f *Flusher) run() {
 	}
 }
 
-// FlushOnce drains the aggregator and POSTs the batch. It returns the number
-// of observations sent (0 if nothing was buffered). Transport errors are
-// recorded on LastError and never propagated — a flush against an unreachable
-// daemon is a graceful no-op.
+// FlushOnce drains the aggregator (and the per-test coverage aggregator, when
+// attached) and POSTs the batch. It returns the number of observations sent
+// (0 if no edges were buffered — note coverage-only batches still POST and
+// still return 0 edges). Transport errors are recorded on LastError and never
+// propagated — a flush against an unreachable daemon is a graceful no-op.
+//
+// Coverage is NOT gated on observations: a coverage-only batch (no edges, but
+// per-test cells) is still sent because the daemon accepts coverage-only
+// batches and a Go test suite can produce dense coverage with a sparse edge
+// drain. We only no-op when BOTH are empty.
 func (f *Flusher) FlushOnce() int {
 	obs := f.agg.Drain()
-	if len(obs) == 0 {
+	var cov []CoverageRow
+	if f.cov != nil {
+		cov = f.cov.Drain()
+	}
+	if len(obs) == 0 && len(cov) == 0 {
 		return 0
 	}
-	payload, err := f.encode(obs)
+	payload, err := f.encode(obs, cov)
 	if err != nil {
 		f.mu.Lock()
 		f.lastErr = err
@@ -236,7 +270,7 @@ func (f *Flusher) FlushOnce() int {
 // a mismatch beyond ±1. Counts are clamped to the daemon's uint16 ceiling so
 // a busy edge never trips the size guard (the clamp keeps the invariant since
 // in pprof mode sample_rate == 1).
-func (f *Flusher) encode(obs []Observation) ([]byte, error) {
+func (f *Flusher) encode(obs []Observation, cov []CoverageRow) ([]byte, error) {
 	rate := f.sampleRate
 	if rate < 1 {
 		rate = 1
@@ -267,10 +301,31 @@ func (f *Flusher) encode(obs []Observation) ([]byte, error) {
 			Kind:     kind,
 		})
 	}
+	// Per-test coverage rows. Weight is the sample count for the (test, entity)
+	// pair; it is NOT scaled by sample_rate (coverage is a per-test presence
+	// count, not an edge estimate). Clamp to the daemon's uint16 ceiling. The
+	// daemon's validator skips a malformed/blank row rather than rejecting the
+	// batch, but we emit only well-formed rows.
+	var covOut []wireCoverage
+	if len(cov) > 0 {
+		covOut = make([]wireCoverage, 0, len(cov))
+		for _, c := range cov {
+			if c.Test == "" || c.Entity == "" || c.Weight <= 0 {
+				continue
+			}
+			w := c.Weight
+			if w > maxCount {
+				w = maxCount
+			}
+			covOut = append(covOut, wireCoverage{Test: c.Test, Entity: c.Entity, Weight: w})
+		}
+	}
+
 	return json.Marshal(wirePayload{
 		Source:       f.source,
 		SampleRate:   rate,
 		Observations: out,
+		TestCoverage: covOut,
 	})
 }
 

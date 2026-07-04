@@ -261,6 +261,50 @@ maybeDescribe("Merkle snapshot", () => {
     expect(rootsOf(root).gset).not.toBe(rootA);
   });
 
+  test("an empty (torn-to-zero) segment file contributes NO leaf", () => {
+    // Regression (found by the P1 multi-daemon chaos harness): a torn-write that
+    // truncates a single-batch segment to a 0-byte file used to still emit a
+    // Merkle leaf (leafHash([]) is a real hash), so a crash-recovered peer's
+    // root diverged from peers that never wrote that day — FOREVER, since an
+    // empty segment has nothing to sync. An empty segment must produce no leaf.
+    const empty = rootsOf(newCrdtRoot()).gset; // baseline: a root with no segments
+
+    const root = newCrdtRoot();
+    const log = new OpLog(root);
+    log.appendOps("gset", [gsetToWire(gset({ hlc: H(DAY_A), writer: W(0xa) }))]);
+    log.close();
+    const segPath = join(root, "gset", "2026-01-10.log");
+    writeFileSync(segPath, new Uint8Array(0)); // simulate torn-to-empty
+
+    const snap = snapOf(root);
+    expect(snap.leaves.gset).toHaveLength(0); // no phantom leaf
+    expect(snap.roots.gset).toBe(empty); // identical to a peer with no segment
+  });
+
+  test("a peer with an extra empty segment still converges (no phantom-leaf divergence)", () => {
+    // peer1: one op on day A. peer2: the SAME op on day A, PLUS an empty day-B
+    // segment (its single day-B op was torn away on a crash). Their op-set
+    // content is identical, so their roots MUST match and the diff MUST be empty.
+    const peer1 = newCrdtRoot();
+    const peer2 = newCrdtRoot();
+    const shared = gset({ hlc: H(DAY_A), writer: W(0xa) });
+    for (const r of [peer1, peer2]) {
+      const log = new OpLog(r);
+      log.appendOps("gset", [gsetToWire(shared)]);
+      log.close();
+    }
+    // peer2 also has a day-B segment that got truncated to empty.
+    const log2 = new OpLog(peer2);
+    log2.appendOps("gset", [gsetToWire(gset({ hlc: H(DAY_B), writer: W(0xb) }))]);
+    log2.close();
+    writeFileSync(join(peer2, "gset", "2026-01-11.log"), new Uint8Array(0));
+
+    expect(snapOf(peer1).roots.gset).toBe(snapOf(peer2).roots.gset);
+    const diff = diffSnapshots(snapOf(peer1), snapOf(peer2));
+    expect(diff.pull).toHaveLength(0);
+    expect(diff.push).toHaveLength(0);
+  });
+
   test("odd-leaf count does not collide with the duplicated-leaf set (H2)", () => {
     // root over 3 distinct days must differ from root over those 3 days plus
     // a duplicate of one — the classic Merkle duplication weakness, closed by

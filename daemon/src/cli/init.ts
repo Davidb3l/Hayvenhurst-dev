@@ -6,14 +6,16 @@
  *   2. Create directory tree.
  *   3. Write default config.json.
  *   4. Initialize SQLite + schema.
- *   5. Copy the skill template if present in `<repo>/skill/hayvenhurst.md`.
+ *   5. Copy the skill template (if present) into each agent's skills dir —
+ *      `.claude/skills/` (Claude Code) and `.agents/skills/` (cross-vendor:
+ *      OpenAI Codex native, Gemini CLI alias) — as the open `SKILL.md` standard.
  *   6. Trigger a first ingest (delegates to ingest.ts).
  *   7. Print a summary.
  *
  * If `.hayven/` exists already, refuse with a friendly message.
  */
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 
 import { DEFAULT_CONFIG } from "../config/defaults.ts";
 import { writeConfig } from "../config/load.ts";
@@ -96,17 +98,26 @@ export async function runInit(args: ParsedArgs): Promise<number> {
   // (release tarball) or the source checkout — NOT from the user's project root,
   // which has no `skill/` dir. See resolveSkillSource() in util/paths.ts.
   const skillSrc = paths.skillSrc;
-  let skillCopied = false;
+  // The skill is the open cross-vendor `SKILL.md` standard (agentskills.io —
+  // required frontmatter `name`+`description`), so ONE file reaches every major
+  // agent if we drop it in each tool's discovery dir. Each skill is a DIRECTORY —
+  // `<base>/<name>/SKILL.md`; a flat `<base>/<name>.md` is NOT discovered (it
+  // falls back to legacy-command behavior) so it never auto-triggers. Install the
+  // byte-identical file into both:
+  //   - `.claude/skills/`  → Claude Code (paths.skillDir).
+  //   - `.agents/skills/`  → the cross-vendor convention: OpenAI Codex reads it
+  //                          natively, and Gemini CLI aliases it (also `.gemini/`).
+  const skillBaseDirs = [paths.skillDir, join(root, ".agents", "skills")];
+  const skillInstalled: string[] = [];
   if (existsSync(skillSrc)) {
-    // Native Claude Code Agent Skill layout is a DIRECTORY: each skill is
-    // `.claude/skills/<name>/SKILL.md`. A flat `.claude/skills/<name>.md` is
-    // NOT discovered as a skill (it falls back to legacy-command behavior), so
-    // the skill never auto-triggers. Install into the directory form.
-    const skillDest = join(paths.skillDir, "hayvenhurst");
-    mkdirSync(skillDest, { recursive: true });
-    copyFileSync(skillSrc, join(skillDest, "SKILL.md"));
-    skillCopied = true;
+    for (const base of skillBaseDirs) {
+      const dest = join(base, "hayvenhurst");
+      mkdirSync(dest, { recursive: true });
+      copyFileSync(skillSrc, join(dest, "SKILL.md"));
+      skillInstalled.push(relative(root, join(dest, "SKILL.md")));
+    }
   }
+  const skillCopied = skillInstalled.length > 0;
 
   // 5b. Keep `hayven`'s generated artifacts out of the user's commits. The
   // index/traces/claims live under `.hayven/`, and we install the skill into
@@ -114,7 +125,11 @@ export async function runInit(args: ParsedArgs): Promise<number> {
   // `hayven init`. Idempotently add them to the project `.gitignore` (only when
   // this is a git repo or a `.gitignore` already exists, so we don't create a
   // spurious one in a non-git tree).
-  const gitignoreAdded = ensureGitignoreEntries(root, [".hayven/", ".claude/skills/"]);
+  const gitignoreAdded = ensureGitignoreEntries(root, [
+    ".hayven/",
+    ".claude/skills/",
+    ".agents/skills/",
+  ]);
 
   // 5c. Ambient "agent reflex" — many agents don't load Claude Code skills, so
   // an instruction file (CLAUDE.md / AGENTS.md) is the fallback that nudges any
@@ -129,10 +144,11 @@ export async function runInit(args: ParsedArgs): Promise<number> {
   if (haveAgents && ensureReflexBlock(agentsMd)) reflexTargets.push("AGENTS.md");
   if (!haveClaude && !haveAgents && ensureReflexBlock(agentsMd)) reflexTargets.push("AGENTS.md");
 
-  // Register this project in the multi-project registry (`~/.hayven/projects.json`)
-  // so a single running daemon can serve it alongside other repos — selectable in
-  // the viewer's project switcher and via `?project=<alias>`. Idempotent by root;
-  // best-effort (a registry write failure must never fail an otherwise-successful init).
+  // 5d. Register this project in the multi-project registry
+  // (`~/.hayven/projects.json`) so a single running daemon can serve it
+  // alongside other repos — selectable in the viewer's project switcher and via
+  // `?project=<alias>`. Idempotent by root; best-effort (a registry write
+  // failure must never fail an otherwise-successful init).
   let registeredAlias: string | null = null;
   try {
     registeredAlias = registerProject(root).alias;
@@ -143,7 +159,7 @@ export async function runInit(args: ParsedArgs): Promise<number> {
   process.stdout.write(`Initialized Hayvenhurst project at ${paths.hayvenDir}\n`);
   process.stdout.write(`  schema_version: ${migration.toVersion}  (fts: ${migration.appliedFts ? "yes" : "no"})\n`);
   process.stdout.write(`  config:         ${paths.configFile}\n`);
-  process.stdout.write(`  skill:          ${skillCopied ? "installed at .claude/skills/hayvenhurst/SKILL.md" : "(not yet present — re-run init or copy manually after the skill is written)"}\n`);
+  process.stdout.write(`  skill:          ${skillCopied ? "installed at " + skillInstalled.join(", ") : "(not yet present — re-run init or copy manually after the skill is written)"}\n`);
   if (gitignoreAdded.length > 0) {
     process.stdout.write(`  .gitignore:     added ${gitignoreAdded.join(", ")}\n`);
   }

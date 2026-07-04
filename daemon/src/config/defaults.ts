@@ -61,6 +61,17 @@ export interface HayvenConfig {
   conflict?: {
     /** Oracle id, e.g. "heuristic-v1". Drop-in selection seam. */
     oracle?: string;
+    /**
+     * Which adjacency signal selects a scope-pair as a Layer-C oracle candidate
+     * (E2, `docs/COORDINATION_ENTERPRISE_EXPERIMENTS.md`). Default
+     * `"module+edge"` (edge OR shared module prefix — the shipping behavior).
+     * `"edge"` = only a direct call/import edge; `"graph"` = direct edge OR a
+     * shared one-hop dependency neighbor. The graph-precise gates stop
+     * merely-co-located work from reaching the oracle at all, cutting
+     * adjacent-benign over-blocking. Only affects candidate SELECTION; the
+     * verdict is still a soft, force-able 202 (§16(4)).
+     */
+    adjacency?: import("../conflict/adjacency.ts").AdjacencyGate;
   };
   /**
    * Branch-aware (per-branch) indexing (Phase 0.0.4.5 §5 item 3). When enabled
@@ -81,6 +92,25 @@ export interface HayvenConfig {
      * does not grow unbounded. Default 8. The legacy index is never evicted.
      */
     maxBranches?: number;
+    /**
+     * Also index dependency-SOURCE directories (`vendor/`, `Godeps/`,
+     * `third_party/`). Default false — first-party code only keeps the index
+     * lean and search relevant (vendored copies would dilute results). Set true
+     * for the rarer case of navigating into a dependency. Build/VCS/cache dirs
+     * (`node_modules`, `target`, `.git`, …) are always skipped regardless.
+     */
+    includeVendored?: boolean;
+    /**
+     * Also index test-fixture / example / benchmark directories
+     * (`test/fixtures/`, `examples/`, `benchmark/`, `benchmarks/`). Default
+     * false — fixture apps are throwaway scaffolds that inflate the index and
+     * feed ID/search noise (measured on withastro/astro: fixture apps under
+     * `test/fixtures` were 27.6% of the index, plus `examples/` at 93 files
+     * and `benchmark/` at 39 files). Set true for the rarer case of navigating
+     * fixture/example code. A `fixtures/` dir NOT directly under a
+     * `test`/`tests`/`e2e`/`__tests__` dir is always indexed.
+     */
+    includeFixtures?: boolean;
   };
   /**
    * Test-impact selection (`hayven affected-tests`). `patterns` overrides the
@@ -126,5 +156,5 @@ export const DEFAULT_CONFIG: HayvenConfig = {
   // Per-branch index caching (§5 item 3). Default on; a no-op outside a git
   // repo. Legacy `.hayven/index.sqlite` remains the fallback for un-ingested
   // branches, so existing single-index projects are unaffected.
-  index: { perBranch: true, maxBranches: 8 },
+  index: { perBranch: true, maxBranches: 8, includeVendored: false, includeFixtures: false },
 };

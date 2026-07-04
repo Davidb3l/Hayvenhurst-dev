@@ -107,7 +107,9 @@ fn static_call_edges_carry_line_precise_call_site() {
 
     let greet_call = values
         .iter()
-        .find(|v| v["type"] == "edge" && v["kind"] == "static_call" && v["dst_name"] == "greet")
+        .find(|v| {
+            v["type"] == "edge" && v["kind"] == "static_call" && v["dst_name"] == "greet"
+        })
         .expect("a static_call edge to greet must exist");
 
     assert_eq!(

@@ -85,6 +85,7 @@ func (c Config) withDefaults() Config {
 type Collector struct {
 	cfg      Config
 	agg      *Aggregator
+	cov      *CoverageAggregator
 	flusher  *Flusher
 	prefixes []string
 
@@ -117,11 +118,13 @@ func Start(cfg Config) *Collector {
 func NewCollector(cfg Config) *Collector {
 	cfg = cfg.withDefaults()
 	agg := NewAggregator()
+	cov := NewCoverageAggregator()
 	opts := []FlusherOption{
 		WithInterval(cfg.FlushInterval),
 		WithSampleRate(cfg.SampleRate),
 		WithTimeout(cfg.Timeout),
 		WithSource(cfg.Source),
+		WithCoverage(cov),
 	}
 	if cfg.Sender != nil {
 		opts = append(opts, WithSender(cfg.Sender))
@@ -129,6 +132,7 @@ func NewCollector(cfg Config) *Collector {
 	return &Collector{
 		cfg:      cfg,
 		agg:      agg,
+		cov:      cov,
 		flusher:  NewFlusher(agg, cfg.DaemonURL, opts...),
 		prefixes: cfg.ProjectPrefixes,
 		selfName: "github.com/hayvenhurst/hayven-trace",
@@ -137,6 +141,10 @@ func NewCollector(cfg Config) *Collector {
 
 // Aggregator exposes the underlying aggregator (for tests/inspection).
 func (c *Collector) Aggregator() *Aggregator { return c.agg }
+
+// Coverage exposes the underlying per-test coverage aggregator (for
+// tests/inspection).
+func (c *Collector) Coverage() *CoverageAggregator { return c.cov }
 
 // Flusher exposes the underlying flusher (for tests/inspection).
 func (c *Collector) Flusher() *Flusher { return c.flusher }
@@ -201,9 +209,15 @@ func (c *Collector) sampleOnce() {
 	stacks := c.snapshot()
 	for _, st := range stacks {
 		names := c.resolve(st)
+		// Existing edge path — unchanged.
 		for _, e := range edgesFromNames(names) {
 			c.agg.Add(e[0], e[1], 1)
 		}
+		// Additive per-test coverage: attribute every kept frame this stack's
+		// test root is executing. Uses the SAME resolve()/keepFrame()-filtered
+		// names so entity symbols are the exact raw names that resolve to graph
+		// nodes. A stack without a Test* root contributes nothing.
+		addCoverage(c.cov, names)
 	}
 }
 

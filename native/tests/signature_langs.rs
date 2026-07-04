@@ -39,11 +39,10 @@ fn sig_of(source: &str, language: Language, want_name: &str) -> Option<Signature
     for (i, n) in query.capture_names().iter().enumerate() {
         match *n {
             "name.definition" => name_idx = Some(i as u32),
-            "definition.function"
-            | "definition.method"
-            | "definition.class"
-            | "definition.arrow"
-            | "definition.pair" => def_idxs.push(i as u32),
+            "definition.function" | "definition.method" | "definition.class"
+            | "definition.arrow" | "definition.pair" | "definition.field" => {
+                def_idxs.push(i as u32)
+            }
             _ => {}
         }
     }
@@ -64,7 +63,11 @@ fn sig_of(source: &str, language: Language, want_name: &str) -> Option<Signature
         if let (Some(nn), Some(dn)) = (name_node, def_node) {
             let nm = text(nn, src);
             if nm == want_name {
-                let sig_node = if matches!(dn.kind(), "variable_declarator" | "pair") {
+                let sig_node = if matches!(
+                    dn.kind(),
+                    "variable_declarator" | "pair" | "public_field_definition"
+                        | "field_definition"
+                ) {
                     dn.child_by_field_name("value").unwrap_or(dn)
                 } else {
                     dn
@@ -141,18 +144,8 @@ fn ts_unknown_union_generic_optional_types_extracted() {
 fn ts_unknown_to_any_is_a_contract_change() {
     // Widening/narrowing a param type (`unknown` → `string`) is a real contract
     // change the diff must catch.
-    let before = sig_of(
-        "export function f(a: unknown): void {}\n",
-        Language::TypeScript,
-        "f",
-    )
-    .unwrap();
-    let after = sig_of(
-        "export function f(a: string): void {}\n",
-        Language::TypeScript,
-        "f",
-    )
-    .unwrap();
+    let before = sig_of("export function f(a: unknown): void {}\n", Language::TypeScript, "f").unwrap();
+    let after = sig_of("export function f(a: string): void {}\n", Language::TypeScript, "f").unwrap();
     assert_ne!(before.params, after.params);
     assert_eq!(before.params, vec!["unknown"]);
     assert_eq!(after.params, vec!["string"]);
@@ -183,12 +176,7 @@ fn ts_rest_param_stable_across_body_edit() {
 
 #[test]
 fn js_async_arrow_const_arity_and_export() {
-    let s = sig_of(
-        "export const f = async (a, b) => a;\n",
-        Language::JavaScript,
-        "f",
-    )
-    .unwrap();
+    let s = sig_of("export const f = async (a, b) => a;\n", Language::JavaScript, "f").unwrap();
     assert_eq!(s.arity, 2);
     assert_eq!(s.params, vec!["a", "b"]);
     assert_eq!(s.return_type, None);
@@ -210,22 +198,14 @@ fn js_object_method_async_arrow() {
 
 #[test]
 fn js_arrow_arity_stable_across_body_edit() {
-    let before = sig_of(
-        "export const f = (a, b) => a + b;\n",
-        Language::JavaScript,
-        "f",
-    )
-    .unwrap();
+    let before = sig_of("export const f = (a, b) => a + b;\n", Language::JavaScript, "f").unwrap();
     let after = sig_of(
         "export const f = (a, b) => {\n  const s = a + b;\n  return s;\n};\n",
         Language::JavaScript,
         "f",
     )
     .unwrap();
-    assert_eq!(
-        before, after,
-        "body-only edit must not move the arrow signature"
-    );
+    assert_eq!(before, after, "body-only edit must not move the arrow signature");
 }
 
 // ── Go multi-return + variadic ────────────────────────────────────────────────
@@ -246,12 +226,7 @@ fn go_multi_return_and_variadic_combined() {
 #[test]
 fn go_adding_a_return_is_a_contract_change() {
     let before = sig_of("func F() int {\n\treturn 0\n}\n", Language::Go, "F").unwrap();
-    let after = sig_of(
-        "func F() (int, error) {\n\treturn 0, nil\n}\n",
-        Language::Go,
-        "F",
-    )
-    .unwrap();
+    let after = sig_of("func F() (int, error) {\n\treturn 0, nil\n}\n", Language::Go, "F").unwrap();
     assert_ne!(before.return_type, after.return_type);
     assert_eq!(before.return_type.as_deref(), Some("int"));
     assert_eq!(after.return_type.as_deref(), Some("int, error"));

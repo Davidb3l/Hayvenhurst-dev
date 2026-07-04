@@ -10,19 +10,24 @@
  * `switch` case, AND a hand-maintained help block that can silently drift.
  */
 import { runAffectedTests } from "./cli/affected_tests.ts";
+import { runBranches } from "./cli/branches.ts";
 import { runClaim } from "./cli/claim.ts";
 import { runConfig } from "./cli/config.ts";
 import { runContext } from "./cli/context.ts";
 import { runDaemon } from "./cli/daemon.ts";
 import { runDoctor } from "./cli/doctor.ts";
 import { runImpact } from "./cli/impact.ts";
+import { runFleetContext } from "./cli/fleet_context.ts";
 import { runImporters } from "./cli/importers.ts";
 import { runIngest } from "./cli/ingest.ts";
 import { runInit } from "./cli/init.ts";
+import { runMcp } from "./cli/mcp.ts";
+import { runProxy } from "./cli/proxy.ts";
 import { runRecall, runRemember } from "./cli/memory.ts";
 import { runRefs } from "./cli/refs.ts";
 import { runModels } from "./cli/models.ts";
 import { runNeighbors } from "./cli/neighbors.ts";
+import { runPlanLanes } from "./cli/plan_lanes.ts";
 import { runNode } from "./cli/node.ts";
 import { runQuery } from "./cli/query.ts";
 import { runReindex } from "./cli/reindex.ts";
@@ -72,10 +77,18 @@ const COMMANDS: readonly Command[] = [
     help: "refs <symbol-id> [--json]  EXHAUSTIVE callers ∪ importers of a symbol (edges, not ranked)" },
   { name: "impact", group: "common", run: runImpact,
     help: "impact <symbol-id> [--depth N] [--json] Transitive blast radius: change this → these N break" },
+  { name: "plan-lanes", group: "coordination", run: runPlanLanes,
+    help: "plan-lanes <files...> [--symbols] [--depth N] [--max-hub-degree N] [--json]  Partition a change-set into blast-radius-disjoint parallel lanes" },
   { name: "affected-tests", group: "common", run: runAffectedTests,
-    help: "affected-tests <symbol> [--changed a,b] [--trace-only] [--json] Minimal tests to run (static graph ∪ runtime traces)" },
+    help: "affected-tests <symbol> [--changed a,b] [--trace-only] [--runner vitest] [--json] Minimal tests to run (static graph ∪ runtime traces)" },
   { name: "context", group: "common", run: runContext,
-    help: "context <symbol> [--json] [--no-neighbors] Minimal precise slice pack (header + body + 1-hop callees) for a prompt" },
+    help: "context <symbol> [--escalate [--budget N]] [--json] Minimal precise slice pack (header + body + 1-hop callees)" },
+  { name: "fleet-context", group: "common", run: runFleetContext,
+    help: "fleet-context --lanes <file.json|-> Deduped shared+per-lane briefing for a fan-out of agents" },
+  { name: "mcp", group: "common", run: runMcp,
+    help: "mcp                        Serve the context packer over MCP (stdio JSON-RPC) — stateless, read-only" },
+  { name: "proxy", group: "common", run: runProxy,
+    help: "proxy [--provider ...] [--compact-history] Transparent LLM-API proxy: graph slices + history compaction" },
   { name: "node", group: "common", run: runNode,
     help: "node body <id> [--body|--file] Update a node's markdown body (LWW CRDT write)" },
   { name: "summarize", group: "common", run: runSummarize,
@@ -90,6 +103,8 @@ const COMMANDS: readonly Command[] = [
     help: "config [key] [value]       Read/write configuration values" },
   { name: "reindex", group: "common", run: runReindex,
     help: "reindex                    Drop the SQLite index and rebuild from markdown" },
+  { name: "branches", group: "common", run: runBranches,
+    help: "branches [--json] [--prune] [--keep N]  List per-branch index caches (size/mtime/counts); --prune removes stale ones" },
   { name: "models", group: "common", run: runModels,
     help: "models <list|pull>         List local models or pull one (download + verify)" },
   { name: "claim", group: "coordination", run: runClaim,

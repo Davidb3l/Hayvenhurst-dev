@@ -180,7 +180,7 @@ export class Flusher {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "User-Agent": "hayven-trace-browser/0.0.5",
+          "User-Agent": "hayven-trace-browser/0.0.4",
         },
         body: payload,
         signal: controller.signal,

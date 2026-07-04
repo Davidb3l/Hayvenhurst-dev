@@ -23,6 +23,18 @@ import { previewImpact } from "../db/impact_preview.ts";
 import { tryLocateNativeBinary } from "../native/locate.ts";
 import { isJson, openProjectDb, requireProject } from "./_shared.ts";
 
+/**
+ * Does `rawId` LOOK like a structured node id rather than a loose search term?
+ * The id scheme is slash-separated (e.g. `werkzeug/http/dump_cookie`), so a `/`
+ * is a strong signal the user typed an exact id — which means a fuzzy FTS
+ * substitution when it isn't found exactly is almost certainly a typo, not a
+ * convenience. A bare term (no `/`, e.g. `dump_cookie`) is a legitimate loose
+ * term and keeps the fuzzy-resolve behavior.
+ */
+function looksLikeExactId(rawId: string): boolean {
+  return rawId.includes("/");
+}
+
 export async function runImpact(args: ParsedArgs): Promise<number> {
   const rawId = args.positionals[0];
   if (!rawId) {
@@ -58,6 +70,18 @@ export async function runImpact(args: ParsedArgs): Promise<number> {
     if (!resolved) {
       process.stderr.write(
         `No node with id \`${rawId}\` — try \`hayven query ${rawId}\` to fuzzy-find it.\n`,
+      );
+      return 1;
+    }
+    // A `/`-containing input LOOKS like a structured node id (the id scheme is
+    // slash-separated, e.g. `werkzeug/http/dump_cookie`). If no node has it
+    // EXACTLY, a fuzzy top-FTS-hit substitution is almost certainly NOT what the
+    // user meant — proceeding would print a confident, WRONG "0 dependents" for a
+    // fat-fingered id. Treat it as a not-found error instead (mirrors the
+    // fully-not-found path above), so a typo can't masquerade as a real answer.
+    if (resolved.resolved && looksLikeExactId(rawId)) {
+      process.stderr.write(
+        `No node with id \`${rawId}\` — try \`hayven query ${rawId}\` to search.\n`,
       );
       return 1;
     }
@@ -176,6 +200,16 @@ async function runImpactPreview(args: ParsedArgs, rawId: string): Promise<number
     if (!preview) {
       process.stderr.write(
         `No node with id \`${rawId}\` — try \`hayven query ${rawId}\` to fuzzy-find it.\n`,
+      );
+      return 1;
+    }
+    // Same typo guard as the plain walk: a `/`-looking id that only FUZZY-matched
+    // is treated as not-found so a fat-fingered id can't silently preview an
+    // unrelated symbol's blast radius. (`preview.resolved` is the chosen id when
+    // fuzzy-resolved, null on an exact match.)
+    if (preview.resolved && looksLikeExactId(rawId)) {
+      process.stderr.write(
+        `No node with id \`${rawId}\` — try \`hayven query ${rawId}\` to search.\n`,
       );
       return 1;
     }

@@ -11,6 +11,7 @@ func TestConfigFromEnv(t *testing.T) {
 	t.Setenv(EnvInterval, "5")
 	t.Setenv(EnvRate, "10")
 	t.Setenv(EnvProject, "example.com/a:example.com/b: :")
+	t.Setenv(EnvSampleMs, "2")
 
 	cfg := ConfigFromEnv()
 	if cfg.DaemonURL != "http://daemon:9999" {
@@ -18,6 +19,9 @@ func TestConfigFromEnv(t *testing.T) {
 	}
 	if cfg.FlushInterval != 5*time.Second {
 		t.Fatalf("interval = %v", cfg.FlushInterval)
+	}
+	if cfg.SampleInterval != 2*time.Millisecond {
+		t.Fatalf("sample interval = %v, want 2ms", cfg.SampleInterval)
 	}
 	if cfg.SampleRate != 10 {
 		t.Fatalf("rate = %d", cfg.SampleRate)

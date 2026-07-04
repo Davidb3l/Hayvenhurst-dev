@@ -55,7 +55,10 @@ fn watch_emits_version_then_ready_then_keeps_running() {
     );
 }
 
-fn read_line_with_deadline<R: BufRead>(reader: &mut R, deadline: Instant) -> Option<String> {
+fn read_line_with_deadline<R: BufRead>(
+    reader: &mut R,
+    deadline: Instant,
+) -> Option<String> {
     // BufReader::read_line blocks; rather than wire a select(), we just
     // bound the whole test via the explicit `deadline` Instant — if the
     // reader hangs past it, the outer kill() unblocks the read with EOF.
@@ -108,10 +111,7 @@ fn parse_emits_version_handshake_as_first_stdout_line() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let first = stdout.lines().next().expect("stdout non-empty");
     let parsed: serde_json::Value = serde_json::from_str(first).expect("first line is JSON");
-    assert_eq!(
-        parsed["type"], "version",
-        "first stdout line must be version"
-    );
+    assert_eq!(parsed["type"], "version", "first stdout line must be version");
     assert_eq!(parsed["protocol"], 2);
 }
 

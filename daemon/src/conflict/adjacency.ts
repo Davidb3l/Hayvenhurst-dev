@@ -118,6 +118,34 @@ export function edgeAdjacency(
   return false;
 }
 
+/**
+ * Whether two scopes are connected THROUGH THE GRAPH — a direct call/import edge
+ * ({@link edgeAdjacency}), OR a shared one-hop dependency neighbor (both scopes
+ * depend on some common entity). This is the "graph-precise" adjacency signal
+ * (E2, `docs/COORDINATION_ENTERPRISE_EXPERIMENTS.md`): stricter than mere module
+ * co-location (two unrelated functions in the same file are NOT connected), but
+ * it still catches a shared-invariant conflict where two entities touch a common
+ * callee without a direct edge between themselves. It mirrors the oracle's own
+ * {@link import("./oracle.ts").HeuristicOracle} `sharesNeighbor` relation, one
+ * level up at the SCOPE-SELECTION gate: a pair only reaches the oracle when they
+ * are actually wired together in the dependency graph, not just filed together.
+ */
+export function scopesGraphConnected(
+  scopeA: readonly string[],
+  scopeB: readonly string[],
+  neighbors: NeighborLookup,
+): boolean {
+  // Direct edge (also covers "a neighbor of one lands in the other's scope").
+  if (edgeAdjacency(scopeA, scopeB, neighbors)) return true;
+  // Shared one-hop neighbor: scopeNeighbors(A) ∩ scopeNeighbors(B) ≠ ∅.
+  const aNeighbors = new Set(scopeNeighbors(scopeA, neighbors));
+  if (aNeighbors.size === 0) return false;
+  for (const n of scopeNeighbors(scopeB, neighbors)) {
+    if (aNeighbors.has(n)) return true;
+  }
+  return false;
+}
+
 /** Whether two scopes share a containing module prefix (co-location). */
 function shareModulePrefix(scopeA: readonly string[], scopeB: readonly string[]): boolean {
   const aPrefixes = modulePrefixes(scopeA);
@@ -160,17 +188,54 @@ export function scopeNeighbors(
 }
 
 /**
- * All active claims adjacent to `incomingScope`. The registration path runs
- * the Layer C oracle once per returned claim.
+ * Which adjacency signal SELECTS a pair of scopes as a Layer-C oracle candidate
+ * (E2, `docs/COORDINATION_ENTERPRISE_EXPERIMENTS.md`). The gate only decides
+ * which pairs are *examined* — the oracle still has the final say and its verdict
+ * is still a soft, force-able 202, never a hard 409 (§16(4)).
+ *
+ *   - `"module+edge"` — the shipping default: edge OR shared module prefix
+ *     ({@link isAdjacent}). Two functions in the same file are candidates even
+ *     with no dependency edge between them (the source of the heuristic's
+ *     documented adjacent-benign over-blocking).
+ *   - `"edge"` — graph-precise, strict: only a direct call/import edge between
+ *     the two scopes ({@link edgeAdjacency}).
+ *   - `"graph"` — graph-precise, permissive: a direct edge OR a shared one-hop
+ *     dependency neighbor ({@link scopesGraphConnected}). Drops pure module
+ *     co-location but keeps shared-callee coupling.
+ */
+export type AdjacencyGate = "module+edge" | "edge" | "graph";
+
+/** The scope-pair predicate for an {@link AdjacencyGate}. */
+export function gatePredicate(
+  gate: AdjacencyGate,
+  neighbors: NeighborLookup,
+): (a: readonly string[], b: readonly string[]) => boolean {
+  switch (gate) {
+    case "edge":
+      return (a, b) => edgeAdjacency(a, b, neighbors);
+    case "graph":
+      return (a, b) => scopesGraphConnected(a, b, neighbors);
+    case "module+edge":
+    default:
+      return (a, b) => isAdjacent(a, b, neighbors);
+  }
+}
+
+/**
+ * All active claims adjacent to `incomingScope` under the given {@link AdjacencyGate}.
+ * The registration path runs the Layer C oracle once per returned claim. The
+ * `gate` defaults to `"module+edge"` so existing callers are byte-identical.
  */
 export function findAdjacent(
   incomingScope: readonly string[],
   active: readonly ClaimLike[],
   neighbors: NeighborLookup,
+  gate: AdjacencyGate = "module+edge",
 ): ClaimLike[] {
+  const adjacent = gatePredicate(gate, neighbors);
   const out: ClaimLike[] = [];
   for (const claim of active) {
-    if (isAdjacent(incomingScope, claim.scope, neighbors)) out.push(claim);
+    if (adjacent(incomingScope, claim.scope)) out.push(claim);
   }
   return out;
 }

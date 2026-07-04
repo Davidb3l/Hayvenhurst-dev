@@ -50,6 +50,22 @@ export interface ScopeOptions {
    * Keep `node_modules` / `node:` / `bun:` internal frames. Default false.
    */
   includeInternal?: boolean;
+  /**
+   * Repo root for PATH-QUALIFIED module hints. When set and a frame's source
+   * file lives under this directory, the module hint becomes the repo-relative
+   * path without extension (`src/utils/body`) instead of the bare basename
+   * (`body`), so the emitted id is `src/utils/body:parseBody`.
+   *
+   * WHY (measured, bench/affected-tests-typescript-RESULTS.md §"Resolution
+   * quality"): basename-only hints are near-useless in idiomatic TS — hono has
+   * 5 `router.ts` and dozens of `index.ts`, so 69 of 102 unresolved runtime
+   * names were ambiguous purely because the hint couldn't disambiguate. The
+   * daemon's resolver already scores module-hint segments against entity-id
+   * path segments; repo-relative hints let that scoring actually bite. Frames
+   * OUTSIDE the root (or when unset) keep the basename hint, so synthetic /
+   * out-of-repo frames are unchanged.
+   */
+  moduleRoot?: string;
 }
 
 /** Strip a `file://` URL (or plain path) down to an absolute filesystem path. */
@@ -75,6 +91,31 @@ export function moduleOf(path: string): string {
   const dot = base.lastIndexOf(".");
   const stem = dot > 0 ? base.slice(0, dot) : base;
   return stem;
+}
+
+/**
+ * Path-qualified module id: the path RELATIVE to `root`, extension stripped,
+ * `/`-joined (`src/utils/body.test.ts` under the repo root -> `src/utils/body.test`).
+ * Falls back to {@link moduleOf}'s basename when the path is not under `root`
+ * (or `root` is empty). The daemon's trace resolver treats every segment before
+ * the function name as a module HINT, so the extra path segments strictly ADD
+ * disambiguation signal — the trailing-name matching is unchanged.
+ */
+export function moduleIdOf(path: string, root: string | undefined): string {
+  if (!path) return "";
+  if (root) {
+    const prefix = root.endsWith("/") ? root : root + "/";
+    if (path.startsWith(prefix)) {
+      const rel = path.slice(prefix.length);
+      const dot = rel.lastIndexOf(".");
+      const slash = rel.lastIndexOf("/");
+      // Strip only a FILENAME extension (a dot after the last slash, not at
+      // position 0 of the basename), mirroring moduleOf's stem rule.
+      const stem = dot > slash + 1 ? rel.slice(0, dot) : rel;
+      if (stem) return stem;
+    }
+  }
+  return moduleOf(path);
 }
 
 function isInternalPath(path: string, url: string): boolean {
@@ -104,6 +145,11 @@ function isPseudoFrame(name: string): boolean {
 export function makeResolver(opts: ScopeOptions = {}, selfMarker = "/trace/bun/src/"): NameResolver {
   const projectPaths = (opts.projectPaths ?? []).filter((p) => p.length > 0);
   const includeInternal = opts.includeInternal ?? false;
+  const moduleRoot = opts.moduleRoot;
+  // The collector's own on-disk location, so self-frames are still dropped when
+  // the package is vendored/copied somewhere that doesn't match the static
+  // `/trace/bun/src/` marker (e.g. installed into a consumer repo).
+  const selfDir = new URL(".", import.meta.url).pathname;
 
   return {
     nameOf(frame: CallFrame): string | null {
@@ -112,11 +158,11 @@ export function makeResolver(opts: ScopeOptions = {}, selfMarker = "/trace/bun/s
 
       const path = urlToPath(frame.url);
       // Drop the collector's own frames so it never traces itself.
-      if (path.includes(selfMarker)) return null;
+      if (path.includes(selfMarker) || (selfDir.length > 1 && path.startsWith(selfDir))) return null;
 
       if (!includeInternal && isInternalPath(path, frame.url ?? "")) return null;
 
-      const mod = moduleOf(path) || "<anonymous>";
+      const mod = moduleIdOf(path, moduleRoot) || "<anonymous>";
       const id = `${mod}:${fn}`;
 
       if (projectPaths.length > 0) {

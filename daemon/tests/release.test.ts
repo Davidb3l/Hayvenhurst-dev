@@ -233,6 +233,46 @@ describe("runRelease CLI", () => {
     expect(board.claims.some((c) => c.id === "claim_foreign")).toBe(true);
   });
 
+  it("SURFACES the soft identity warning (old daemon) instead of dropping it, exit 0", async () => {
+    // Regression guard: the old hand-rolled `if (!identity.ok)` block dropped
+    // `identity.warning`. `runRelease` now funnels through `reportIdentity`, so an
+    // unverifiable (old) daemon must still print a `note:` while the release proceeds.
+    const repoRoot = makeProject();
+    const app = makeApp(repoRoot);
+    expect((await postClaim(app, "claim_oldd", ["mod/a"])).status).toBe(201);
+    process.chdir(repoRoot);
+
+    const orig = globalThis.fetch;
+    // Route at the in-process app, but strip `root` from /api/health so the
+    // identity guard returns ok:true + warning ("old daemon").
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const raw = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const url = new URL(raw);
+      const local = `http://localhost${url.pathname}${url.search}`;
+      const res = await app.handle(new Request(local, init));
+      if (url.pathname === "/api/health") {
+        const body = (await res.json()) as Record<string, unknown>;
+        delete body.root;
+        return new Response(JSON.stringify(body), {
+          status: res.status,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return res;
+    }) as unknown as typeof fetch;
+    try {
+      const { code, out, err } = await captureIo(() =>
+        runRelease({ positionals: ["claim_oldd"], flags: {} }),
+      );
+      expect(code).toBe(0);
+      expect(err).toContain("note:");
+      expect(err).toContain("did not report a project root");
+      expect(out).toContain("Claim released");
+    } finally {
+      globalThis.fetch = orig;
+    }
+  });
+
   it("unreachable daemon → friendly error, exit 1", async () => {
     const repoRoot = makeProject();
     process.chdir(repoRoot);

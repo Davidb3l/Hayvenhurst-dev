@@ -96,4 +96,37 @@ describe("incremental parse --files-stdin transport", () => {
     expect(c.stdinMode).toBe("ignore");
     expect(c.stdinWrites).toHaveLength(0);
   });
+
+  test("includeVendored controls the --include-vendored flag (default off)", async () => {
+    const drain = async (opts: Parameters<typeof startParse>[0]): Promise<string[]> => {
+      const captured: CapturedSpawn[] = [];
+      const run = startParse({ ...opts, spawn: makeSpawn(captured) });
+      for await (const _rec of run.records) {
+        /* drain */
+      }
+      return captured[0]!.cmd;
+    };
+    // Default (omitted) + explicit false → no flag (first-party only).
+    expect(await drain(baseOpts)).not.toContain("--include-vendored");
+    expect(await drain({ ...baseOpts, includeVendored: false })).not.toContain("--include-vendored");
+    // Opt-in → the flag is present.
+    expect(await drain({ ...baseOpts, includeVendored: true })).toContain("--include-vendored");
+  });
+
+  test("includeFixtures controls the --include-fixtures flag (default off)", async () => {
+    const drain = async (opts: Parameters<typeof startParse>[0]): Promise<string[]> => {
+      const captured: CapturedSpawn[] = [];
+      const run = startParse({ ...opts, spawn: makeSpawn(captured) });
+      for await (const _rec of run.records) {
+        /* drain */
+      }
+      return captured[0]!.cmd;
+    };
+    // Default (omitted) + explicit false → no flag (fixtures/examples/benchmarks skipped).
+    expect(await drain(baseOpts)).not.toContain("--include-fixtures");
+    expect(await drain({ ...baseOpts, includeFixtures: false })).not.toContain("--include-fixtures");
+    // Opt-in → the flag is present; independent of includeVendored.
+    expect(await drain({ ...baseOpts, includeFixtures: true })).toContain("--include-fixtures");
+    expect(await drain({ ...baseOpts, includeFixtures: true })).not.toContain("--include-vendored");
+  });
 });

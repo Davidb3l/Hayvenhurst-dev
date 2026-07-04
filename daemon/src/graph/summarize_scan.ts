@@ -39,7 +39,7 @@ import type { Db } from "../db/queries.ts";
  * renders a placeholder node and compares.
  */
 export const SUMMARY_PLACEHOLDER_SENTINEL =
-  "_Summary pending — run `hayven summarize` (not yet implemented)._";
+  "_Summary pending — run `hayven summarize` to generate one._";
 
 /**
  * The SQL predicate (sans `SELECT … FROM nodes WHERE`) that matches a node which

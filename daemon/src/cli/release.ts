@@ -13,7 +13,7 @@
  *   200 → released.
  *   404 → no active claim with that id (already released / never existed).
  */
-import { assertDaemonServesProject, isJson, requireProject } from "./_shared.ts";
+import { assertDaemonServesProject, isJson, reportIdentity, requireProject } from "./_shared.ts";
 import type { ParsedArgs } from "../cli.ts";
 
 export async function runRelease(args: ParsedArgs): Promise<number> {
@@ -35,11 +35,7 @@ export async function runRelease(args: ParsedArgs): Promise<number> {
   // Guard against mutating a DIFFERENT project's daemon (every project defaults
   // to port 7777). Verify the daemon at `base` serves this repo before DELETEing.
   const identity = await assertDaemonServesProject(base, ctx);
-  if (!identity.ok) {
-    process.stderr.write(`error: ${identity.message}\n`);
-    return 1;
-  }
-  if (identity.warning) process.stderr.write(`warning: ${identity.warning}\n`);
+  if (!reportIdentity(identity)) return 1;
 
   let res: Response;
   try {

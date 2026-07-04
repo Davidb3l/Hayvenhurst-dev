@@ -26,9 +26,10 @@
 
 import inspector from "node:inspector";
 
-import { Aggregator } from "./aggregator.ts";
+import { Aggregator, CoverageAggregator } from "./aggregator.ts";
+import { prewarmCryptoLocks } from "./prewarm.ts";
 import { Flusher } from "./flusher.ts";
-import { deriveEdges, type CpuProfile } from "./profile.ts";
+import { deriveCoverage, deriveEdges, type CpuProfile } from "./profile.ts";
 import { makeResolver, type ScopeOptions } from "./names.ts";
 
 export interface TracerConfig {
@@ -41,10 +42,23 @@ export interface TracerConfig {
   projectPaths: string[];
   /** Keep node_modules / node:/bun: internals. Default false. */
   includeInternal: boolean;
-  /** V8 sampling interval in microseconds. Default 1000 (1 ms). */
+  /**
+   * V8 sampling interval in microseconds. Default 1000 (1 ms).
+   *
+   * Guidance (measured on hono's unit suite): the 1 ms default captures almost
+   * nothing on fast unit tests (~3 edges for a whole 32-test file — per-file
+   * test time is 10–70 ms); 100 µs is the test-suite tracing sweet spot
+   * (3 → 22 edges on the same file) at a measurable but acceptable CPU cost.
+   * Exposed via `start({ samplingIntervalUs })` and `HAYVEN_TRACE_SAMPLING_US`.
+   */
   samplingIntervalUs: number;
   /** Batch source tag. Default "bun". */
   source: string;
+  /**
+   * Repo root for path-qualified module hints (see {@link ScopeOptions.moduleRoot}).
+   * Default `process.cwd()`. Set "" to disable (bare-basename hints).
+   */
+  moduleRoot: string;
 }
 
 export const DEFAULT_CONFIG: TracerConfig = {
@@ -55,6 +69,7 @@ export const DEFAULT_CONFIG: TracerConfig = {
   includeInternal: false,
   samplingIntervalUs: 1000,
   source: "bun",
+  moduleRoot: process.cwd(),
 };
 
 type Post = (method: string, params?: Record<string, unknown>) => Promise<unknown>;
@@ -62,6 +77,8 @@ type Post = (method: string, params?: Record<string, unknown>) => Promise<unknow
 export class HayvenTracer {
   readonly config: TracerConfig;
   readonly aggregator: Aggregator;
+  /** Per-test coverage cells, drained by the flusher beside the edge aggregate. */
+  readonly coverage: CoverageAggregator;
   readonly flusher: Flusher;
 
   private session: inspector.Session | null = null;
@@ -70,10 +87,17 @@ export class HayvenTracer {
   private reprofileTimer: ReturnType<typeof setInterval> | null = null;
   private installed = false;
   private _lastError: string | null = null;
+  private _coverageContext: string | null = null;
 
-  constructor(config: TracerConfig, aggregator?: Aggregator, flusher?: Flusher) {
+  constructor(
+    config: TracerConfig,
+    aggregator?: Aggregator,
+    flusher?: Flusher,
+    coverage?: CoverageAggregator,
+  ) {
     this.config = config;
     this.aggregator = aggregator ?? new Aggregator();
+    this.coverage = coverage ?? new CoverageAggregator();
     this.flusher =
       flusher ??
       new Flusher(this.aggregator, {
@@ -81,10 +105,12 @@ export class HayvenTracer {
         intervalSeconds: config.flushIntervalSeconds,
         sampleRate: config.sampleRate,
         source: config.source,
+        coverage: this.coverage,
       });
     const scope: ScopeOptions = {
       projectPaths: config.projectPaths,
       includeInternal: config.includeInternal,
+      ...(config.moduleRoot ? { moduleRoot: config.moduleRoot } : {}),
     };
     this.resolver = makeResolver(scope);
   }
@@ -100,6 +126,26 @@ export class HayvenTracer {
   }
 
   /**
+   * The active per-test attribution context, or null (no attribution).
+   *
+   * While set, every harvested profile window ALSO records, per entity the
+   * window executed, a (context, entity) coverage cell — the wire's
+   * `test_coverage` rows. The test-runner integration (vitest.ts) sets this to
+   * the current TEST FILE's path-qualified module id at test start and clears
+   * it after the file's final harvest; attribution is therefore by WINDOW
+   * BOUNDARY, not stack frame, which is what makes it work for anonymous
+   * `it()` callbacks the profiler cannot name. The GLOBAL edge graph is
+   * unchanged by the context (mirrors the Python collector, where coverage is
+   * additive beside the edge aggregate).
+   */
+  get coverageContext(): string | null {
+    return this._coverageContext;
+  }
+  setCoverageContext(context: string | null): void {
+    this._coverageContext = context && context.length > 0 ? context : null;
+  }
+
+  /**
    * Connect the inspector session, start the CPU profiler, and launch the
    * background flusher + re-profile loop. Returns true on success. On any
    * failure (e.g. a runtime without the CPU profiler) it records `lastError`
@@ -107,6 +153,11 @@ export class HayvenTracer {
    */
   async install(): Promise<boolean> {
     if (this.installed) return true;
+    // Fork-safety: warm OpenSSL's lock-guarded caches BEFORE any profiler
+    // signal can fire. First-use crypto under a live 100 µs SIGPROF storm
+    // deadlocks Node 25's namemap writer against its background CA-cert
+    // loader's recursive read (see src/prewarm.ts for the full post-mortem).
+    prewarmCryptoLocks();
     try {
       const session = new inspector.Session();
       session.connect();
@@ -148,14 +199,7 @@ export class HayvenTracer {
     if (!this.installed || !this.post) return 0;
     try {
       const res = (await this.post("Profiler.stop")) as { profile?: CpuProfile };
-      const profile = res?.profile;
-      let added = 0;
-      if (profile) {
-        for (const e of deriveEdges(profile, this.resolver)) {
-          this.aggregator.add(e.src, e.dst, "call", e.observed);
-          added++;
-        }
-      }
+      const added = this.absorbWindow(res?.profile);
       // Re-arm a fresh profile window.
       await this.post("Profiler.start");
       return added;
@@ -163,6 +207,28 @@ export class HayvenTracer {
       this._lastError = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
       return 0;
     }
+  }
+
+  /**
+   * Fold one profile window into the aggregates: caller->callee edges into the
+   * GLOBAL edge aggregate (unchanged behavior), and — when a coverage context
+   * is set — every entity the window executed into the per-test coverage
+   * aggregate, attributed to that context. Returns the number of edges added.
+   */
+  private absorbWindow(profile: CpuProfile | undefined): number {
+    if (!profile) return 0;
+    let added = 0;
+    for (const e of deriveEdges(profile, this.resolver)) {
+      this.aggregator.add(e.src, e.dst, "call", e.observed);
+      added++;
+    }
+    const context = this._coverageContext;
+    if (context !== null) {
+      for (const c of deriveCoverage(profile, this.resolver)) {
+        this.coverage.add(context, c.name, c.observed);
+      }
+    }
+    return added;
   }
 
   /**
@@ -179,11 +245,7 @@ export class HayvenTracer {
     if (this.installed && this.post) {
       try {
         const res = (await this.post("Profiler.stop")) as { profile?: CpuProfile };
-        if (res?.profile) {
-          for (const e of deriveEdges(res.profile, this.resolver)) {
-            this.aggregator.add(e.src, e.dst, "call", e.observed);
-          }
-        }
+        this.absorbWindow(res?.profile);
         await this.post("Profiler.disable").catch(() => {});
       } catch (e) {
         this._lastError = e instanceof Error ? `${e.name}: ${e.message}` : String(e);

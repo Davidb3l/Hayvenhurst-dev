@@ -353,4 +353,37 @@ describe("graph routes (HTTP)", () => {
     const { status } = await get(app, "/api/importers");
     expect(status).toBe(400);
   });
+
+  it("GET /api/importers?id=<slash-typo> that only FUZZY-matches 404s (typo guard)", async () => {
+    // `wrong/dump_cookie` is not an exact id, but FTS resolves it to
+    // `pkg/dump_cookie`. A `/`-looking id must NOT silently answer for a
+    // different node — parity with the impact/refs/importers CLI guard.
+    const db = new Db(":memory:");
+    db.migrate();
+    node(db, "pkg/dump_cookie");
+    node(db, "other/thing");
+    const app = buildTestApp(db);
+    const { status } = await get(app, "/api/importers?id=wrong/dump_cookie");
+    expect(status).toBe(404);
+  });
+
+  it("GET /api/impact?id=<slash-typo> that only FUZZY-matches 404s (typo guard)", async () => {
+    const db = new Db(":memory:");
+    db.migrate();
+    node(db, "pkg/dump_cookie");
+    const app = buildTestApp(db);
+    const { status } = await get(app, "/api/impact?id=wrong/dump_cookie");
+    expect(status).toBe(404);
+  });
+
+  it("GET /api/importers?id=<bare-term> still fuzzy-resolves (200, echoes resolved)", async () => {
+    // A bare term (no `/`) is a loose query — keep the convenience.
+    const db = new Db(":memory:");
+    db.migrate();
+    node(db, "pkg/dump_cookie");
+    const app = buildTestApp(db);
+    const { status, body } = await get(app, "/api/importers?id=dump_cookie");
+    expect(status).toBe(200);
+    expect(body.resolved).toBe("pkg/dump_cookie");
+  });
 });

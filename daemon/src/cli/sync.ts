@@ -6,7 +6,7 @@
 // round-trip per divergent segment plus the initial root + leaves exchange.
 import { computeMerkle, diffSnapshots, type MerkleSnapshot } from "../crdt/merkle.ts";
 import { OpLog, splitSegmentBatches, type CrdtType } from "../crdt/oplog.ts";
-import { assertDaemonServesProject, requireProject } from "./_shared.ts";
+import { assertDaemonServesProject, reportIdentity, requireProject } from "./_shared.ts";
 import type { ParsedArgs } from "../cli.ts";
 
 interface SyncSummary {
@@ -44,11 +44,7 @@ export async function runSync(args: ParsedArgs): Promise<number> {
   // the wrong repo.
   const localUrl = `http://${ctx.config.daemon_host}:${ctx.config.daemon_port}`;
   const identity = await assertDaemonServesProject(localUrl, ctx);
-  if (!identity.ok) {
-    process.stderr.write(`error: ${identity.message}\n`);
-    return 1;
-  }
-  if (identity.warning) process.stderr.write(`warning: ${identity.warning}\n`);
+  if (!reportIdentity(identity)) return 1;
   const summary: SyncSummary = {
     peer: peerUrl,
     pulledSegments: 0,
@@ -64,8 +60,41 @@ export async function runSync(args: ParsedArgs): Promise<number> {
   const oplog = new OpLog(ctx.paths.crdtDir);
   try {
     return await runSyncWith(oplog, ctx, peerUrl, summary);
+  } catch (err) {
+    // A bare `fetch` rejection (connection refused / DNS / reset) means a daemon
+    // — local or peer — was unreachable. Surface it the same way the other
+    // mutating commands do instead of letting it bubble as an unhandled
+    // rejection. HTTP-status errors carry their own message and re-throw.
+    if (err instanceof UnreachableDaemonError) {
+      process.stderr.write(
+        `error: could not reach daemon at ${err.base} (${err.reason.message}).\n` +
+          "Start it with `hayven daemon start`.\n",
+      );
+      return 1;
+    }
+    throw err;
   } finally {
     oplog.close();
+  }
+}
+
+/** Thrown when a `fetch` to a daemon (local or peer) fails at the transport
+ *  layer — connection refused, DNS, reset — as opposed to an HTTP error status. */
+class UnreachableDaemonError extends Error {
+  constructor(readonly base: string, readonly reason: Error) {
+    super(`could not reach daemon at ${base}: ${reason.message}`);
+    this.name = "UnreachableDaemonError";
+  }
+}
+
+/** Run a `fetch`, re-tagging a transport-layer failure with the base URL so the
+ *  top-level handler can print the consistent unreachable-daemon message. */
+async function reachableFetch(url: string, init?: RequestInit): Promise<Response> {
+  const base = new URL(url).origin;
+  try {
+    return await fetch(url, init);
+  } catch (err) {
+    throw new UnreachableDaemonError(base, err as Error);
   }
 }
 
@@ -153,13 +182,13 @@ function rootsMatch(a: Record<CrdtType, string>, b: Record<CrdtType, string>): b
 }
 
 async function fetchJson<T>(url: string): Promise<T> {
-  const res = await fetch(url);
+  const res = await reachableFetch(url);
   if (!res.ok) throw new Error(`GET ${url} → ${res.status}`);
   return (await res.json()) as T;
 }
 
 async function postJson<T>(url: string, body: unknown): Promise<T> {
-  const res = await fetch(url, {
+  const res = await reachableFetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
@@ -177,7 +206,7 @@ async function pullSegment(peerUrl: string, type: CrdtType, path: string): Promi
   let offset = 0;
   // Hard cap on iterations to avoid an infinite loop against a buggy peer.
   for (let i = 0; i < 1024; i++) {
-    const res = await fetch(`${peerUrl}/api/sync/batch`, {
+    const res = await reachableFetch(`${peerUrl}/api/sync/batch`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ type, path, offset }),

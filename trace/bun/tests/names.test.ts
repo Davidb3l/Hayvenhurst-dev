@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { makeResolver, moduleOf, urlToPath } from "../src/names.ts";
+import { makeResolver, moduleIdOf, moduleOf, urlToPath } from "../src/names.ts";
 
 describe("urlToPath / moduleOf", () => {
   test("decodes file:// urls to filesystem paths", () => {
@@ -15,6 +15,24 @@ describe("urlToPath / moduleOf", () => {
     expect(moduleOf("/proj/index.js")).toBe("index");
     expect(moduleOf("/proj/noext")).toBe("noext");
     expect(moduleOf("")).toBe("");
+  });
+});
+
+describe("moduleIdOf (path-qualified module hints)", () => {
+  test("under the root: repo-relative path, extension stripped", () => {
+    expect(moduleIdOf("/repo/src/utils/body.ts", "/repo")).toBe("src/utils/body");
+    expect(moduleIdOf("/repo/src/utils/body.test.ts", "/repo/")).toBe("src/utils/body.test");
+    expect(moduleIdOf("/repo/src/jsx/dom/index.test.tsx", "/repo")).toBe("src/jsx/dom/index.test");
+  });
+
+  test("outside the root (or no root): falls back to the basename", () => {
+    expect(moduleIdOf("/elsewhere/x.ts", "/repo")).toBe("x");
+    expect(moduleIdOf("/repo/src/a.ts", undefined)).toBe("a");
+    expect(moduleIdOf("/repo/src/a.ts", "")).toBe("a");
+  });
+
+  test("dotfile basenames keep their name (no empty stem)", () => {
+    expect(moduleIdOf("/repo/src/.env", "/repo")).toBe("src/.env");
   });
 });
 
@@ -60,5 +78,17 @@ describe("makeResolver (entity-id convention + scoping)", () => {
     expect(
       r.nameOf({ functionName: "harvest", url: "file:///repo/trace/bun/src/tracer.ts" }),
     ).toBeNull();
+  });
+
+  test("moduleRoot emits path-qualified ids for in-repo frames, basename otherwise", () => {
+    const r = makeResolver({ projectPaths: ["/proj/"], moduleRoot: "/proj" });
+    expect(r.nameOf({ functionName: "parseBody", url: "file:///proj/src/utils/body.ts" })).toBe(
+      "src/utils/body:parseBody",
+    );
+    // Default (no moduleRoot) stays the bare basename — backward compatible.
+    const r2 = makeResolver({ projectPaths: ["/proj/"] });
+    expect(r2.nameOf({ functionName: "parseBody", url: "file:///proj/src/utils/body.ts" })).toBe(
+      "body:parseBody",
+    );
   });
 });

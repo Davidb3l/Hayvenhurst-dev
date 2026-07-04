@@ -27,6 +27,7 @@ import {
   type ContextSlice,
 } from "../db/context_pack.ts";
 import { resolveTaskToSymbols } from "../db/task_resolve.ts";
+import { buildEscalatingContext, selectRungForBudget } from "../db/context_escalation.ts";
 import { warnIfStale } from "../db/freshness.ts";
 import { isJson, openProjectDb, requireProject } from "./_shared.ts";
 
@@ -103,8 +104,112 @@ function sliceKey(s: ContextSlice): string {
 }
 
 export async function runContext(args: ParsedArgs): Promise<number> {
+  const escalate =
+    args.flags["escalate"] === true || args.flags["escalate"] === "true";
+  if (escalate) return runEscalateMode(args);
   const isTask = args.flags["task"] === true || args.flags["task"] === "true";
   return isTask ? runTaskMode(args) : runSymbolMode(args);
+}
+
+/**
+ * The `--escalate` path: build the pack → pack-2hop → whole-file LADDER for a
+ * symbol and report every rung plus the recommended one (the cheapest rung still
+ * under the "open every file" baseline). `--json` emits the full
+ * `EscalationResult`; markdown prints a rung summary + the recommended rung's
+ * slices, so a token-constrained builder can see the cost of each rung and climb
+ * only when the cheap one is insufficient.
+ */
+async function runEscalateMode(args: ParsedArgs): Promise<number> {
+  const rawId = args.positionals[0];
+  if (!rawId) {
+    process.stderr.write(
+      "usage: hayven context <symbol> --escalate [--budget N] [--json] [--max-neighbors N]\n",
+    );
+    return 2;
+  }
+  let ctx;
+  try {
+    ctx = requireProject();
+  } catch (err) {
+    process.stderr.write(`error: ${(err as Error).message}\n`);
+    return 1;
+  }
+  const maxFlag = args.flags["max-neighbors"];
+  const maxNeighbors =
+    maxFlag === undefined || maxFlag === true ? undefined : Number(maxFlag);
+  const budgetFlag = args.flags["budget"];
+  const budget =
+    typeof budgetFlag === "string" && budgetFlag.length > 0 && !Number.isNaN(Number(budgetFlag))
+      ? Number(budgetFlag)
+      : undefined;
+
+  const db = openProjectDb(ctx, { readonly: true });
+  try {
+    warnIfStale(db, ctx.paths);
+    const result = buildEscalatingContext(db, ctx.paths.repoRoot, rawId, {
+      maxNeighbors:
+        maxNeighbors !== undefined && !Number.isNaN(maxNeighbors)
+          ? maxNeighbors
+          : undefined,
+    });
+    if (!result) {
+      process.stderr.write(
+        `No node with id \`${rawId}\` — try \`hayven query ${rawId}\` to fuzzy-find it.\n`,
+      );
+      return 1;
+    }
+    if (result.resolved) {
+      process.stderr.write(
+        `note: \`${rawId}\` not found exactly; using \`${result.symbol}\` (top search hit).\n`,
+      );
+    }
+    // With a --budget, pick the RICHEST rung that fits; otherwise the default
+    // "cheapest under whole-file" recommendation.
+    const budgeted = budget !== undefined ? selectRungForBudget(result, budget) : undefined;
+    const chosen = budgeted ? budgeted.rung : result.recommended;
+
+    if (isJson(args.flags)) {
+      process.stdout.write(
+        JSON.stringify(budgeted ? { ...result, budgeted } : result, null, 2) + "\n",
+      );
+      return 0;
+    }
+    const lines = [
+      `# Context ladder for \`${result.symbol}\``,
+      "",
+      "| rung | files | ~tokens |",
+      "|------|-------|---------|",
+    ];
+    for (const r of result.rungs) {
+      const mark = r.level === chosen.level ? " ✅" : "";
+      lines.push(`| ${r.level}${mark} | ${r.files.length} | ${r.estTokens} |`);
+    }
+    lines.push("");
+    if (budgeted) {
+      lines.push(
+        budgeted.fits
+          ? `Budget ${budget}: richest rung that fits is \`${chosen.level}\` (~${chosen.estTokens} tokens).`
+          : `Budget ${budget}: even the cheapest rung \`${chosen.level}\` (~${chosen.estTokens} tokens) is OVER budget — sending the floor.`,
+      );
+    } else {
+      lines.push(
+        `Recommended: \`${result.recommended.level}\` (~${result.recommended.estTokens} tokens).`,
+      );
+    }
+    lines.push("");
+    for (const s of chosen.slices) {
+      lines.push(`## ${sliceLabel(s)}`);
+      lines.push("```" + fenceLang(s.file));
+      lines.push(s.text);
+      lines.push("```");
+      lines.push("");
+    }
+    if (result.notes.length > 0) lines.push("> notes: " + result.notes.join("; "));
+    process.stdout.write(lines.join("\n") + "\n");
+    return 0;
+  } finally {
+    db.close();
+  }
 }
 
 /** The EXISTING single-symbol path — behavior unchanged. */

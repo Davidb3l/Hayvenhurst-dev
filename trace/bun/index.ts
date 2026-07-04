@@ -35,19 +35,32 @@
 import { HayvenTracer, DEFAULT_CONFIG, type TracerConfig } from "./src/tracer.ts";
 import { configFromEnv, isEnabled } from "./src/env.ts";
 
-export { Aggregator } from "./src/aggregator.ts";
-export type { Observation, CallKey } from "./src/aggregator.ts";
-export { Flusher, encodePayload } from "./src/flusher.ts";
-export type { Sender, WirePayload, WireObservation, FlusherOptions } from "./src/flusher.ts";
-export { deriveEdges, UINT16_MAX } from "./src/profile.ts";
-export type { CpuProfile, ProfileNode, CallFrame, DerivedEdge, NameResolver } from "./src/profile.ts";
-export { makeResolver, urlToPath, moduleOf } from "./src/names.ts";
+export { Aggregator, CoverageAggregator } from "./src/aggregator.ts";
+export type { Observation, CallKey, CoverageRow } from "./src/aggregator.ts";
+export { Flusher, encodePayload, FLUSH_BATCH_SIZE } from "./src/flusher.ts";
+export type {
+  Sender,
+  WirePayload,
+  WireObservation,
+  WireTestCoverage,
+  FlusherOptions,
+} from "./src/flusher.ts";
+export { deriveEdges, deriveCoverage, UINT16_MAX } from "./src/profile.ts";
+export type {
+  CpuProfile,
+  ProfileNode,
+  CallFrame,
+  DerivedEdge,
+  CoveredName,
+  NameResolver,
+} from "./src/profile.ts";
+export { makeResolver, urlToPath, moduleOf, moduleIdOf } from "./src/names.ts";
 export type { ScopeOptions } from "./src/names.ts";
 export { HayvenTracer, DEFAULT_CONFIG } from "./src/tracer.ts";
 export type { TracerConfig } from "./src/tracer.ts";
 export { configFromEnv, isEnabled } from "./src/env.ts";
 
-export const VERSION = "0.0.5";
+export const VERSION = "0.0.4";
 
 /** Public `start` options. All optional except none — every field has a default. */
 export interface StartOptions {
@@ -60,6 +73,17 @@ export interface StartOptions {
   /** Keep node_modules / node:/bun: frames. Default false. */
   includeInternal?: boolean;
   source?: string;
+  /**
+   * V8 sampling interval in µs. Default 1000 (1 ms). Fast unit-test suites need
+   * 100 µs for usable edge density (measured: 3 → 22 edges on the same hono
+   * test file). Also settable via `HAYVEN_TRACE_SAMPLING_US`.
+   */
+  samplingIntervalUs?: number;
+  /**
+   * Repo root for path-qualified module hints (`src/utils/body:parseBody`
+   * instead of `body:parseBody`). Default `process.cwd()`; pass "" to disable.
+   */
+  moduleRoot?: string;
 }
 
 let active: HayvenTracer | null = null;
@@ -88,6 +112,10 @@ export async function start(opts: StartOptions = {}): Promise<HayvenTracer> {
     ...(opts.projectPaths !== undefined ? { projectPaths: opts.projectPaths } : {}),
     ...(opts.includeInternal !== undefined ? { includeInternal: opts.includeInternal } : {}),
     ...(opts.source !== undefined ? { source: opts.source } : {}),
+    ...(opts.samplingIntervalUs !== undefined
+      ? { samplingIntervalUs: Math.max(1, Math.floor(opts.samplingIntervalUs)) }
+      : {}),
+    ...(opts.moduleRoot !== undefined ? { moduleRoot: opts.moduleRoot } : {}),
   };
   const tracer = new HayvenTracer(cfg);
   await tracer.install();
@@ -110,6 +138,9 @@ export async function startFromEnv(overrides: StartOptions = {}): Promise<Hayven
   if (overrides.projectPaths !== undefined) partial.projectPaths = overrides.projectPaths;
   if (overrides.includeInternal !== undefined) partial.includeInternal = overrides.includeInternal;
   if (overrides.source !== undefined) partial.source = overrides.source;
+  if (overrides.samplingIntervalUs !== undefined)
+    partial.samplingIntervalUs = Math.max(1, Math.floor(overrides.samplingIntervalUs));
+  if (overrides.moduleRoot !== undefined) partial.moduleRoot = overrides.moduleRoot;
 
   const cfg = configFromEnv(partial);
   const tracer = new HayvenTracer(cfg);

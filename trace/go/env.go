@@ -9,11 +9,12 @@ import (
 
 // Env var names, mirroring the Python collector's table.
 const (
-	EnvEnable   = "HAYVEN_TRACE"          // set "1" to enable
-	EnvURL      = "HAYVEN_TRACE_URL"      // daemon base URL
-	EnvRate     = "HAYVEN_TRACE_RATE"     // sample_rate (true 1-in-N only)
-	EnvInterval = "HAYVEN_TRACE_INTERVAL" // flush cadence, seconds
-	EnvProject  = "HAYVEN_TRACE_PROJECT"  // ":"-separated import-path prefixes
+	EnvEnable   = "HAYVEN_TRACE"           // set "1" to enable
+	EnvURL      = "HAYVEN_TRACE_URL"       // daemon base URL
+	EnvRate     = "HAYVEN_TRACE_RATE"      // sample_rate (true 1-in-N only)
+	EnvInterval = "HAYVEN_TRACE_INTERVAL"  // flush cadence, seconds
+	EnvSampleMs = "HAYVEN_TRACE_SAMPLE_MS" // stack-sample cadence, milliseconds
+	EnvProject  = "HAYVEN_TRACE_PROJECT"   // ":"-separated import-path prefixes
 )
 
 // ConfigFromEnv builds a Config from the HAYVEN_TRACE_* environment, applying
@@ -32,6 +33,15 @@ func ConfigFromEnv() Config {
 	if v := os.Getenv(EnvInterval); v != "" {
 		if secs, err := strconv.ParseFloat(v, 64); err == nil && secs > 0 {
 			cfg.FlushInterval = time.Duration(secs * float64(time.Second))
+		}
+	}
+	// Per-test coverage NEEDS dense sampling (a fast test that runs between two
+	// 10ms ticks is otherwise never observed). HAYVEN_TRACE_SAMPLE_MS lowers the
+	// stack-sample cadence; <= 0 / unset keeps the 10ms default. The edge path
+	// is unaffected by the value beyond finer counts.
+	if v := os.Getenv(EnvSampleMs); v != "" {
+		if ms, err := strconv.ParseFloat(v, 64); err == nil && ms > 0 {
+			cfg.SampleInterval = time.Duration(ms * float64(time.Millisecond))
 		}
 	}
 	if v := os.Getenv(EnvRate); v != "" {

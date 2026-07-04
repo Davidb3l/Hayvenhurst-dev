@@ -10,7 +10,7 @@
  * a mock that captures the encoded payload — no live daemon required.
  */
 
-import type { Aggregator, Observation } from "./aggregator.ts";
+import type { Aggregator, CoverageAggregator, CoverageRow, Observation } from "./aggregator.ts";
 import { UINT16_MAX } from "./profile.ts";
 
 /** Injectable transport. Receives the full URL and the JSON-encoded body. */
@@ -26,11 +26,40 @@ export interface WireObservation {
   kind: string;
 }
 
+/** A per-test coverage row on the wire (mirrors trace/python's shape exactly:
+ *  non-empty `test`/`entity` raw runtime names + a non-negative int `weight`). */
+export interface WireTestCoverage {
+  test: string;
+  entity: string;
+  weight: number;
+}
+
 /** The full POST envelope the daemon validates. */
 export interface WirePayload {
   source: string;
   sample_rate: number;
   observations: WireObservation[];
+  /** Additive per-test coverage (daemon schema v6). Omitted entirely when there
+   *  is nothing to report, so edge-only batches stay byte-identical to the
+   *  legacy shape (same rule as trace/python's flusher). */
+  test_coverage?: WireTestCoverage[];
+}
+
+/**
+ * Maximum rows (observations OR coverage) carried in a single POST. Mirrors
+ * trace/python's `FLUSH_BATCH_SIZE` and the data-loss bug it fixed there: a
+ * full suite's shutdown flush in ONE giant JSON blew the per-request timeout
+ * and silently dropped everything already drained. Bounded chunks keep every
+ * request small, and a single failed chunk is re-buffered instead of taking
+ * the rest of the flush down with it.
+ */
+export const FLUSH_BATCH_SIZE = 1000;
+
+function chunk<T>(rows: readonly T[], size: number): T[][] {
+  const s = size < 1 ? 1 : size;
+  const out: T[][] = [];
+  for (let i = 0; i < rows.length; i += s) out.push(rows.slice(i, i + s));
+  return out;
 }
 
 export interface FlusherOptions {
@@ -50,6 +79,14 @@ export interface FlusherOptions {
   sender?: Sender;
   /** Batch source tag. Default `"bun"`. */
   source?: string;
+  /**
+   * Optional per-test coverage aggregator. When supplied, each flush also
+   * drains it and emits a top-level `test_coverage` array alongside the
+   * unchanged `observations` — the SAME lifecycle as the edge aggregate
+   * (cleared every flush, including the final shutdown flush). Mirrors
+   * trace/python's `Flusher(coverage=…)`.
+   */
+  coverage?: CoverageAggregator;
 }
 
 /**
@@ -71,10 +108,11 @@ export function encodePayload(
   observations: Observation[],
   sampleRate: number,
   source: string,
+  coverage: CoverageRow[] = [],
 ): WirePayload {
   const rate = Math.max(1, Math.floor(sampleRate));
   const observedCeiling = Math.floor(UINT16_MAX / rate);
-  return {
+  const payload: WirePayload = {
     source,
     sample_rate: rate,
     observations: observations.map((o) => {
@@ -89,10 +127,24 @@ export function encodePayload(
       };
     }),
   };
+  // Additive per-test coverage. The daemon accepts `test_coverage` beside the
+  // unchanged `observations` (coverage-only payloads carry `observations: []`,
+  // which the route accepts). Weight is NOT sample-rate scaled — it's an
+  // advisory count, not the daemon-verified `weight` invariant field. Omit the
+  // key entirely when empty (byte-identical legacy shape).
+  if (coverage.length > 0) {
+    payload.test_coverage = coverage.map((c) => ({
+      test: c.test,
+      entity: c.entity,
+      weight: Math.max(0, Math.floor(c.weight)),
+    }));
+  }
+  return payload;
 }
 
 export class Flusher {
   private readonly agg: Aggregator;
+  private readonly coverage: CoverageAggregator | null;
   private readonly url: string;
   private readonly intervalMs: number;
   private readonly sampleRate: number;
@@ -109,6 +161,7 @@ export class Flusher {
 
   constructor(aggregator: Aggregator, opts: FlusherOptions) {
     this.agg = aggregator;
+    this.coverage = opts.coverage ?? null;
     this.url = opts.daemonUrl.replace(/\/+$/, "") + "/api/traces/observations";
     this.intervalMs = Math.max(1, (opts.intervalSeconds ?? 30)) * 1000;
     this.sampleRate = Math.max(1, Math.floor(opts.sampleRate ?? 1));
@@ -148,28 +201,73 @@ export class Flusher {
   }
 
   /**
-   * Drain and POST. Returns the number of observations sent (0 if none or on
-   * error). Never throws into user code; errors land on `lastError`.
+   * Drain and POST in BOUNDED chunks. Returns the number of observations
+   * actually sent (0 if none, or if every chunk failed). Never throws into
+   * user code; errors land on `lastError`.
+   *
+   * Mirrors trace/python's chunked flush: the drained payload is split into
+   * chunks of at most {@link FLUSH_BATCH_SIZE} rows; observation chunks are
+   * PAIRED with coverage chunks so coverage rides with a non-empty
+   * `observations` wherever possible, and surplus chunks ship on their own
+   * (a coverage-only payload carries `observations: []`, which the daemon
+   * accepts). A FAILED chunk is re-buffered into the aggregators so the next
+   * flush retries it — a transient daemon outage is a delayed send, not a
+   * silent drop — and the loop CONTINUES so one bad chunk can't take the
+   * remaining chunks down.
    */
   async flushOnce(): Promise<number> {
     const obs = this.agg.drain();
-    if (obs.length === 0) return 0;
-    const payload = encodePayload(obs, this.sampleRate, this.source);
-    const body = JSON.stringify(payload);
+    const coverage = this.coverage?.drain() ?? [];
+    if (obs.length === 0 && coverage.length === 0) return 0;
+
     const run = (async () => {
-      try {
-        await this.sender(this.url, body);
-        this._lastFlushAt = Date.now();
-        this._lastFlushCount = obs.length;
-        this._lastError = null;
-      } catch (e) {
-        this._lastError = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      const obsChunks = chunk(obs, FLUSH_BATCH_SIZE);
+      const covChunks = chunk(coverage, FLUSH_BATCH_SIZE);
+      const nPairs = Math.max(obsChunks.length, covChunks.length);
+      let sent = 0;
+      let anyError: string | null = null;
+      for (let i = 0; i < nPairs; i++) {
+        const o = obsChunks[i] ?? [];
+        const c = covChunks[i] ?? [];
+        const body = JSON.stringify(encodePayload(o, this.sampleRate, this.source, c));
+        try {
+          await this.sender(this.url, body);
+          sent += o.length;
+        } catch (e) {
+          anyError = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+          this.rebuffer(o, c);
+        }
       }
+      if (anyError !== null) {
+        this._lastError = anyError;
+        this._lastFlushCount = sent;
+      } else {
+        this._lastFlushAt = Date.now();
+        this._lastFlushCount = sent;
+        this._lastError = null;
+      }
+      return sent;
     })();
-    this.inFlight = run;
-    await run;
+
+    this.inFlight = run.then(() => {});
+    const sent = await run;
     this.inFlight = null;
-    return this._lastError === null ? obs.length : 0;
+    return sent;
+  }
+
+  /**
+   * Return a failed chunk's rows to the aggregators for the next flush.
+   * Best-effort: must never throw out of the flush path.
+   */
+  private rebuffer(obs: Observation[], coverage: CoverageRow[]): void {
+    try {
+      for (const o of obs) this.agg.add(o.src, o.dst, o.kind, o.observed);
+      if (this.coverage !== null) {
+        for (const c of coverage) this.coverage.add(c.test, c.entity, c.weight);
+      }
+    } catch {
+      /* defensive: drop only in the already-degraded double-failure case */
+    }
   }
 
   private async defaultSender(url: string, body: string): Promise<void> {
@@ -180,7 +278,7 @@ export class Flusher {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "User-Agent": "hayven-trace-bun/0.0.5",
+          "User-Agent": "hayven-trace-bun/0.0.4",
         },
         body,
         signal: ctrl.signal,

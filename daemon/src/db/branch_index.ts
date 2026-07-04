@@ -34,6 +34,8 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 
+import { Database } from "bun:sqlite";
+
 import type { HayvenConfig } from "../config/defaults.ts";
 import type { HayvenPaths } from "../util/paths.ts";
 
@@ -191,6 +193,29 @@ export function resolveWriteIndex(
   opts: { seed?: boolean } = {},
 ): ResolvedWriteIndex {
   const key = activeBranchKey(paths, config);
+  return resolveWriteIndexForKey(paths, config, key, opts);
+}
+
+/**
+ * Resolve/seed/evict a WRITE index for a SPECIFIC branch `key` — the caller
+ * already knows the key it wants and does NOT want a fresh `.git/HEAD` read.
+ *
+ * This is the daemon's live-re-point path: the poller detects a branch key,
+ * hands it here, and the resolved index must target THAT key — not "whatever
+ * HEAD says now" (a `git checkout` during a multi-second freshen would
+ * otherwise retarget the swap and desync the poller). `key === null` is the
+ * legacy/no-git case (identical to `resolveWriteIndex`'s null branch).
+ *
+ * `opts.keepAlsoKey` protects a second key (e.g. the still-open OLD served
+ * branch) from LRU eviction during the re-point, so the branch dir the daemon
+ * currently holds open is never `rmSync`'d out from under it.
+ */
+export function resolveWriteIndexForKey(
+  paths: HayvenPaths,
+  config: HayvenConfig,
+  key: string | null,
+  opts: { seed?: boolean; keepAlsoKey?: string } = {},
+): ResolvedWriteIndex {
   if (key === null) {
     return {
       path: paths.sqliteFile,
@@ -217,7 +242,9 @@ export function resolveWriteIndex(
 
   // The just-touched branch is the most-recently-used; evict the oldest beyond
   // the cap (legacy index is never a candidate — it lives outside branchesDir).
-  evictBranchesLru(paths, config, key);
+  // Protect both the resolved key AND any caller-pinned key (the OLD served
+  // branch during a re-point), so an open branch dir is never evicted.
+  evictBranchesLru(paths, config, key, opts.keepAlsoKey);
 
   return { path: bp, branchKey: key, usedFallback: false, seededFrom };
 }
@@ -256,6 +283,88 @@ function freshestSeed(paths: HayvenPaths, exceptKey: string): string | null {
   const newest = siblings[0];
   if (newest !== undefined) return newest.path;
   return existsSync(paths.sqliteFile) ? paths.sqliteFile : null;
+}
+
+/** One per-branch cache directory removed by {@link pruneBranches}. */
+export interface BranchPruneRemoval {
+  readonly key: string;
+  /** Absolute path of the removed branch's `index.sqlite`. */
+  readonly path: string;
+  /** On-disk bytes reclaimed (index + any `-wal`/`-shm` sidecars). */
+  readonly sizeBytes: number;
+}
+
+export interface BranchPruneResult {
+  /** The branch caches that were deleted. */
+  readonly removed: BranchPruneRemoval[];
+  /** Total bytes reclaimed across all removals. */
+  readonly bytesReclaimed: number;
+  /** Keys retained (the active branch + the `keep` most-recently-used). */
+  readonly kept: string[];
+}
+
+/** Sum the on-disk bytes of a branch index file plus any `-wal`/`-shm` sidecars. */
+function branchIndexSize(path: string): number {
+  let total = 0;
+  for (const suffix of ["", ...SQLITE_SIDECARS]) {
+    try {
+      total += statSync(path + suffix).size;
+    } catch {
+      // Missing main file or absent sidecar — counts as 0.
+    }
+  }
+  return total;
+}
+
+/**
+ * Prune stale per-branch index caches, KEEPING the active branch plus the `keep`
+ * most-recently-used branches; reports what was removed and the bytes reclaimed.
+ *
+ * Safe by construction: only ever removes directories strictly under
+ * `paths.branchesDir` (the keys `listBranchIndexes` enumerates from it). The
+ * active branch is NEVER a candidate, and the legacy `.hayven/index.sqlite`
+ * lives OUTSIDE `branchesDir` so it is never enumerated here — it cannot be
+ * touched. Best-effort per-removal (a failed `rmSync` is skipped); never throws.
+ */
+export function pruneBranches(
+  paths: HayvenPaths,
+  config: HayvenConfig,
+  keep: number,
+): BranchPruneResult {
+  const activeKey = activeBranchKey(paths, config);
+  const all = listBranchIndexes(paths).sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+  const kept: string[] = [];
+  const removed: BranchPruneRemoval[] = [];
+  let bytesReclaimed = 0;
+  let keptNonActive = 0;
+  const keepN = Math.max(0, Math.floor(keep));
+
+  for (const b of all) {
+    // Always retain the active branch (it does not consume a `keep` slot).
+    if (b.key === activeKey) {
+      kept.push(b.key);
+      continue;
+    }
+    // Retain the `keep` most-recently-used non-active branches.
+    if (keptNonActive < keepN) {
+      kept.push(b.key);
+      keptNonActive++;
+      continue;
+    }
+    // Evict — only ever a dir under branchesDir.
+    const size = branchIndexSize(b.path);
+    try {
+      rmSync(join(paths.branchesDir, b.key), { recursive: true, force: true });
+      removed.push({ key: b.key, path: b.path, sizeBytes: size });
+      bytesReclaimed += size;
+    } catch {
+      // best-effort eviction — keep it in `kept` since it survived
+      kept.push(b.key);
+    }
+  }
+
+  return { removed, bytesReclaimed, kept };
 }
 
 export interface BranchDiff {
@@ -305,42 +414,189 @@ export function gitDiffSince(repoRoot: string, fromRef: string): BranchDiff | nu
   return { changed, deleted };
 }
 
-/** Copy a SQLite file and any present `-wal`/`-shm` sidecars. */
+/**
+ * NEW source files that git is not yet tracking (`git ls-files --others
+ * --exclude-standard`). `gitDiffSince` only sees tracked changes; an
+ * incremental same-branch re-ingest must also pick up brand-new files the user
+ * created since the last ingest. Returns `[]` on any git failure / non-repo
+ * (the caller already has the tracked diff). NEVER throws.
+ */
+export function gitUntracked(repoRoot: string): string[] {
+  try {
+    const res = spawnSync(
+      "git",
+      ["-C", repoRoot, "ls-files", "--others", "--exclude-standard", "-z"],
+      { encoding: "utf8", timeout: 10_000, maxBuffer: 64 * 1024 * 1024 },
+    );
+    if (res.status !== 0 || typeof res.stdout !== "string") return [];
+    return res.stdout.split("\0").filter((t) => t.length > 0);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Seed a new branch index by taking a TRANSACTIONALLY-CONSISTENT snapshot of
+ * `from` and writing it to `to`.
+ *
+ * WAL-consistency: the DB runs in `journal_mode = WAL` (`db/schema.ts`). When
+ * the source is the daemon's LIVE connection (the only risky case — seeding
+ * branch B from branch A while A is still open, see `resolveWriteIndexForKey`),
+ * it holds COMMITTED-but-un-checkpointed pages in its `-wal`. The old
+ * `copyFileSync(main) + copy(-wal) + copy(-shm)` approach was NOT a consistent
+ * snapshot: the three files can be torn relative to each other, and a copied
+ * `-shm` (shared-memory index) is meaningless out of its mmap — a fresh open of
+ * the copied `main` alone silently DROPS every un-checkpointed WAL commit (the
+ * bug this fixes) or refuses to open at all.
+ *
+ * Why not `bun:sqlite`'s `serialize()`: it captures the committed state, but its
+ * output still carries a WAL-mode header and bun REFUSES a `{ readonly: true }`
+ * open of a bare WAL-header file with no sidecars (SQLITE_CANTOPEN) — and the
+ * daemonless read path DOES open a seeded index read-only (`refs`/`context`/
+ * `impact`/`mcp` all use `openProjectDb(ctx, { readonly: true })`). So the
+ * snapshot must be a self-contained, readonly-openable single file.
+ *
+ * The fix — fold the committed WAL into `main`, then hand off a NON-WAL copy:
+ * 1. `PRAGMA wal_checkpoint(TRUNCATE)` on a short-lived SOURCE connection folds
+ *    every committed page (including un-checkpointed WAL commits) into the
+ *    source `main`. A passive/truncate checkpoint from a second connection is
+ *    safe while the daemon's live connection is open — the re-point path is
+ *    serialized by `runIngestExclusive`, so there is no concurrent writer.
+ * 2. `copyFileSync(main)` (plus a residual non-empty `-wal` iff a reader blocked
+ *    the truncate — so no committed data is ever lost; `-shm` is never copied).
+ * 3. Open the DESTINATION once, checkpoint again to absorb any residual `-wal`,
+ *    and `PRAGMA journal_mode = DELETE` to rewrite its header OUT of WAL mode,
+ *    yielding a self-contained file that opens cleanly read-only. This is a
+ *    raw file copy + a header flip — NOT a page-by-page `VACUUM INTO` rebuild —
+ *    so the "instant branch switch" hot path stays fast for the few-MB indexes
+ *    involved.
+ *
+ * Best-effort throughout: a cleanly-closed source is already a consistent single
+ * `main`, so even if every step no-ops the copy is correct; seeding never throws.
+ */
 function copySqlite(from: string, to: string): void {
+  // 1. Fold the source's committed WAL into its main file.
+  checkpointWal(from);
+
+  // 2. Copy the (now-consolidated) main; carry a residual non-empty `-wal` only
+  //    if a concurrent reader prevented the truncate, so committed pages survive.
+  //    Never copy `-shm` (it is rebuilt from main+wal on open).
   copyFileSync(from, to);
-  for (const suffix of SQLITE_SIDECARS) {
-    const src = from + suffix;
-    if (existsSync(src)) {
-      try {
-        copyFileSync(src, to + suffix);
-      } catch {
-        // Sidecars are best-effort; a clean source has none anyway.
-      }
+  const walSize = fileSizeOrZero(from + "-wal");
+  if (walSize > 0) {
+    try {
+      copyFileSync(from + "-wal", to + "-wal");
+    } catch {
+      // best-effort; the checkpoint above already folded committed pages in
+    }
+  } else {
+    safeRm(to + "-wal"); // drop any stale sidecar a prior seed may have left
+  }
+
+  // 3. Rewrite the destination out of WAL mode into a self-contained file that
+  //    opens read-only. checkpoint absorbs any residual `-wal` first.
+  finalizeDestination(to);
+}
+
+/** Fold `path`'s committed WAL into its main file. Best-effort; never throws. */
+function checkpointWal(path: string): void {
+  if (!existsSync(path)) return;
+  let db: Database | null = null;
+  try {
+    db = new Database(path);
+    db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  } catch {
+    // best-effort — a cleanly-closed source is already consistent
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      // ignore close failures
     }
   }
 }
 
 /**
+ * Absorb any residual `-wal` into `to`'s main file and rewrite its header out of
+ * WAL mode (`journal_mode = DELETE`), leaving a single self-contained file that
+ * opens `{ readonly: true }`. Best-effort; never throws.
+ */
+function finalizeDestination(to: string): void {
+  let db: Database | null = null;
+  try {
+    db = new Database(to);
+    db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    db.exec("PRAGMA journal_mode = DELETE");
+  } catch {
+    // best-effort
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      // ignore close failures
+    }
+  }
+  // journal_mode=DELETE removes the `-wal`; drop the `-shm` too so the copied
+  // main is the sole source of truth for a subsequent read-only open.
+  safeRm(to + "-wal");
+  safeRm(to + "-shm");
+}
+
+/** `statSync(path).size`, or 0 when the file is absent. */
+function fileSizeOrZero(path: string): number {
+  try {
+    return statSync(path).size;
+  } catch {
+    return 0;
+  }
+}
+
+/** `rmSync(path, { force: true })` that swallows any error. */
+function safeRm(path: string): void {
+  try {
+    rmSync(path, { force: true });
+  } catch {
+    // best-effort
+  }
+}
+
+/**
  * LRU-evict per-branch indexes beyond `index.maxBranches`, keeping the most
- * recently modified (the current branch `keepKey` is always retained even if
- * its mtime is momentarily oldest). Best-effort; never throws.
+ * recently modified. The protected keys (`keepKey`, the current branch, and the
+ * optional `keepAlsoKey`, the still-open OLD served branch during a re-point)
+ * are ALWAYS retained even if their mtime is momentarily oldest. Best-effort;
+ * never throws.
  */
 export function evictBranchesLru(
   paths: HayvenPaths,
   config: HayvenConfig,
   keepKey?: string,
+  keepAlsoKey?: string,
 ): void {
   const max = Math.max(1, config.index?.maxBranches ?? DEFAULT_MAX_BRANCHES);
   const all = listBranchIndexes(paths);
   if (all.length <= max) return;
 
-  // Newest first; protect the current branch by forcing it to the front.
-  const ranked = all.sort((a, b) => {
-    if (a.key === keepKey) return -1;
-    if (b.key === keepKey) return 1;
-    return b.mtimeMs - a.mtimeMs;
-  });
-  for (const victim of ranked.slice(max)) {
+  // Partition the protected keys OUT first, then sort only the remainder by
+  // mtime. The prior in-comparator `keepKey` special-casing returned ±1 for a
+  // protected key regardless of the OTHER operand, which is non-transitive (not
+  // a valid total order) — the "protect keepKey" guarantee then depended on the
+  // engine's sort implementation. A clean partition makes the guarantee
+  // structural, independent of any comparator behavior.
+  const protectedKeys = new Set<string>();
+  if (keepKey !== undefined) protectedKeys.add(keepKey);
+  if (keepAlsoKey !== undefined) protectedKeys.add(keepAlsoKey);
+
+  const kept = all.filter((b) => protectedKeys.has(b.key));
+  const evictable = all
+    .filter((b) => !protectedKeys.has(b.key))
+    .sort((a, b) => b.mtimeMs - a.mtimeMs); // newest first
+
+  // Retain the protected keys plus the freshest `max - kept.length` others.
+  // Everything past that cap (never a protected key) is a victim.
+  const remainingSlots = Math.max(0, max - kept.length);
+  const victims = evictable.slice(remainingSlots);
+  for (const victim of victims) {
     try {
       rmSync(join(paths.branchesDir, victim.key), { recursive: true, force: true });
     } catch {

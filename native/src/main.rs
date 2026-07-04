@@ -50,8 +50,12 @@ enum Cmd {
         #[arg(long)]
         jobs: Option<usize>,
 
-        /// Skip files larger than this many bytes. Default: 2 MiB.
-        #[arg(long, default_value_t = 2 * 1024 * 1024)]
+        /// Skip files larger than this many bytes. Default: 8 MiB — covers
+        /// legitimate large HAND-WRITTEN source (e.g. TypeScript's checker.ts at
+        /// ~3 MB / 54K lines, which a 2 MiB cap silently dropped at scale);
+        /// tree-sitter parses 8 MiB in well under a second. Files past this are
+        /// overwhelmingly minified/generated bundles, where skipping is correct.
+        #[arg(long, default_value_t = 8 * 1024 * 1024)]
         max_file_size: u64,
 
         /// Read the incremental file list from stdin instead of walking the
@@ -77,6 +81,22 @@ enum Cmd {
         /// daemon's deterministic contract-diff conflict oracle.
         #[arg(long)]
         signatures: bool,
+
+        /// Also index dependency-SOURCE directories (`vendor/`, `Godeps/`,
+        /// `third_party/`). Default OFF — first-party code only keeps the index
+        /// lean and search relevant; set this for the rarer case of navigating
+        /// into a vendored dependency. (Build/VCS/cache dirs are always skipped.)
+        #[arg(long)]
+        include_vendored: bool,
+
+        /// Also index test-fixture / example / benchmark directories
+        /// (`test/fixtures/`, `examples/`, `benchmark/`, `benchmarks/`).
+        /// Default OFF — fixture apps are throwaway scaffolds that inflate the
+        /// index and dilute search (measured 27.6% of withastro/astro's index);
+        /// set this for the rarer case of navigating fixture/example code.
+        /// A `fixtures/` dir NOT under a test dir is always indexed.
+        #[arg(long)]
+        include_fixtures: bool,
     },
 
     /// Watch a project root for changes. Streams §16.2 NDJSON change
@@ -143,7 +163,18 @@ fn main() -> ExitCode {
             max_file_size,
             files_stdin,
             signatures,
-        } => match run_parse(root, langs, jobs, max_file_size, files_stdin, signatures) {
+            include_vendored,
+            include_fixtures,
+        } => match run_parse(
+            root,
+            langs,
+            jobs,
+            max_file_size,
+            files_stdin,
+            signatures,
+            include_vendored,
+            include_fixtures,
+        ) {
             Ok(code) => ExitCode::from(code as u8),
             Err(err) => {
                 // Fatal: write a single Fatal record on stdout, then
@@ -178,6 +209,10 @@ fn main() -> ExitCode {
 /// Convert raw CLI args into `ParseOptions` and run the pipeline.
 /// Anything that fails before we start emitting records (unknown
 /// language token, missing root) is surfaced as a `Fatal` record.
+// One positional per clap flag: this shim mirrors the CLI surface 1:1 and the
+// args collapse into `ParseOptions` immediately, so a param struct here would
+// just duplicate that type.
+#[allow(clippy::too_many_arguments)]
 fn run_parse(
     root: PathBuf,
     langs: Vec<String>,
@@ -185,6 +220,8 @@ fn run_parse(
     max_file_size: u64,
     files_stdin: bool,
     emit_signatures: bool,
+    include_vendored: bool,
+    include_fixtures: bool,
 ) -> anyhow::Result<i32> {
     let mut languages = HashSet::new();
     for token in &langs {
@@ -226,6 +263,8 @@ fn run_parse(
         max_file_size,
         explicit_files,
         emit_signatures,
+        include_vendored,
+        include_fixtures,
     })
 }
 

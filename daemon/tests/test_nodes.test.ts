@@ -121,10 +121,34 @@ describe("classifyTest — runner + runnable shapes", () => {
     expect(h!.runnable).toBe("tests/test_echo.py::test_echo");
   });
 
+  it("pytest: a MODULE node runs as the FILE, never file::<module-name>", () => {
+    // A test-file module node has name == module stem (`test_http`); the naive
+    // handle `tests/test_http.py::test_http` is not collectable and ABORTS a whole
+    // `pytest <ids…>` run. It must be the file itself.
+    const h = classifyTest(cand({ name: "test_http", file: "tests/test_http.py", kind: "module", language: "python" }));
+    expect(h).not.toBeNull();
+    expect(h!.runner).toBe("pytest");
+    expect(h!.runnable).toBe("tests/test_http.py"); // the FILE, not ::test_http
+  });
+
   it("pytest: PascalCase Class.method → file::Class::method node id", () => {
     const h = classifyTest(cand({ name: "TestParser.test_echo", file: "tests/test_parser.py" }));
     expect(h!.runner).toBe("pytest");
     expect(h!.runnable).toBe("tests/test_parser.py::TestParser::test_echo");
+  });
+
+  it("pytest: class method whose CLASS is only in the id tail (bare name) → file::Class::method", () => {
+    // Class-based suites (unittest-style — requests/Django/etc.): the node `name`
+    // is the BARE method and the class lives only in the id qualname tail. The
+    // runnable must still carry the class, else pytest can't collect it (the test
+    // silently never runs). Regression guard for the dropped-class bug.
+    const h = classifyTest(cand({
+      id: "tests/test_requests/TestRequests.test_content_length",
+      name: "test_content_length",
+      file: "tests/test_requests.py",
+    }));
+    expect(h!.runner).toBe("pytest");
+    expect(h!.runnable).toBe("tests/test_requests.py::TestRequests::test_content_length");
   });
 
   it("vitest: spec FILE is the runnable, not a symbol id", () => {
@@ -139,10 +163,22 @@ describe("classifyTest — runner + runnable shapes", () => {
     expect(h!.runnable).toBe("src/__tests__/jest/app.test.ts");
   });
 
-  it("go: file is the runnable, runner is go", () => {
+  it("go: a Test* function → file::TestName `-run` handle (per-test, actionable)", () => {
     const h = classifyTest(cand({ name: "TestParse", file: "parser_test.go" }));
     expect(h!.runner).toBe("go");
-    expect(h!.runnable).toBe("parser_test.go");
+    expect(h!.runnable).toBe("parser_test.go::TestParse");
+  });
+
+  it("go: a receiver-qualified test method → file::TestName (leaf after receiver)", () => {
+    const h = classifyTest(cand({ name: "(*Suite).TestThing", file: "suite_test.go" }));
+    expect(h!.runner).toBe("go");
+    expect(h!.runnable).toBe("suite_test.go::TestThing");
+  });
+
+  it("go: a reached non-test helper in a _test.go file keeps the FILE handle (no -run target)", () => {
+    const h = classifyTest(cand({ name: "newTestCommand", file: "command_test.go" }));
+    expect(h!.runner).toBe("go");
+    expect(h!.runnable).toBe("command_test.go");
   });
 
   it("cargo: rust test file → cargo runner, file runnable", () => {
@@ -263,8 +299,8 @@ describe("classifyTest — nested / non-collectable pytest tests get a null runn
   it("does NOT over-filter: a deeply-namespaced top-level test stays runnable", () => {
     // No dotted qualname on the entity itself (the id `/`-segments are scope,
     // not a nested qualname), so it remains collectable.
-    const c = cand({ id: "a/b/c/tests/deep/test_y", name: "test_y", file: "a/b/c/tests/deep.py" });
-    expect(classifyTest(c)!.runnable).toBe("a/b/c/tests/deep.py::test_y");
+    const c = cand({ id: "a/b/c/tests/test_deep/test_y", name: "test_y", file: "a/b/c/tests/test_deep.py" });
+    expect(classifyTest(c)!.runnable).toBe("a/b/c/tests/test_deep.py::test_y");
     expect(isCollectableTest(c)).toBe(true);
   });
 
@@ -285,5 +321,196 @@ describe("classifyTest — nested / non-collectable pytest tests get a null runn
     const second = classifyTest(c);
     expect(second).toEqual(first);
     expect(isCollectableTest(c)).toBe(isCollectableTest(c));
+  });
+});
+
+/**
+ * Runnable HYGIENE — the psf/requests-measured non-runnable emission bug
+ * (bench/requests-ci-RESULTS.md "Product gap found"). The raw selection emitted
+ * 4–11 ids per change that pytest reports "not found" (exit 4, ZERO tests run):
+ * helper-class callables, non-test_ methods on real Test* classes, and non-test
+ * files (conftest.py, tests/testserver/server.py). A pytest runnable must mirror
+ * pytest's DEFAULT collection: test-prefixed functions, test-prefixed methods on
+ * Test*-named classes, in test modules (test_*.py / *_test.py). Everything else
+ * stays in the set as EVIDENCE (non-null handle, null runnable) — information is
+ * marked non-runnable, never deleted.
+ */
+describe("classifyTest — pytest runnable hygiene (requests-measured emission bug)", () => {
+  it("NULLS a helper-class method in a test file (RedirectSession::send)", () => {
+    // `RedirectSession` is PascalCase but NOT Test*-named — pytest's default
+    // python_classes never collects it, so `file::RedirectSession::send` aborts
+    // the run. Reached via the graph → keep as evidence, never as a run target.
+    const c = cand({
+      id: "tests/test_requests/RedirectSession.send",
+      name: "RedirectSession.send",
+      file: "tests/test_requests.py",
+    });
+    const h = classifyTest(c);
+    expect(h).not.toBeNull(); // still a counted test node (evidence)…
+    expect(h!.runnable).toBeNull(); // …but NOT a run target.
+    expect(isCollectableTest(c)).toBe(false);
+  });
+
+  it("NULLS a helper-class method whose class survives only in the id tail", () => {
+    const c = cand({
+      id: "tests/test_requests/RedirectSession.build_response",
+      name: "build_response",
+      file: "tests/test_requests.py",
+    });
+    expect(classifyTest(c)!.runnable).toBeNull();
+    expect(isCollectableTest(c)).toBe(false);
+  });
+
+  it("NULLS a NON-test_ method on a real Test* class (TestRequests::build_response)", () => {
+    // The class IS collectable; the METHOD is not test-prefixed, so pytest's
+    // default python_functions never collects it → "not found".
+    const c = cand({
+      id: "tests/test_requests/TestRequests.build_response",
+      name: "TestRequests.build_response",
+      file: "tests/test_requests.py",
+    });
+    const h = classifyTest(c);
+    expect(h).not.toBeNull();
+    expect(h!.runnable).toBeNull();
+    expect(isCollectableTest(c)).toBe(false);
+  });
+
+  it("NULLS every callable in a NON-test-module python file (tests/testserver/server.py)", () => {
+    // The file lives under /tests/ (so it IS a test node by PATH), but pytest's
+    // default python_files (test_*.py / *_test.py) never collects `server.py` —
+    // `tests/testserver/server.py::Server::run` was a measured run-aborter.
+    const c = cand({
+      id: "tests/testserver/server/Server.run",
+      name: "Server.run",
+      file: "tests/testserver/server.py",
+    });
+    const h = classifyTest(c);
+    expect(h).not.toBeNull();
+    expect(h!.runnable).toBeNull();
+    expect(isCollectableTest(c)).toBe(false);
+    // Even a test_-named helper in such a file is not collectable by node id.
+    const helper = cand({
+      id: "tests/testserver/server/test_helper",
+      name: "test_helper",
+      file: "tests/testserver/server.py",
+    });
+    expect(classifyTest(helper)!.runnable).toBeNull();
+  });
+
+  it("NULLS a conftest.py MODULE node (bare-file-path emission, measured class 2)", () => {
+    // A bare `tests/conftest.py` arg collects nothing; it must be evidence only.
+    const c = cand({
+      id: "tests/conftest",
+      name: "conftest",
+      file: "tests/conftest.py",
+      kind: "module",
+      language: "python",
+    });
+    const h = classifyTest(c);
+    expect(h).not.toBeNull();
+    expect(h!.runner).toBe("pytest");
+    expect(h!.runnable).toBeNull();
+    // …and a fixture function inside it is not a run target either.
+    const fixture = cand({
+      id: "tests/conftest/httpbin",
+      name: "httpbin",
+      file: "tests/conftest.py",
+    });
+    expect(classifyTest(fixture)!.runnable).toBeNull();
+  });
+
+  it("NULLS a non-test-module MODULE node (tests/testserver/server.py as a file)", () => {
+    const c = cand({
+      id: "tests/testserver/server",
+      name: "server",
+      file: "tests/testserver/server.py",
+      kind: "module",
+      language: "python",
+    });
+    expect(classifyTest(c)!.runnable).toBeNull();
+  });
+
+  it("NULLS a non-test module-level helper in a real test file (_build)", () => {
+    const c = cand({
+      id: "tests/test_requests/_build",
+      name: "_build",
+      file: "tests/test_requests.py",
+    });
+    expect(classifyTest(c)!.runnable).toBeNull();
+    expect(isCollectableTest(c)).toBe(false);
+  });
+
+  it("KEEPS a real top-level test_* function and TestClass::test_* method", () => {
+    const fn = cand({
+      id: "tests/test_requests/test_entry_points",
+      name: "test_entry_points",
+      file: "tests/test_requests.py",
+    });
+    expect(classifyTest(fn)!.runnable).toBe("tests/test_requests.py::test_entry_points");
+    expect(isCollectableTest(fn)).toBe(true);
+
+    const method = cand({
+      id: "tests/test_requests/TestRequests.test_basic_building",
+      name: "TestRequests.test_basic_building",
+      file: "tests/test_requests.py",
+    });
+    expect(classifyTest(method)!.runnable).toBe(
+      "tests/test_requests.py::TestRequests::test_basic_building",
+    );
+    expect(isCollectableTest(method)).toBe(true);
+  });
+
+  it("KEEPS a test module node (bare test-file path IS a valid pytest target)", () => {
+    const c = cand({
+      id: "tests/test_requests",
+      name: "test_requests",
+      file: "tests/test_requests.py",
+      kind: "module",
+      language: "python",
+    });
+    expect(classifyTest(c)!.runnable).toBe("tests/test_requests.py");
+  });
+
+  it("KEEPS a Test* CLASS node as a whole-class run target (file::TestClass)", () => {
+    const c = cand({
+      id: "tests/test_requests/TestRequests",
+      name: "TestRequests",
+      file: "tests/test_requests.py",
+      kind: "class",
+    });
+    expect(classifyTest(c)!.runnable).toBe("tests/test_requests.py::TestRequests");
+    expect(isCollectableTest(c)).toBe(true);
+  });
+
+  it("NULLS a non-Test* helper CLASS node in a test file (file::RedirectSession)", () => {
+    const c = cand({
+      id: "tests/test_requests/RedirectSession",
+      name: "RedirectSession",
+      file: "tests/test_requests.py",
+      kind: "class",
+    });
+    const h = classifyTest(c);
+    expect(h).not.toBeNull(); // detected by PATH — evidence only.
+    expect(h!.runnable).toBeNull();
+    expect(isCollectableTest(c)).toBe(false);
+  });
+
+  it("*_test.py files are pytest-collectable modules too", () => {
+    const c = cand({ id: "tests/util_test/test_x", name: "test_x", file: "tests/util_test.py" });
+    expect(classifyTest(c)!.runnable).toBe("tests/util_test.py::test_x");
+  });
+
+  it("vitest/bun: a NAME-detected test in a NON-spec file gets a null runnable (evidence only)", () => {
+    // `testFoo` in src/helpers.ts is a test node by NAME, but src/helpers.ts is
+    // not a spec file — emitting it into `vitest run <files…>` / `bun test
+    // <files…>` is the same bug class as the pytest one.
+    const c = cand({ id: "src/helpers/testFoo", name: "testFoo", file: "src/helpers.ts" });
+    const h = classifyTest(c);
+    expect(h).not.toBeNull();
+    expect(h!.runner).toBe("vitest");
+    expect(h!.runnable).toBeNull();
+    // A real spec file keeps its file runnable (unchanged).
+    const spec = cand({ id: "x", name: "renders", file: "src/__tests__/app.test.ts" });
+    expect(classifyTest(spec)!.runnable).toBe("src/__tests__/app.test.ts");
   });
 });

@@ -149,6 +149,68 @@ export class HeuristicOracle implements ClaimConflictOracle {
 }
 
 /**
+ * Whether a REAL dependency edge directly connects the two scopes — some entity
+ * in one scope is an immediate call/import neighbor of some entity in the other.
+ * Computable from the {@link ClaimContext}s alone: each context carries its
+ * scope's one-hop `neighbors` (from `scopeNeighbors`), so a direct edge exists
+ * iff a neighbor of one lands in the other's scope. (This is the "neighbor in
+ * other scope" half of {@link sharesNeighbor}; it deliberately EXCLUDES the
+ * shared-common-neighbor case — two siblings that both call a third entity are
+ * NOT contract-coupled to each other.)
+ */
+function directEdge(a: ClaimContext, b: ClaimContext): boolean {
+  const aScope = new Set(a.scope);
+  const bScope = new Set(b.scope);
+  for (const n of a.neighbors) if (bScope.has(n)) return true;
+  for (const n of b.neighbors) if (aScope.has(n)) return true;
+  return false;
+}
+
+/**
+ * Graph-adjacency oracle (`graph-adjacency`) — E2, the "BL-13 killer" candidate
+ * (docs/COORDINATION_ENTERPRISE_EXPERIMENTS.md). The heuristic over-blocks
+ * because it fires on shared IDENTIFIER TOKENS between graph-connected scopes —
+ * and two functions in one module share module-name tokens whether or not they
+ * actually interact. This oracle drops the token signal entirely and rules on
+ * STRUCTURE ALONE: `conflict = true` iff a real call/import EDGE directly couples
+ * the two scopes (a genuine caller/callee contract dependency), else `false`.
+ *
+ * Trade (measured in bench/graph-precise-conflict.ts): it stops blocking
+ * merely-co-located and shared-callee benign pairs (the bulk of the heuristic's
+ * conservatism), at the cost of missing the rare *shared-module invariant*
+ * conflict that has no dependency edge (already invisible to any static signal,
+ * and to the heuristic's neighbor gate too). Deterministic, zero-dep, needs no
+ * model or entity bodies — unlike contract-diff it does not read signatures, so
+ * it runs anywhere the graph is loaded.
+ */
+export class GraphAdjacencyOracle implements ClaimConflictOracle {
+  readonly id = "graph-adjacency";
+  // `async` only to satisfy the interface; pure + synchronous, no I/O.
+  async assess(incoming: ClaimContext, adjacent: ClaimContext): Promise<ConflictVerdict> {
+    if (directEdge(incoming, adjacent)) {
+      return {
+        conflict: true,
+        reason:
+          "A resolved call/import edge directly couples the two scopes, so a " +
+          "contract change on one can break the other.",
+        confidence: 0.7,
+        oracle: this.id,
+      };
+    }
+    return {
+      conflict: false,
+      reason: "No direct call/import edge couples the two scopes.",
+      confidence: 0,
+      oracle: this.id,
+    };
+  }
+}
+
+/** The deterministic graph-adjacency oracle id (E2). Selectable via
+ * `config.conflict.oracle === "graph-adjacency"`; needs no binary/model/bodies. */
+export const GRAPH_ADJACENCY_ORACLE_ID = "graph-adjacency";
+
+/**
  * What {@link selectOracle} needs to construct an {@link LlmOracle} (§18.4):
  * the `.hayven` home (model-presence + path resolution), a native-binary
  * locator, and — for tests — injectable registry/infer hooks. All optional:
@@ -199,6 +261,10 @@ export function selectOracle(
 
   // The heuristic is the explicit, the unknown-key, and the zero-config default.
   if (key === "heuristic-v1") return new HeuristicOracle();
+
+  // Deterministic graph-adjacency oracle (E2) — pure structural rule, no binary,
+  // model, or entity bodies required. Selected only when explicitly named.
+  if (key === GRAPH_ADJACENCY_ORACLE_ID) return new GraphAdjacencyOracle();
 
   // OPT-IN deterministic contract-diff oracle (CLAUDE.md item 6 (b)). Selected
   // only when the config explicitly names it. Requires a locatable native binary

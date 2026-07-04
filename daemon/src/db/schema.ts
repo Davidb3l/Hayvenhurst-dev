@@ -41,8 +41,19 @@
  *       endpoints are RAW runtime names resolved at read time, mirroring
  *       `observations`. Additive — a fresh DB gets it from SCHEMA_SQL; an existing
  *       DB gains it via the v5→v6 migration step (fills on the next traced run).
+ *   7 — Fleet-memory FTS recall (Phase 0.0.4 — recall upgrade): adds the
+ *       `fleet_memory_fts` trigram virtual table (mirroring `nodes_fts`) plus the
+ *       triggers that keep it in sync with `fleet_memory`, so `searchMemory` can
+ *       go from a blind substring `LIKE` to FTS5 + the model-free query-expansion
+ *       floor (identifier tokenization + abbrev table). Where the substring path
+ *       only matches a literal contiguous run, the FTS path recalls a note about
+ *       `authHandler` for the query `"auth handler"` (tokenization) or `cfg` for
+ *       `config` (abbrev). Additive — a fresh DB gets the table+triggers from
+ *       FTS_FLEET_MEMORY_SQL / FTS_FLEET_MEMORY_TRIGGERS_SQL; an existing DB gains
+ *       them AND a one-time backfill from `fleet_memory` via the v6→v7 migration
+ *       step (no reingest; grounded `memoryForNode`/`listMemory` are unchanged).
  */
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 
 /** Core relational tables. */
 export const SCHEMA_SQL = `
@@ -50,6 +61,15 @@ PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA foreign_keys = ON;
 PRAGMA temp_store = MEMORY;
+-- Schema v7 (fleet-memory FTS): \`recordMemory\` writes with INSERT OR REPLACE.
+-- By DEFAULT SQLite's REPLACE does NOT fire AFTER DELETE triggers, so the
+-- \`fleet_memory_fts\` delete-then-insert sync net would leave a STALE/DUPLICATE
+-- FTS row on every re-record. Enabling recursive triggers makes REPLACE fire the
+-- DELETE trigger first, so the two triggers net to a correct upsert. This is
+-- safe for \`nodes\`: it upserts via ON CONFLICT DO UPDATE (fires the AFTER UPDATE
+-- trigger regardless of this pragma) and never uses REPLACE; bulk node deletes
+-- drop the FTS triggers explicitly (see queries.ts::withoutFtsTriggers).
+PRAGMA recursive_triggers = ON;
 
 CREATE TABLE IF NOT EXISTS nodes (
   id              TEXT PRIMARY KEY,
@@ -251,5 +271,53 @@ CREATE TRIGGER IF NOT EXISTS nodes_fts_au AFTER UPDATE ON nodes BEGIN
   INSERT INTO nodes_fts(id, name, qualified_name, summary, path)
   VALUES (new.id, new.name, new.qualified_name, COALESCE(new.summary, ''),
           ${ftsPathExpr("new")});
+END;
+`;
+
+/**
+ * FTS5 trigram virtual table for fleet-memory RECALL (schema v7).
+ *
+ * Mirrors the `nodes_fts` pattern exactly: a trigram-tokenized index over the
+ * note text, with `id` UNINDEXED so it round-trips verbatim and can JOIN back to
+ * `fleet_memory`. The trigram tokenizer is what makes recall fuzzy by
+ * construction — a query for `config` finds a note mentioning `cfg` (once the
+ * model-free expansion floor in `queryExpansion.ts` adds the abbrev partner),
+ * and `auth handler` finds `authHandler` (identifier tokenization), neither of
+ * which a contiguous-substring `LIKE` can do.
+ *
+ * Only the `note` column is indexed — the structured columns (kind/agent/scope)
+ * are filtered/ordered against the base `fleet_memory` table after the JOIN, and
+ * grounded recall (`memoryForNode`) is already exact, so there's nothing to gain
+ * from indexing them here.
+ */
+export const FTS_FLEET_MEMORY_SQL = `
+CREATE VIRTUAL TABLE IF NOT EXISTS fleet_memory_fts USING fts5(
+  id UNINDEXED,
+  note,
+  tokenize = 'trigram'
+);
+`;
+
+/**
+ * Triggers to keep `fleet_memory_fts` in sync with `fleet_memory`.
+ *
+ * CRITICAL — the upsert net. `recordMemory` writes with `INSERT OR REPLACE`,
+ * which on a duplicate primary key fires a DELETE of the old row THEN an INSERT
+ * of the new one. So the two triggers below must compose to a correct UPSERT:
+ *   - AFTER DELETE removes the FTS row for `old.id` (the conflicting row being
+ *     replaced, or a genuine `forgetMemory`/`pruneExpired` delete);
+ *   - AFTER INSERT (re)adds the FTS row for `new.id` with the current note text.
+ * For a fresh insert only the INSERT trigger fires; for a replace BOTH fire in
+ * that order, netting to "row present once, with the latest note" — exactly the
+ * `nodes_fts` AFTER INSERT + AFTER DELETE discipline. (fleet_memory has no
+ * in-place UPDATE path, so no AFTER UPDATE trigger is needed.)
+ */
+export const FTS_FLEET_MEMORY_TRIGGERS_SQL = `
+CREATE TRIGGER IF NOT EXISTS fleet_memory_fts_ai AFTER INSERT ON fleet_memory BEGIN
+  INSERT INTO fleet_memory_fts(id, note) VALUES (new.id, new.note);
+END;
+
+CREATE TRIGGER IF NOT EXISTS fleet_memory_fts_ad AFTER DELETE ON fleet_memory BEGIN
+  DELETE FROM fleet_memory_fts WHERE id = old.id;
 END;
 `;

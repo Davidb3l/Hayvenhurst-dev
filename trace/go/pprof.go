@@ -45,6 +45,8 @@ func (c *Collector) CollectCPUProfile(d time.Duration) (int, error) {
 			c.agg.Add(e[0], e[1], 1)
 			edges++
 		}
+		// Additive per-test coverage, mirroring the interval sampler.
+		addCoverage(c.cov, filtered)
 	}
 	c.FlushOnce()
 	return edges, nil

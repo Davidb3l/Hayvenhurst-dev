@@ -10,6 +10,7 @@ import { blake3 } from "@noble/hashes/blake3";
 import { deriveEntityId, unresolvedEdgeId } from "./idScheme.ts";
 import { writeNodeMarkdowns } from "./nodeWriter.ts";
 import { normalizePosix, SpecifierResolver } from "./specifierResolve.ts";
+import { WorkspaceMap } from "./workspace.ts";
 import type { GraphEdge, GraphNode, RawEdge } from "./types.ts";
 import type { Db } from "../db/queries.ts";
 import { describeFailure, type ParseRun } from "../native/process.ts";
@@ -380,8 +381,26 @@ export interface ResolveEdgesOptions {
  *         Falls back to the name lookups below if none match. (Cross-lane
  *         contract fields, absent on older payloads → this branch degrades to
  *         the single-receiver path and nothing else changes.)
- *      c. all other edges — same-file lookup, then global qn, then unique name.
+ *      c. all other edges — same-file lookup, then qn, then unique name.
  *   3. Unresolved edges get id `?:<dst_name>`.
+ *
+ * PACKAGE SCOPING (monorepo P1 — bench/monorepo-astro-RESULTS.md §2c): the
+ * qn/name indexes are scoped to the WORKSPACE PACKAGE a node's file belongs to
+ * (via {@link WorkspaceMap.packageForFile}; a non-workspace repo is one
+ * implicit package, so single-repo behavior is byte-identical). Global
+ * name-match across package boundaries was a coin flip on a real monorepo: it
+ * invented edges (`playwright.config.js`'s `defineConfig` — imported from
+ * `@playwright/test` — attributed to astro's `defineConfig`) and, whenever a
+ * name legitimately recurred across packages, went AMBIGUOUS and found nothing.
+ * The rules now are:
+ *   - name-match resolves WITHIN the source file's package only;
+ *   - CROSS-package resolution requires an IMPORT-EDGE WITNESS: when the
+ *     callee/receiver-root is bound by an import that resolves to an in-repo
+ *     module, the symbol may resolve inside THAT package (ladder first, then a
+ *     name-match scoped to the target package);
+ *   - a callee bound by an import that resolves EXTERNALLY (npm pkg) never
+ *     falls back to name-match at all — the witness says the symbol is not
+ *     ours, so inventing an in-repo edge would be a false positive.
  */
 export function resolveEdges(
   nodes: GraphNode[],
@@ -389,6 +408,23 @@ export function resolveEdges(
   options?: ResolveEdgesOptions,
 ): { resolved: GraphEdge[]; unresolved: GraphEdge[]; sites: CallSite[] } {
   const now = Date.now();
+
+  // Module-specifier resolver (file → module id, with alias/relative/workspace
+  // probing) + the workspace package map that scopes name-match to packages.
+  // Built FIRST because the node indexes below key by package.
+  const specResolver = new SpecifierResolver(nodes, options?.repoRoot ?? "");
+  const ws = specResolver.workspace;
+  const pkgCache = new Map<string, string>();
+  /** Workspace package dir owning `file` ("" = root/implicit package). */
+  const pkgOf = (file: string): string => {
+    let pkg = pkgCache.get(file);
+    if (pkg === undefined) {
+      pkg = ws.packageForFile(file);
+      pkgCache.set(file, pkg);
+    }
+    return pkg;
+  };
+
   const byFileName = new Map<string, string>();
   // Per-file index keyed by an entity's QUALIFIED name. The native extractor
   // sets an edge's `src_name` to the enclosing definition's `qualified_name`
@@ -399,14 +435,26 @@ export function resolveEdges(
   // call whose enclosing definition was a method or nested function. We key by
   // qualified_name and fall back to it when the bare-name lookup misses.
   const byFileQn = new Map<string, string>();
+  // PACKAGE-SCOPED qn/name indexes: keyed `<pkg>\0<name>` so uniqueness (and
+  // the AMBIGUOUS sentinel) is judged WITHIN a package, never across packages.
+  // Two benefits on a monorepo: a name duplicated across packages no longer
+  // poisons every package's lookup into AMBIGUOUS (false-negative fix), and a
+  // name can never resolve into a foreign package without an import witness
+  // (false-positive fix). Non-workspace repos have one package ("") — the maps
+  // then degenerate to exactly the old global maps.
   const byQualified = new Map<string, string | typeof AMBIGUOUS>();
   const byName = new Map<string, string | typeof AMBIGUOUS>();
   const byId = new Set<string>();
+  /** id → owning package dir, for import-witnessed cross-package lookups. */
+  const pkgById = new Map<string, string>();
+  const pkgKey = (pkg: string, name: string): string => `${pkg}\0${name}`;
 
   for (const n of nodes) {
     byFileName.set(`${n.file}::${n.name}`, n.id);
     byFileQn.set(`${n.file}::${n.qualified_name}`, n.id);
     byId.add(n.id);
+    const pkg = pkgOf(n.file);
+    pkgById.set(n.id, pkg);
     // A `module` node is resolved as an IMPORT target via the SpecifierResolver,
     // never as a call/reference `dst` by NAME (you import a module; you call a
     // symbol). Excluding modules from the GLOBAL name indexes prevents a module
@@ -418,17 +466,16 @@ export function resolveEdges(
     // `byFileQn`/`byId` (it's a valid same-file lookup + a real import target);
     // only the by-NAME call-resolution indexes skip it.
     if (n.kind === "module") continue;
-    const existingQn = byQualified.get(n.qualified_name);
-    if (existingQn === undefined) byQualified.set(n.qualified_name, n.id);
-    else if (existingQn !== n.id) byQualified.set(n.qualified_name, AMBIGUOUS);
+    const qnKey = pkgKey(pkg, n.qualified_name);
+    const existingQn = byQualified.get(qnKey);
+    if (existingQn === undefined) byQualified.set(qnKey, n.id);
+    else if (existingQn !== n.id) byQualified.set(qnKey, AMBIGUOUS);
 
-    const existing = byName.get(n.name);
-    if (existing === undefined) byName.set(n.name, n.id);
-    else if (existing !== n.id) byName.set(n.name, AMBIGUOUS);
+    const nameKey = pkgKey(pkg, n.name);
+    const existing = byName.get(nameKey);
+    if (existing === undefined) byName.set(nameKey, n.id);
+    else if (existing !== n.id) byName.set(nameKey, AMBIGUOUS);
   }
-
-  // Module-specifier resolver (file → module id, with alias/relative probing).
-  const specResolver = new SpecifierResolver(nodes, options?.repoRoot ?? "");
 
   // Per-file index of import `local` binding → resolved module id, for Tier-2
   // member-call resolution. Built lazily/once over rawEdges. `aliases` maps a
@@ -464,17 +511,26 @@ export function resolveEdges(
   // this list preserves each occurrence's exact location for `refs --sites`.
   const sites: CallSite[] = [];
 
-  /** Generic name-based resolution (same-file → global qn → unique name). */
-  const resolveByName = (srcFile: string, dstName: string): string | null => {
-    const sameFile = byFileName.get(`${srcFile}::${dstName}`);
-    if (sameFile) return sameFile;
-    const qn = byQualified.get(dstName);
+  /** Qn-then-name lookup WITHIN one package (no same-file preference). */
+  const lookupInPackage = (pkg: string, dstName: string): string | null => {
+    const qn = byQualified.get(pkgKey(pkg, dstName));
     // NB: the ambiguity sentinel is a literal string; exclude it explicitly so
     // an ambiguous dst never resolves to a bogus "ambiguous" entity id.
     if (typeof qn === "string" && qn !== AMBIGUOUS) return qn;
-    const named = byName.get(dstName);
+    const named = byName.get(pkgKey(pkg, dstName));
     if (typeof named === "string" && named !== AMBIGUOUS) return named;
     return null;
+  };
+
+  /**
+   * Generic name-based resolution: same-file → same-PACKAGE qn → same-package
+   * unique name. Scoped to the source file's package — cross-package hits
+   * require the import-witness paths below, never bare name luck.
+   */
+  const resolveByName = (srcFile: string, dstName: string): string | null => {
+    const sameFile = byFileName.get(`${srcFile}::${dstName}`);
+    if (sameFile) return sameFile;
+    return lookupInPackage(pkgOf(srcFile), dstName);
   };
 
   for (const e of rawEdges) {
@@ -522,6 +578,10 @@ export function resolveEdges(
       const root = chain && chain.length > 0 ? chain[0]! : e.receiver;
       const imports = importsByFile.get(e.src_file);
       const match = imports?.find((imp) => imp.local.includes(root));
+      // True when the receiver ROOT is bound by an import that resolves
+      // EXTERNALLY (npm pkg): the witness says the member is not in-repo, so
+      // name-match fallbacks are suppressed (no invented edges).
+      let externallyBound = false;
       if (match) {
         const moduleId = specResolver.resolve(e.src_file, match.spec);
         if (moduleId) {
@@ -559,10 +619,20 @@ export function resolveEdges(
               break;
             }
           }
+          // IMPORT-WITNESSED cross-package fallback: the receiver's import
+          // pins the target module — if the id ladder missed, try the member
+          // name WITHIN the target module's package only.
+          if (!dstId) {
+            dstId = lookupInPackage(pkgById.get(moduleId) ?? "", e.dst_name);
+          }
+        } else {
+          externallyBound = true;
         }
       }
-      // Fall back to the generic name resolution if the member didn't resolve.
-      if (!dstId) dstId = resolveByName(e.src_file, e.dst_name);
+      // Fall back to same-file/same-package name resolution — unless the
+      // receiver is witnessed as an EXTERNAL import (then a name-match hit
+      // would be a false cross-package edge; stay unresolved, honest).
+      if (!dstId && !externallyBound) dstId = resolveByName(e.src_file, e.dst_name);
     } else if (e.kind === "static_call") {
       // BARE call `fn(...)` (no receiver). The global name lookups handle the
       // common case where the callee name is unique, but they MISS when:
@@ -578,6 +648,12 @@ export function resolveEdges(
       // barrel/`index` specifiers all resolve consistently with import edges.
       const imports = importsByFile.get(e.src_file);
       const match = imports?.find((imp) => imp.local.includes(e.dst_name));
+      // True when the callee is bound by an import that resolves EXTERNALLY
+      // (`import { defineConfig } from "@playwright/test"`): the witness says
+      // the symbol is not in-repo. Falling through to name-match here is what
+      // invented the measured astro false positive (playwright's/vitest's
+      // `defineConfig` attributed to astro's) — suppressed instead.
+      let externallyBound = false;
       if (match) {
         const moduleId = specResolver.resolve(e.src_file, match.spec);
         if (moduleId) {
@@ -592,14 +668,25 @@ export function resolveEdges(
           // Only accept a target that is a REAL entity defined under the
           // resolved module (`<module>/<exported>`). We deliberately do NOT fall
           // back to the bare module node — that would invent a misleading
-          // function→module edge — so a miss stays unresolved (honest).
+          // function→module edge.
           const direct = `${moduleId}/${exported}`;
           if (byId.has(direct)) dstId = direct;
+          // IMPORT-WITNESSED cross-package fallback: the import pins the
+          // target module, but the symbol may live deeper than `<module>/<name>`
+          // (re-exported through a barrel — `astro/config` re-exports
+          // `defineConfig` from core). The witness licenses a name-match
+          // scoped to the TARGET module's package (unique-within-package only).
+          if (!dstId) {
+            dstId = lookupInPackage(pkgById.get(moduleId) ?? "", exported);
+          }
+        } else {
+          externallyBound = true;
         }
       }
-      // Fall back to the generic name resolution if the import binding didn't
-      // pin a target (keeps unique-name bare calls working as before).
-      if (!dstId) dstId = resolveByName(e.src_file, e.dst_name);
+      // Fall back to same-file/same-package name resolution if no import
+      // binding pinned a target (keeps unique-name bare calls working as
+      // before) — unless the binding is witnessed EXTERNAL (stay unresolved).
+      if (!dstId && !externallyBound) dstId = resolveByName(e.src_file, e.dst_name);
     } else {
       dstId = resolveByName(e.src_file, e.dst_name);
     }
@@ -670,31 +757,56 @@ export function resolveEdges(
  * delete the old `?:` row and upsert the resolved one inside one transaction.
  * Idempotent: a second pass finds no `?:` edges that newly resolve and is a
  * no-op. Returns the number of edges re-resolved.
+ *
+ * PACKAGE SCOPING mirrors {@link resolveEdges}: when `repoRoot` is provided,
+ * the name indexes are scoped per workspace package and a `?:` edge only
+ * re-resolves WITHIN its source node's package (cross-package edges belong to
+ * the import-witnessed ingest paths, which this cheap pass cannot re-run).
+ * Without a `repoRoot` — or in a non-workspace repo — everything is one
+ * implicit package and behavior is unchanged.
  */
-export function reresolveAllEdges(db: Db): number {
-  // 1. Build the global indexes from EVERY node currently in the graph. The
-  //    SQL cache (CRDT-derived but authoritative for graph reads) is the cheap
-  //    source — `nodes(name, qualified_name)` is what `resolveEdges` indexed
-  //    in-pass at ingest time.
+export function reresolveAllEdges(db: Db, repoRoot?: string): number {
+  // 1. Build the per-package indexes from EVERY node currently in the graph.
+  //    The SQL cache (CRDT-derived but authoritative for graph reads) is the
+  //    cheap source — `nodes(name, qualified_name)` is what `resolveEdges`
+  //    indexed in-pass at ingest time.
+  const ws = WorkspaceMap.load(repoRoot ?? "");
+  const pkgCache = new Map<string, string>();
+  const pkgOf = (file: string): string => {
+    let pkg = pkgCache.get(file);
+    if (pkg === undefined) {
+      pkg = ws.packageForFile(file);
+      pkgCache.set(file, pkg);
+    }
+    return pkg;
+  };
+  const pkgKey = (pkg: string, name: string): string => `${pkg}\0${name}`;
+
   const byQualified = new Map<string, string | typeof AMBIGUOUS>();
   const byName = new Map<string, string | typeof AMBIGUOUS>();
+  /** src entity id → its file's package, to scope each edge's lookup. */
+  const pkgById = new Map<string, string>();
   const allNodes = db.handle
-    .query<{ id: string; name: string; qualified_name: string; kind: string }, []>(
-      "SELECT id, name, qualified_name, kind FROM nodes",
+    .query<{ id: string; name: string; qualified_name: string; kind: string; file: string }, []>(
+      "SELECT id, name, qualified_name, kind, file FROM nodes",
     )
     .all();
   for (const n of allNodes) {
+    const pkg = pkgOf(n.file);
+    pkgById.set(n.id, pkg);
     // Mirror resolveEdges: a `module` node is never a call/reference dst-by-name
     // (it's an import target), so excluding it keeps a function named after its
     // own file (`sympify` in `sympify.py`) from being shadowed into AMBIGUOUS.
     if (n.kind === "module") continue;
-    const existingQn = byQualified.get(n.qualified_name);
-    if (existingQn === undefined) byQualified.set(n.qualified_name, n.id);
-    else if (existingQn !== n.id) byQualified.set(n.qualified_name, AMBIGUOUS);
+    const qnKey = pkgKey(pkg, n.qualified_name);
+    const existingQn = byQualified.get(qnKey);
+    if (existingQn === undefined) byQualified.set(qnKey, n.id);
+    else if (existingQn !== n.id) byQualified.set(qnKey, AMBIGUOUS);
 
-    const existing = byName.get(n.name);
-    if (existing === undefined) byName.set(n.name, n.id);
-    else if (existing !== n.id) byName.set(n.name, AMBIGUOUS);
+    const nameKey = pkgKey(pkg, n.name);
+    const existing = byName.get(nameKey);
+    if (existing === undefined) byName.set(nameKey, n.id);
+    else if (existing !== n.id) byName.set(nameKey, AMBIGUOUS);
   }
 
   // 2. Collect the currently-unresolved (`?:`) edges and the id each now
@@ -718,8 +830,11 @@ export function reresolveAllEdges(db: Db): number {
     // `?` is a SQL-LIKE wildcard-free literal here; keep the slice precise).
     if (!e.dst.startsWith(UNRESOLVED_PREFIX)) continue;
     const name = e.dst.slice(UNRESOLVED_PREFIX.length);
-    const qn = byQualified.get(name);
-    const named = byName.get(name);
+    // Scope the lookup to the SOURCE node's package (an unknown src — deleted
+    // node — falls back to the root package, matching resolveEdges' default).
+    const pkg = pkgById.get(e.src) ?? "";
+    const qn = byQualified.get(pkgKey(pkg, name));
+    const named = byName.get(pkgKey(pkg, name));
     let dstId: string | null = null;
     if (typeof qn === "string" && qn !== AMBIGUOUS) dstId = qn;
     else if (typeof named === "string" && named !== AMBIGUOUS) dstId = named;

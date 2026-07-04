@@ -11,7 +11,7 @@
  *
  *   # `loginHandler`
  *
- *   _Summary pending — run `hayven summarize` (not yet implemented)._
+ *   _Summary pending — run `hayven summarize` to generate one._
  *
  *   ## Observed callers (from traces)
  *   - [[some_caller]] (N invocations)
@@ -25,7 +25,7 @@ import { dirname, join } from "node:path";
 import type { GraphEdge, GraphNode } from "./types.ts";
 import { nodeMarkdownPath } from "./idScheme.ts";
 
-const SUMMARY_PLACEHOLDER = "_Summary pending — run `hayven summarize` (not yet implemented)._";
+const SUMMARY_PLACEHOLDER = "_Summary pending — run `hayven summarize` to generate one._";
 
 export interface NodeNeighbors {
   /** Edges where this node is the destination (i.e. it is being called). */

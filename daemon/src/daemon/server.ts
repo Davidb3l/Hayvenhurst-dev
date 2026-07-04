@@ -19,6 +19,7 @@ import { contextRoutes } from "./routes/context.ts";
 import { graphRoutes } from "./routes/graph.ts";
 import { healthRoutes } from "./routes/health.ts";
 import { impactPreviewRoutes } from "./routes/impact_preview.ts";
+import { lanePlannerRoutes } from "./routes/lane_planner.ts";
 import { memoryRoutes } from "./routes/memory.ts";
 import { ingestRoutes, type IngestController } from "./routes/ingest.ts";
 import { nodesRoutes } from "./routes/nodes.ts";
@@ -30,11 +31,11 @@ import { viewerRoutes } from "./routes/viewer.ts";
 import { wsRoutes } from "./routes/ws.ts";
 
 /**
- * A mutable holder for the served {@link Db}. Optional per-project indirection:
- * when a caller supplies one, `buildApp` (or the multi-project facade) rewires
- * `deps.db` to read `dbRef.current` at REQUEST time, so a live re-point that
- * reassigns `dbRef.current` is picked up by every route without touching any
- * route file. `path`/`branchKey` are surfaced via `/api/health`.
+ * A mutable holder for the served {@link Db}. LIVE branch re-pointing (the
+ * daemon following a `git checkout` while it is up) swaps `current` to a new
+ * branch's index. Routes never see this type — `buildApp` rewires `deps.db` to
+ * read through `current` at REQUEST time, so a swap is invisible to every route
+ * module (they keep using `deps.db.…`).
  */
 export interface DbRef {
   current: Db;
@@ -46,6 +47,14 @@ export interface DbRef {
 
 export interface ServerDependencies {
   db: Db;
+  /**
+   * Optional swappable holder for the served db. When present, `buildApp`
+   * redefines `deps.db` as a getter delegating to `dbRef.current`, so a live
+   * branch re-point that reassigns `dbRef.current` is picked up by every route
+   * on its next request WITHOUT touching any route file. When absent (tests,
+   * one-shot callers), `deps.db` stays the fixed instance passed in.
+   */
+  dbRef?: DbRef;
   config: HayvenConfig;
   paths: HayvenPaths;
   logger: Logger;
@@ -56,13 +65,6 @@ export interface ServerDependencies {
   daemonVersion: string;
   /** Native binary version, if known. */
   nativeVersion?: string | undefined;
-  /**
-   * Optional swappable holder for the served db. When present, `buildApp`
-   * redefines `deps.db` as a getter delegating to `dbRef.current`. When absent
-   * (single-project daemon, tests, one-shot callers), `deps.db` stays the fixed
-   * instance passed in.
-   */
-  dbRef?: DbRef;
   /**
    * Multi-project only: alias of the primary/default project (the one served
    * when a request omits `?project=`). Absent for single-project callers/tests.
@@ -91,16 +93,16 @@ export interface BuildAppOptions {
   onRequest?: (request: Request) => void;
   /**
    * When true (default), a supplied `deps.dbRef` rewires `deps.db` to read
-   * `dbRef.current` at request time. The multi-project facade passes false: its
-   * own `db` getter already resolves the current project's live db per request,
-   * so buildApp must not re-pin it.
+   * `dbRef.current` at request time (live branch re-point). The multi-project
+   * facade passes false: its own `db` getter already resolves the current
+   * project's live db per request, so buildApp must not re-pin it.
    */
   branchAwareDb?: boolean;
 }
 
 /**
  * Rewire `deps.db` to resolve `deps.dbRef.current` at REQUEST time, so a live
- * re-point (reassigning `dbRef.current`) reaches every route with zero
+ * branch re-point (reassigning `dbRef.current`) reaches every route with zero
  * per-route changes. No-op when there is no swappable holder.
  */
 export function wireBranchAwareDb(deps: ServerDependencies): void {
@@ -116,10 +118,10 @@ export function wireBranchAwareDb(deps: ServerDependencies): void {
 // Intentionally untyped return — Elysia's chained generics inflate the signature
 // past TypeScript's comparison limits when composed with `.use()` modules.
 export function buildApp(deps: ServerDependencies, opts: BuildAppOptions = {}) {
-  // LIVE re-pointing (single-project): rewire `deps.db` → `dbRef.current` at
-  // REQUEST time so a swap reaches every route with ZERO per-route changes.
-  // Skipped for the multi-project facade (branchAwareDb:false), whose own `db`
-  // getter already resolves the current project's live db per request.
+  // LIVE branch re-pointing (single-project): rewire `deps.db` → `dbRef.current`
+  // at REQUEST time so a branch swap reaches every route with ZERO per-route
+  // changes. Skipped for the multi-project facade (branchAwareDb:false), whose
+  // own `db` getter already resolves the current project's live db per request.
   if (opts.branchAwareDb ?? true) {
     wireBranchAwareDb(deps);
   }
@@ -152,6 +154,7 @@ export function buildApp(deps: ServerDependencies, opts: BuildAppOptions = {}) {
     .use(searchRoutes(deps))
     .use(graphRoutes(deps))
     .use(affectedTestsRoutes(deps))
+    .use(lanePlannerRoutes(deps))
     .use(memoryRoutes(deps))
     .use(contextRoutes(deps))
     .use(impactPreviewRoutes(deps))
@@ -193,9 +196,9 @@ const projectContext = new AsyncLocalStorage<ServerDependencies>();
  * crdt/ingest getters resolve the CURRENT request's project — chosen from
  * `?project=<alias>` (or the `x-hayven-project` header), defaulting to `primary`.
  *
- * Each per-project {@link ServerDependencies} in `multi.projects` that supplies
- * a `dbRef` must already be branch-wired (call {@link wireBranchAwareDb} on it)
- * so `deps.db` follows that project's own live re-point.
+ * Each per-project {@link ServerDependencies} in `multi.projects` must already
+ * be branch-wired (call {@link wireBranchAwareDb} on it) so `deps.db` follows
+ * that project's own live branch re-point.
  */
 export function buildMultiProjectApp(multi: MultiProjectDeps) {
   const primaryDeps = multi.projects.get(multi.primary);

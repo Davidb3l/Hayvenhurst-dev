@@ -155,6 +155,8 @@ pub fn extract_file_opts(
     let mut cap_def_class = None;
     let mut cap_def_arrow = None;
     let mut cap_def_pair = None;
+    let mut cap_def_field = None;
+    let mut cap_def_cjs_export = None;
     let mut cap_name = None;
     let mut cap_call = None;
     let mut cap_import = None;
@@ -168,6 +170,12 @@ pub fn extract_file_opts(
             // and object-literal method pairs. See queries/*.scm.
             "definition.arrow" => cap_def_arrow = Some(i),
             "definition.pair" => cap_def_pair = Some(i),
+            // JS/TS class-field arrow/function-expression methods
+            // (`class C { get = (k) => … }`). See queries/*.scm.
+            "definition.field" => cap_def_field = Some(i),
+            // CommonJS `exports.foo = function(){}` / `module.exports.foo = …`
+            // export-assigned callables. See queries/*.scm.
+            "definition.cjs_export" => cap_def_cjs_export = Some(i),
             "name.definition" => cap_name = Some(i),
             "call" => cap_call = Some(i),
             "import" => cap_import = Some(i),
@@ -238,6 +246,24 @@ pub fn extract_file_opts(
                     // reported as a method. The captured node is the `pair`.
                     found = Some((cap.index, "method"));
                     break;
+                } else if Some(cap.index) == cap_def_field {
+                    // `class C { get = (k) => … }` — a class-field arrow/
+                    // function-expression method. Reported as a method,
+                    // qualified by the enclosing class exactly like a
+                    // `method_definition` (`Context.get`). The captured node
+                    // is the field definition (spans name + value, so calls
+                    // inside the body attribute to this entity).
+                    found = Some((cap.index, "method"));
+                    break;
+                } else if Some(cap.index) == cap_def_cjs_export {
+                    // `exports.foo = function(){}` — a CommonJS export-assigned
+                    // callable, reported as a function named by the export
+                    // property. The captured node is the whole
+                    // `assignment_expression` (spans the value body, so calls
+                    // inside it attribute to this entity). Guarded below:
+                    // only an `exports`/`module.exports` object qualifies.
+                    found = Some((cap.index, "function"));
+                    break;
                 }
             }
             match found {
@@ -283,6 +309,21 @@ pub fn extract_file_opts(
         // object is still skipped — that's the one-off option-bag noise we avoid.
         let is_arrow = Some(def_capture) == cap_def_arrow;
         let is_pair = Some(def_capture) == cap_def_pair;
+        // A class-field arrow (`class C { get = (k) => … }`). Follows the
+        // `method_definition` path for kind + qualified name (class-method
+        // convention: `Context.get`, `C.#handler`) but, like arrow/pair, its
+        // callable contract lives on the `value` node.
+        let is_field = Some(def_capture) == cap_def_field;
+        // A CommonJS export-assigned callable (`exports.foo = fn`,
+        // `module.exports.foo = fn`). The query matches ANY
+        // `<member>.<prop> = <callable>` assignment; only the two exports
+        // objects are promoted — an arbitrary `obj.foo = fn` mutation
+        // (prototype patching, test monkey-patching) is NOT a module export
+        // and indexing it would pollute name resolution across the package.
+        let is_cjs_export = Some(def_capture) == cap_def_cjs_export;
+        if is_cjs_export && !cjs_export_target(def_node, parse_source) {
+            continue;
+        }
         if is_pair {
             let bound = bound_object_name(def_node, parse_source).is_some();
             // A callable pair in an UNBOUND object is promoted ONLY when it sits
@@ -307,12 +348,15 @@ pub fn extract_file_opts(
             qualified_name(name, language, &tree, def_node, parse_source)
         };
 
-        // For arrow/pair captures the node carrying the callable contract is
-        // the `value` (the `arrow_function`/`function_expression`), not the
-        // declarator/pair wrapper. The signature extractor needs that inner
-        // node to find the `parameters`/`return_type` fields.
-        let sig_node = if is_arrow || is_pair {
+        // For arrow/pair/class-field captures the node carrying the callable
+        // contract is the `value` (the `arrow_function`/`function_expression`),
+        // not the declarator/pair/field wrapper — for a CJS export assignment
+        // it's the `right`. The signature extractor needs that inner node to
+        // find the `parameters`/`return_type` fields.
+        let sig_node = if is_arrow || is_pair || is_field {
             def_node.child_by_field_name("value").unwrap_or(def_node)
+        } else if is_cjs_export {
+            def_node.child_by_field_name("right").unwrap_or(def_node)
         } else {
             def_node
         };
@@ -385,6 +429,45 @@ pub fn extract_file_opts(
     while let Some(m) = matches.next() {
         for cap in m.captures.iter() {
             if Some(cap.index) == cap_call {
+                // CommonJS `require("<string literal>")` is an IMPORT, not a
+                // call (JS-family grammars only). The `(call_expression) @call`
+                // capture already matches every require call, so we intercept
+                // here rather than adding a query pattern: emit an `import`
+                // edge carrying the string-literal specifier as `dst_name`
+                // (exactly the ESM wire shape, resolved by the daemon's
+                // SpecifierResolver) plus the `local` binding name(s) /
+                // `import_aliases` derived from the binding form around the
+                // call, so destructured/assigned require bindings feed
+                // member-call resolution the same way ESM imports do.
+                //
+                // The edge REPLACES the legacy unresolved `?:require`
+                // static_call (one source construct, one edge) — mirroring how
+                // an ESM `import` statement never doubles as a call. A
+                // dynamic/computed `require(expr)` does NOT match
+                // `require_specifier` and stays an unresolved CALL, unchanged.
+                if is_js_family(language) {
+                    if let Some(spec) = require_specifier(&cap.node, parse_source) {
+                        let src_name = enclosing_definition(&definitions, cap.node.start_byte())
+                            .map(|d| d.qualified_name.clone())
+                            .unwrap_or_else(|| module_name.clone());
+                        let (local, import_aliases) = require_bindings(&cap.node, parse_source);
+                        records.push(Record::Edge {
+                            src_file: rel_path.to_string(),
+                            src_name,
+                            dst_name: spec,
+                            kind: "import".to_string(),
+                            receiver: None,
+                            receiver_chain: None,
+                            local,
+                            import_aliases,
+                            // Import edges carry no call-site position (matches
+                            // the ESM import-edge wire contract).
+                            line: None,
+                            col: None,
+                        });
+                        continue;
+                    }
+                }
                 if let Some(target) = call_target_name(&cap.node, parse_source) {
                     let src_name = enclosing_definition(&definitions, cap.node.start_byte())
                         .map(|d| d.qualified_name.clone())
@@ -650,10 +733,7 @@ fn astro_template_components(source: &[u8]) -> Vec<Vec<String>> {
         // (`count<Threshold`, `foo()<B`, `arr[i]<B`), where `<` is an operator.
         if i > 0 {
             let prev = body[i - 1];
-            if prev.is_ascii_alphanumeric()
-                || prev == b'_'
-                || prev == b'$'
-                || prev == b')'
+            if prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'$' || prev == b')'
                 || prev == b']'
             {
                 i = after;
@@ -810,7 +890,12 @@ struct DefinitionSpan {
 /// Foo` qn). The block is NOT added to `definitions`, so call-edge `src_name`
 /// resolution (which already attributes a method's calls to the method) is
 /// unchanged.
-fn collect_rust_impl_nodes(root: Node, source: &[u8], rel_path: &str, records: &mut Vec<Record>) {
+fn collect_rust_impl_nodes(
+    root: Node,
+    source: &[u8],
+    rel_path: &str,
+    records: &mut Vec<Record>,
+) {
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if node.kind() == "impl_item" {
@@ -982,7 +1067,9 @@ fn bound_object_name(pair_node: Node, source: &[u8]) -> Option<String> {
 /// object while still skipping `{ nullable: true }`-style option bags.
 fn pair_value_is_callable(pair_node: Node) -> bool {
     matches!(
-        pair_node.child_by_field_name("value").map(|v| v.kind()),
+        pair_node
+            .child_by_field_name("value")
+            .map(|v| v.kind()),
         Some("arrow_function") | Some("function_expression")
     )
 }
@@ -1092,16 +1179,32 @@ fn arrow_qualified_name(bare: &str, def_node: Node, is_pair: bool, source: &[u8]
                 }
             }
             // An enclosing `const outer = () => { const inner = … }`: the
-            // arrow's declarator carries the binding name.
+            // arrow's declarator carries the binding name. An enclosing
+            // CLASS-FIELD arrow (`class C { handler = () => { const inner =
+            // … } }`) carries it on the field definition instead — `name:` in
+            // the TS grammar (`public_field_definition`), `property:` in the
+            // JS grammar (`field_definition`).
             "arrow_function" | "function_expression" => {
                 if let Some(decl) = p.parent() {
-                    if decl.kind() == "variable_declarator" {
-                        if let Some(n) = decl
-                            .child_by_field_name("name")
-                            .and_then(|n| n.utf8_text(source).ok())
-                        {
-                            segments.push(n.to_string());
+                    match decl.kind() {
+                        "variable_declarator" => {
+                            if let Some(n) = decl
+                                .child_by_field_name("name")
+                                .and_then(|n| n.utf8_text(source).ok())
+                            {
+                                segments.push(n.to_string());
+                            }
                         }
+                        "public_field_definition" | "field_definition" => {
+                            if let Some(n) = decl
+                                .child_by_field_name("name")
+                                .or_else(|| decl.child_by_field_name("property"))
+                                .and_then(|n| n.utf8_text(source).ok())
+                            {
+                                segments.push(n.to_string());
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1304,6 +1407,17 @@ fn import_local_bindings(node: &Node, language: Language, source: &[u8]) -> Opti
     for child in node.named_children(&mut cursor) {
         if child.kind() == "import_clause" {
             collect_import_clause_bindings(child, source, &mut out);
+        } else if child.kind() == "import_require_clause" {
+            // TS `import foo = require("./bar")` — the binding is the clause's
+            // bare `identifier` child (the grammar exposes no `name` field).
+            let mut c2 = child.walk();
+            for gc in child.named_children(&mut c2) {
+                if gc.kind() == "identifier" {
+                    if let Ok(t) = gc.utf8_text(source) {
+                        out.push(t.to_string());
+                    }
+                }
+            }
         }
     }
     if out.is_empty() {
@@ -1421,10 +1535,260 @@ fn import_alias_pairs(node: &Node, language: Language, source: &[u8]) -> Option<
     }
 }
 
+/// True when a `definition.cjs_export` capture (an `assignment_expression`
+/// whose right side is a callable literal) assigns to the module's EXPORT
+/// surface — i.e. the member's object is exactly the identifier `exports` or
+/// the member expression `module.exports`. Everything else
+/// (`Foo.prototype.bar = fn`, `res.send = fn`, `this.handler = fn`) is a plain
+/// object mutation and is NOT promoted to a definition.
+fn cjs_export_target(assign_node: Node, source: &[u8]) -> bool {
+    let Some(left) = assign_node.child_by_field_name("left") else {
+        return false;
+    };
+    if left.kind() != "member_expression" {
+        return false;
+    }
+    let Some(object) = left.child_by_field_name("object") else {
+        return false;
+    };
+    match object.kind() {
+        // `exports.foo = …`
+        "identifier" => object.utf8_text(source).ok() == Some("exports"),
+        // `module.exports.foo = …`
+        "member_expression" => {
+            let obj = object
+                .child_by_field_name("object")
+                .and_then(|n| n.utf8_text(source).ok());
+            let prop = object
+                .child_by_field_name("property")
+                .and_then(|n| n.utf8_text(source).ok());
+            obj == Some("module") && prop == Some("exports")
+        }
+        _ => false,
+    }
+}
+
+/// True for the JS-family grammars where a CommonJS `require()` call is a
+/// module import. Astro frontmatter is TypeScript, so it participates too.
+fn is_js_family(language: Language) -> bool {
+    matches!(
+        language,
+        Language::JavaScript | Language::TypeScript | Language::Tsx | Language::Astro
+    )
+}
+
+/// If `node` is a CommonJS `require("<string literal>")` call, return the
+/// module specifier — else `None`.
+///
+/// STRICT by design (never invent an edge):
+/// - the callee must be the bare identifier `require` (`require.resolve(…)`,
+///   `ctx.require(…)` and friends do NOT match — they stay ordinary calls);
+/// - the arguments must be EXACTLY ONE plain `string` literal. A computed or
+///   dynamic specifier (`require(name)`, `require("./" + x)`), extra args, and
+///   template strings (even substitution-free ones) all return `None`, so the
+///   call keeps its legacy unresolved-CALL behavior.
+///
+/// An empty specifier (`require("")`) is rejected too — it can never resolve
+/// and would only add a `?:` placeholder.
+fn require_specifier(node: &Node, source: &[u8]) -> Option<String> {
+    if node.kind() != "call_expression" {
+        return None;
+    }
+    // TS `import foo = require("./bar")`: the require call sits INSIDE an
+    // `import_require_clause`, and the `@import` (import_statement) path
+    // already emits that edge with its `local` binding — skip here or the
+    // same import would be emitted twice.
+    if node.parent().map(|p| p.kind()) == Some("import_require_clause") {
+        return None;
+    }
+    let func = node.child_by_field_name("function")?;
+    if func.kind() != "identifier" || func.utf8_text(source).ok()? != "require" {
+        return None;
+    }
+    let args = node.child_by_field_name("arguments")?;
+    let mut cursor = args.walk();
+    let named: Vec<Node> = args.named_children(&mut cursor).collect();
+    if named.len() != 1 || named[0].kind() != "string" {
+        return None;
+    }
+    let spec = string_literal_value(named[0], source)?;
+    if spec.is_empty() {
+        None
+    } else {
+        Some(spec)
+    }
+}
+
+/// Derive the `local` binding name(s) and aliased `{local, imported}` pairs a
+/// CommonJS `require("…")` call introduces, from the binding form AROUND the
+/// call node. Mirrors the ESM `import_local_bindings`/`import_alias_pairs`
+/// wire semantics so the daemon's Tier-2 member-call resolution treats a
+/// require binding exactly like the equivalent ESM import:
+///
+/// - `const x = require('./y')` → local `["x"]` (≙ `import * as x` / default)
+/// - `const {a, b: c} = require('./y')` → local `["a","c"]`, aliases
+///   `[{local:"c",imported:"b"}]` (≙ `import { a, b as c }`)
+/// - `const {...rest} = require('./y')` → local `["rest"]` (namespace-ish)
+/// - `const z = require('./y').thing` → local `["z"]`, aliases
+///   `[{local:"z",imported:"thing"}]` (≙ `import { thing as z }`)
+/// - `require('./y')` → `(None, None)` (side-effect)
+/// - `module.exports = require('./y')` → `(None, None)` (re-export; no local)
+/// - `require('debug')('express')` → `(None, None)` (binds the CALL result,
+///   not the module — conservatively no local)
+///
+/// Nested destructuring (`{a: {b}}`) and array patterns are skipped
+/// (conservative — no binding rather than a wrong one).
+fn require_bindings(
+    node: &Node,
+    source: &[u8],
+) -> (Option<Vec<String>>, Option<Vec<ImportAlias>>) {
+    let Some(parent) = node.parent() else {
+        return (None, None);
+    };
+    match parent.kind() {
+        // `const x = require('./y')` / `const {…} = require('./y')`.
+        "variable_declarator" => {
+            // The require call must be the declarator's VALUE (not, say, a
+            // computed-property key somewhere inside the name pattern).
+            if parent.child_by_field_name("value").map(|v| v.id()) != Some(node.id()) {
+                return (None, None);
+            }
+            let Some(name) = parent.child_by_field_name("name") else {
+                return (None, None);
+            };
+            match name.kind() {
+                "identifier" => match name.utf8_text(source) {
+                    Ok(t) => (Some(vec![t.to_string()]), None),
+                    Err(_) => (None, None),
+                },
+                "object_pattern" => {
+                    let mut locals: Vec<String> = Vec::new();
+                    let mut aliases: Vec<ImportAlias> = Vec::new();
+                    let mut cursor = name.walk();
+                    for child in name.named_children(&mut cursor) {
+                        collect_object_pattern_binding(child, source, &mut locals, &mut aliases);
+                    }
+                    (
+                        if locals.is_empty() { None } else { Some(locals) },
+                        if aliases.is_empty() { None } else { Some(aliases) },
+                    )
+                }
+                _ => (None, None),
+            }
+        }
+        // `const z = require('./y').thing` — the require call is the OBJECT of
+        // a member access whose result is bound by a declarator. The local
+        // binds to the MEMBER, exactly like `import { thing as z }`.
+        "member_expression" => {
+            let Some(prop) = parent.child_by_field_name("property") else {
+                return (None, None);
+            };
+            let Some(gp) = parent.parent() else {
+                return (None, None);
+            };
+            if gp.kind() != "variable_declarator"
+                || gp.child_by_field_name("value").map(|v| v.id()) != Some(parent.id())
+            {
+                return (None, None);
+            }
+            let Some(name) = gp.child_by_field_name("name") else {
+                return (None, None);
+            };
+            if name.kind() != "identifier" {
+                return (None, None);
+            }
+            let (Ok(local), Ok(imported)) = (name.utf8_text(source), prop.utf8_text(source))
+            else {
+                return (None, None);
+            };
+            let aliases = if local != imported {
+                Some(vec![ImportAlias {
+                    local: local.to_string(),
+                    imported: imported.to_string(),
+                }])
+            } else {
+                None
+            };
+            (Some(vec![local.to_string()]), aliases)
+        }
+        // Bare `require('./y');`, `module.exports = require('./y')`, a require
+        // in call/argument position, etc. — no local binding introduced.
+        _ => (None, None),
+    }
+}
+
+/// Append the binding(s) of one `object_pattern` child to `locals`/`aliases`.
+/// Handles the destructured-require shapes (tree-sitter-javascript /
+/// -typescript spell them identically):
+/// - `{a}` → `shorthand_property_identifier_pattern` (local `a`)
+/// - `{b: c}` → `pair_pattern` key `b`, value `identifier c` (local `c`,
+///   alias `{local:"c", imported:"b"}`)
+/// - `{a = 1}` → `object_assignment_pattern`, recurse on its `left`
+/// - `{...rest}` → `rest_pattern` (local `rest`, no alias — binds the
+///   remaining module surface like a namespace)
+/// - nested patterns (`{a: {b}}`) are skipped (conservative).
+fn collect_object_pattern_binding(
+    node: Node,
+    source: &[u8],
+    locals: &mut Vec<String>,
+    aliases: &mut Vec<ImportAlias>,
+) {
+    match node.kind() {
+        "shorthand_property_identifier_pattern" => {
+            if let Ok(t) = node.utf8_text(source) {
+                locals.push(t.to_string());
+            }
+        }
+        "pair_pattern" => {
+            let key = node.child_by_field_name("key");
+            let value = node.child_by_field_name("value");
+            let (Some(key), Some(value)) = (key, value) else {
+                return;
+            };
+            if value.kind() != "identifier" {
+                return; // nested pattern — skip, conservative
+            }
+            let (Ok(imported), Ok(local)) = (key.utf8_text(source), value.utf8_text(source))
+            else {
+                return;
+            };
+            locals.push(local.to_string());
+            if local != imported {
+                aliases.push(ImportAlias {
+                    local: local.to_string(),
+                    imported: imported.to_string(),
+                });
+            }
+        }
+        // `{a = 1}` — the binding lives on the pattern's `left`.
+        "object_assignment_pattern" => {
+            if let Some(left) = node.child_by_field_name("left") {
+                collect_object_pattern_binding(left, source, locals, aliases);
+            }
+        }
+        // `{...rest}` — the lone identifier child is the binding.
+        "rest_pattern" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.kind() == "identifier" {
+                    if let Ok(t) = child.utf8_text(source) {
+                        locals.push(t.to_string());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn target_identifier(node: Node, source: &[u8]) -> Option<String> {
     match node.kind() {
         // Bare identifiers across all our supported grammars.
-        "identifier" | "type_identifier" | "field_identifier" | "property_identifier" => {
+        // `private_property_identifier` is a JS/TS `#private` member name
+        // (`this.#dispatch(...)`); its text INCLUDES the leading `#`, matching
+        // the `C.#name` entity naming, so calls to #private methods resolve.
+        "identifier" | "type_identifier" | "field_identifier" | "property_identifier"
+        | "private_property_identifier" => {
             node.utf8_text(source).ok().map(|s| s.to_string())
         }
         // `a.b.c` / `obj.method` — pick the rightmost identifier-ish child.
@@ -1529,6 +1893,20 @@ fn js_imports(node: &Node, source: &[u8], out: &mut Vec<String>) {
     if let Some(source_node) = node.child_by_field_name("source") {
         if let Some(s) = string_literal_value(source_node, source) {
             out.push(s);
+        }
+        return;
+    }
+    // TS CJS-interop `import foo = require("./bar")` — an `import_statement`
+    // whose specifier lives on the `import_require_clause` child's `source`
+    // field, NOT on the statement itself (see TREE_SITTER_NOTES.md "CommonJS").
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "import_require_clause" {
+            if let Some(source_node) = child.child_by_field_name("source") {
+                if let Some(s) = string_literal_value(source_node, source) {
+                    out.push(s);
+                }
+            }
         }
     }
 }
@@ -1843,11 +2221,7 @@ mod tests {
         let out = extract_file("bad.py", src, Language::Python).expect("extract");
         let ws = warns(&out.records);
         assert_eq!(ws.len(), 1, "broken file should warn exactly once: {ws:?}");
-        assert!(
-            ws[0].contains("syntax error"),
-            "warn names a syntax error: {}",
-            ws[0]
-        );
+        assert!(ws[0].contains("syntax error"), "warn names a syntax error: {}", ws[0]);
     }
 
     #[test]
@@ -1891,7 +2265,9 @@ mod tests {
                     kind,
                     range,
                     ..
-                } if kind != "module" => Some((qualified_name.clone(), kind.clone(), *range)),
+                } if kind != "module" => {
+                    Some((qualified_name.clone(), kind.clone(), *range))
+                }
                 _ => None,
             })
             .collect()
@@ -1923,9 +2299,7 @@ mod tests {
             "struct `Foo` (kind class) must still exist, distinct from `impl Foo`: {nodes:?}"
         );
         assert!(
-            nodes
-                .iter()
-                .any(|(q, k, _)| q == "Foo::bar" && k == "method"),
+            nodes.iter().any(|(q, k, _)| q == "Foo::bar" && k == "method"),
             "method `Foo::bar` must still exist: {nodes:?}"
         );
     }
@@ -1976,7 +2350,8 @@ mod tests {
         let out = extract_file("m.ts", src, Language::TypeScript).expect("extract");
         let qs = node_qnames(&out.records);
         assert!(
-            qs.iter().any(|(q, k)| q == "api/search" && k == "method"),
+            qs.iter()
+                .any(|(q, k)| q == "api/search" && k == "method"),
             "object method `api/search` must be a method: {qs:?}"
         );
         assert!(qs.iter().any(|(q, _)| q == "api/health"));
@@ -1990,9 +2365,141 @@ mod tests {
         let out = extract_file("m.ts", src, Language::TypeScript).expect("extract");
         let qs = node_qnames(&out.records);
         assert!(
-            qs.iter()
-                .all(|(q, _)| q != "onClick" && !q.ends_with("/onClick")),
+            qs.iter().all(|(q, _)| q != "onClick" && !q.ends_with("/onClick")),
             "anonymous inline object methods must be skipped: {qs:?}"
+        );
+    }
+
+    // ── Class-field arrow methods + `#private` methods (the hono idioms) ────
+
+    #[test]
+    fn ts_class_field_arrow_is_a_method_qualified_by_class() {
+        // hono's ENTIRE Context API is written as class-field arrows
+        // (`get = (key) => {…}`) — a `public_field_definition`, not a
+        // `method_definition`, so it used to be invisible. It must be a
+        // `method` node named with the CLASS-METHOD convention (`Context.get`,
+        // dot separator), exactly like a regular method.
+        let src = b"export class Context {\n  get = (key: string): unknown => {\n    return lookup(key);\n  };\n  set = (key: string, value: unknown): void => {\n    store(key, value);\n  };\n}\n";
+        let out = extract_file("context.ts", src, Language::TypeScript).expect("extract");
+        let qs = node_qnames(&out.records);
+        assert!(
+            qs.iter().any(|(q, k)| q == "Context.get" && k == "method"),
+            "class-field arrow must be `Context.get` (method): {qs:?}"
+        );
+        assert!(
+            qs.iter().any(|(q, k)| q == "Context.set" && k == "method"),
+            "class-field arrow must be `Context.set` (method): {qs:?}"
+        );
+        // Caller side: calls INSIDE the field-arrow body attribute to the
+        // method entity, not the module/file — chains through it resolve.
+        let calls = call_src_dst(&out.records);
+        assert!(
+            calls.iter().any(|(s, d)| s == "Context.get" && d == "lookup"),
+            "call inside a field-arrow body must attribute to `Context.get`: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn ts_private_hash_method_is_indexed_with_hash_name() {
+        // ES `#private` methods (`Hono.#dispatch`) — the name node is a
+        // `private_property_identifier` whose text INCLUDES the `#`.
+        let src = b"export class Hono {\n  fetch(request: Request): Response {\n    return this.#dispatch(request);\n  }\n  #dispatch(request: Request): Response {\n    return getPath(request);\n  }\n}\n";
+        let out = extract_file("hono-base.ts", src, Language::TypeScript).expect("extract");
+        let qs = node_qnames(&out.records);
+        assert!(
+            qs.iter().any(|(q, k)| q == "Hono.#dispatch" && k == "method"),
+            "`#private` method must be `Hono.#dispatch` (method): {qs:?}"
+        );
+        let calls = call_src_dst(&out.records);
+        // Caller side: a call INSIDE #dispatch's body attributes to it (this is
+        // the broken static chain from the hono bench: getPath ← Hono.#dispatch).
+        assert!(
+            calls.iter().any(|(s, d)| s == "Hono.#dispatch" && d == "getPath"),
+            "call inside a #private body must attribute to `Hono.#dispatch`: {calls:?}"
+        );
+        // Callee side: `this.#dispatch(...)` emits an edge whose dst carries
+        // the `#` so it can resolve to the `Hono.#dispatch` entity.
+        assert!(
+            calls.iter().any(|(s, d)| s == "Hono.fetch" && d == "#dispatch"),
+            "`this.#dispatch()` must emit a call edge to `#dispatch`: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn ts_private_hash_field_arrow_is_indexed_data_fields_are_not() {
+        // A #private FIELD holding an arrow is a callable method surface
+        // (`C.#log`); a #private field holding DATA (`#var = new Map()`) is
+        // not, and must stay unindexed (don't explode the index with state).
+        let src = b"class C {\n  #var = new Map();\n  #log = (msg: string): void => {\n    sink(msg);\n  };\n}\n";
+        let out = extract_file("c.ts", src, Language::TypeScript).expect("extract");
+        let qs = node_qnames(&out.records);
+        assert!(
+            qs.iter().any(|(q, k)| q == "C.#log" && k == "method"),
+            "#private field arrow must be `C.#log` (method): {qs:?}"
+        );
+        assert!(
+            qs.iter().all(|(q, _)| q != "C.#var" && !q.ends_with("#var")),
+            "#private DATA field must not be indexed: {qs:?}"
+        );
+        let calls = call_src_dst(&out.records);
+        assert!(
+            calls.iter().any(|(s, d)| s == "C.#log" && d == "sink"),
+            "call inside #private field-arrow body must attribute to `C.#log`: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn tsx_class_field_arrow_and_private_method_are_indexed() {
+        // Same grammar family, distinct `Language::Tsx` entry point — pin it.
+        let src = b"export class Widget {\n  render = () => {\n    return <div onClick={this.#fire}/>;\n  };\n  #fire(): void {\n    emit();\n  }\n}\n";
+        let out = extract_file("widget.tsx", src, Language::Tsx).expect("extract");
+        let qs = node_qnames(&out.records);
+        assert!(
+            qs.iter().any(|(q, k)| q == "Widget.render" && k == "method"),
+            "TSX class-field arrow must be `Widget.render`: {qs:?}"
+        );
+        assert!(
+            qs.iter().any(|(q, k)| q == "Widget.#fire" && k == "method"),
+            "TSX #private method must be `Widget.#fire`: {qs:?}"
+        );
+    }
+
+    #[test]
+    fn js_class_field_arrow_and_private_method_are_indexed() {
+        // Plain-JS class fields ride the JS grammar's `field_definition`
+        // (field name `property:`, not `name:`) — pin the JS path too.
+        let src = b"class Store {\n  get = (key) => {\n    return this.#read(key);\n  };\n  #read(key) {\n    return fetchRow(key);\n  }\n}\n";
+        let out = extract_file("store.js", src, Language::JavaScript).expect("extract");
+        let qs = node_qnames(&out.records);
+        assert!(
+            qs.iter().any(|(q, k)| q == "Store.get" && k == "method"),
+            "JS class-field arrow must be `Store.get` (method): {qs:?}"
+        );
+        assert!(
+            qs.iter().any(|(q, k)| q == "Store.#read" && k == "method"),
+            "JS #private method must be `Store.#read` (method): {qs:?}"
+        );
+        let calls = call_src_dst(&out.records);
+        assert!(
+            calls.iter().any(|(s, d)| s == "Store.get" && d == "#read"),
+            "`this.#read()` inside the field arrow must edge from `Store.get`: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|(s, d)| s == "Store.#read" && d == "fetchRow"),
+            "call inside JS #private body must attribute to `Store.#read`: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn nested_arrow_inside_class_field_arrow_is_qualified_by_field() {
+        // A helper const-arrow nested in a field-arrow body picks up the field
+        // name as a qualifier segment (mirrors `outer/inner` for functions).
+        let src = b"class C {\n  handler = () => {\n    const inner = (n) => n * 2;\n    return inner(1);\n  };\n}\n";
+        let out = extract_file("c.ts", src, Language::TypeScript).expect("extract");
+        let qs = node_qnames(&out.records);
+        assert!(
+            qs.iter().any(|(q, _)| q == "C/handler/inner"),
+            "nested arrow inside a field arrow should be `C/handler/inner`: {qs:?}"
         );
     }
 
@@ -2164,9 +2671,9 @@ builder.queryField('photosByProject', (t) =>
             .records
             .iter()
             .find_map(|r| match r {
-                Record::Edge { dst_name, kind, .. }
-                    if kind == "static_call" && dst_name == "foo" =>
-                {
+                Record::Edge {
+                    dst_name, kind, ..
+                } if kind == "static_call" && dst_name == "foo" => {
                     Some(serde_json::to_string(r).unwrap())
                 }
                 _ => None,
@@ -2235,9 +2742,11 @@ builder.queryField('photosByProject', (t) =>
                     receiver,
                     receiver_chain,
                     ..
-                } if kind == "static_call" => {
-                    Some((dst_name.clone(), receiver.clone(), receiver_chain.clone()))
-                }
+                } if kind == "static_call" => Some((
+                    dst_name.clone(),
+                    receiver.clone(),
+                    receiver_chain.clone(),
+                )),
                 _ => None,
             })
             .collect()
@@ -2266,7 +2775,8 @@ builder.queryField('photosByProject', (t) =>
         let calls = static_calls_with_chain(&out.records);
         assert!(
             calls.iter().any(|(d, _, c)| d == "run"
-                && c.as_deref() == Some(&["a".to_string(), "b".to_string(), "c".to_string()][..])),
+                && c.as_deref()
+                    == Some(&["a".to_string(), "b".to_string(), "c".to_string()][..])),
             "a.b.c.run() must carry chain [a,b,c]: {calls:?}"
         );
     }
@@ -2306,7 +2816,8 @@ builder.queryField('photosByProject', (t) =>
     fn computed_root_chain_is_skipped() {
         // `arr[i].client.run()` — root is a subscript → no chain, no receiver.
         // `getThing().client.run()` — root is a call → no chain, no receiver.
-        let src = b"function f(arr, i) { arr[i].client.run(); getThing().client.run(); }\n";
+        let src =
+            b"function f(arr, i) { arr[i].client.run(); getThing().client.run(); }\n";
         let out = extract_file("m.ts", src, Language::TypeScript).expect("extract");
         let calls = static_calls_with_chain(&out.records);
         let runs: Vec<_> = calls.iter().filter(|(d, _, _)| d == "run").collect();
@@ -2342,8 +2853,8 @@ builder.queryField('photosByProject', (t) =>
         // chain). The `receiver_chain` EXCLUDES the trailing member, so a
         // 2-part component collapses to just the immediate-object receiver.
         let src = b"---\nimport Foo from \"~/components/Foo.tsx\";\n---\n<Foo.Bar />\n";
-        let out =
-            extract_file("viewer/src/pages/x.astro", src, Language::Astro).expect("extract astro");
+        let out = extract_file("viewer/src/pages/x.astro", src, Language::Astro)
+            .expect("extract astro");
         let calls = static_calls_with_chain(&out.records);
         assert!(
             calls
@@ -2357,13 +2868,11 @@ builder.queryField('photosByProject', (t) =>
     fn astro_lowercase_html_tags_are_not_edges() {
         // Plain HTML tags (`<div>`, `<p>`) must NOT become component edges.
         let src = b"---\nimport Stats from \"~/components/Stats.tsx\";\n---\n<div><p>hi</p><span/></div>\n";
-        let out =
-            extract_file("viewer/src/pages/y.astro", src, Language::Astro).expect("extract astro");
+        let out = extract_file("viewer/src/pages/y.astro", src, Language::Astro)
+            .expect("extract astro");
         let calls = static_calls_with_chain(&out.records);
         assert!(
-            calls
-                .iter()
-                .all(|(d, _, _)| d != "div" && d != "p" && d != "span"),
+            calls.iter().all(|(d, _, _)| d != "div" && d != "p" && d != "span"),
             "lowercase HTML tags must not be edges: {calls:?}"
         );
     }
@@ -2373,8 +2882,8 @@ builder.queryField('photosByProject', (t) =>
         // Paired `<Base>…</Base>` + repeated `<Stats/>` → one edge per distinct
         // component name (the open tag; close tags / repeats deduped).
         let src = b"---\nimport Base from \"~/layouts/Base.astro\";\nimport Stats from \"~/components/Stats.tsx\";\n---\n<Base><Stats /><Stats /></Base>\n";
-        let out =
-            extract_file("viewer/src/pages/z.astro", src, Language::Astro).expect("extract astro");
+        let out = extract_file("viewer/src/pages/z.astro", src, Language::Astro)
+            .expect("extract astro");
         let calls = static_calls_with_chain(&out.records);
         let stats: Vec<_> = calls.iter().filter(|(d, _, _)| d == "Stats").collect();
         let base: Vec<_> = calls.iter().filter(|(d, _, _)| d == "Base").collect();
@@ -2389,8 +2898,10 @@ builder.queryField('photosByProject', (t) =>
         let out = extract_file("m.ts", src, Language::TypeScript).expect("extract");
         let imports = import_locals(&out.records);
         assert!(
-            imports.iter().any(|(d, l)| d == "~/api/client"
-                && l.as_deref() == Some(&["api".to_string(), "qk".to_string()][..])),
+            imports
+                .iter()
+                .any(|(d, l)| d == "~/api/client"
+                    && l.as_deref() == Some(&["api".to_string(), "qk".to_string()][..])),
             "named import must emit local [api, qk]: {imports:?}"
         );
     }
@@ -2450,8 +2961,7 @@ builder.queryField('photosByProject', (t) =>
         // Plain named, default, and namespace imports introduce NO alias → the
         // `import_aliases` field is omitted (None) so the common case is
         // byte-identical with older payloads.
-        let src =
-            b"import { foo } from \"a\";\nimport Bar from \"b\";\nimport * as ns from \"c\";\n";
+        let src = b"import { foo } from \"a\";\nimport Bar from \"b\";\nimport * as ns from \"c\";\n";
         let out = extract_file("m.ts", src, Language::TypeScript).expect("extract");
         let aliases = import_alias_lists(&out.records);
         assert!(
@@ -2463,7 +2973,9 @@ builder.queryField('photosByProject', (t) =>
             .records
             .iter()
             .find_map(|r| match r {
-                Record::Edge { dst_name, kind, .. } if kind == "import" && dst_name == "a" => {
+                Record::Edge { dst_name, kind, .. }
+                    if kind == "import" && dst_name == "a" =>
+                {
                     Some(serde_json::to_string(r).unwrap())
                 }
                 _ => None,
@@ -2533,9 +3045,7 @@ builder.queryField('photosByProject', (t) =>
         let out = extract_file("m.ts", src, Language::TypeScript).expect("extract");
         let imports = import_locals(&out.records);
         assert!(
-            imports
-                .iter()
-                .any(|(d, l)| d == "./styles.css" && l.is_none()),
+            imports.iter().any(|(d, l)| d == "./styles.css" && l.is_none()),
             "side-effect import must omit local: {imports:?}"
         );
         let line = out
@@ -2567,16 +3077,311 @@ builder.queryField('photosByProject', (t) =>
         );
     }
 
+    // ── CommonJS `require()` → import edges ─────────────────────────────────
+
+    /// `(src_name, dst_name, local, aliases)` of one import edge.
+    type ImportEdgeView = (String, String, Option<Vec<String>>, Option<Vec<ImportAlias>>);
+
+    /// Collect an {@link ImportEdgeView} for every import edge.
+    fn cjs_imports(records: &[Record]) -> Vec<ImportEdgeView> {
+        records
+            .iter()
+            .filter_map(|r| match r {
+                Record::Edge {
+                    src_name,
+                    dst_name,
+                    kind,
+                    local,
+                    import_aliases,
+                    ..
+                } if kind == "import" => Some((
+                    src_name.clone(),
+                    dst_name.clone(),
+                    local.clone(),
+                    import_aliases.clone(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// True when any static_call edge targets `require` (the legacy shape a
+    /// recognized require call must NOT keep).
+    fn has_require_call(records: &[Record]) -> bool {
+        static_calls(records).iter().any(|(d, _)| d == "require")
+    }
+
+    #[test]
+    fn js_require_const_is_an_import_edge_not_a_call() {
+        let src = b"const x = require('./y');\n";
+        let out = extract_file("m.js", src, Language::JavaScript).expect("extract");
+        let imports = cjs_imports(&out.records);
+        assert_eq!(
+            imports,
+            vec![(
+                "m".to_string(),
+                "./y".to_string(),
+                Some(vec!["x".to_string()]),
+                None
+            )],
+            "const-require must emit one import edge from the module node"
+        );
+        assert!(
+            !has_require_call(&out.records),
+            "a recognized require() must not ALSO emit a static_call"
+        );
+    }
+
+    #[test]
+    fn js_require_destructuring_emits_locals_and_aliases() {
+        let src = b"const {a, b: c} = require('./y');\n";
+        let out = extract_file("m.js", src, Language::JavaScript).expect("extract");
+        let imports = cjs_imports(&out.records);
+        assert_eq!(imports.len(), 1, "{imports:?}");
+        let (_, dst, local, aliases) = &imports[0];
+        assert_eq!(dst, "./y");
+        assert_eq!(local.as_deref(), Some(&["a".to_string(), "c".to_string()][..]));
+        assert_eq!(
+            aliases.as_deref(),
+            Some(
+                &[ImportAlias {
+                    local: "c".to_string(),
+                    imported: "b".to_string()
+                }][..]
+            ),
+            "`b: c` must map the local alias back to the exported name"
+        );
+    }
+
+    #[test]
+    fn js_require_default_and_rest_patterns_bind() {
+        let src = b"const {a = 1, ...rest} = require('./y');\n";
+        let out = extract_file("m.js", src, Language::JavaScript).expect("extract");
+        let imports = cjs_imports(&out.records);
+        assert_eq!(imports.len(), 1, "{imports:?}");
+        let (_, _, local, aliases) = &imports[0];
+        assert_eq!(
+            local.as_deref(),
+            Some(&["a".to_string(), "rest".to_string()][..]),
+            "defaulted + rest bindings must both surface as locals"
+        );
+        assert!(aliases.is_none());
+    }
+
+    #[test]
+    fn js_bare_require_is_a_side_effect_import() {
+        let src = b"require('./y');\n";
+        let out = extract_file("m.js", src, Language::JavaScript).expect("extract");
+        let imports = cjs_imports(&out.records);
+        assert_eq!(
+            imports,
+            vec![("m".to_string(), "./y".to_string(), None, None)],
+            "bare require = side-effect import, no local"
+        );
+        assert!(!has_require_call(&out.records));
+    }
+
+    #[test]
+    fn js_require_member_binding_is_an_aliased_import() {
+        // `const z = require('./y').thing` ≙ `import { thing as z } from './y'`.
+        let src = b"const z = require('./y').thing;\n";
+        let out = extract_file("m.js", src, Language::JavaScript).expect("extract");
+        let imports = cjs_imports(&out.records);
+        assert_eq!(imports.len(), 1, "{imports:?}");
+        let (_, dst, local, aliases) = &imports[0];
+        assert_eq!(dst, "./y");
+        assert_eq!(local.as_deref(), Some(&["z".to_string()][..]));
+        assert_eq!(
+            aliases.as_deref(),
+            Some(
+                &[ImportAlias {
+                    local: "z".to_string(),
+                    imported: "thing".to_string()
+                }][..]
+            )
+        );
+        assert!(!has_require_call(&out.records));
+    }
+
+    #[test]
+    fn js_require_member_same_name_has_no_alias() {
+        let src = b"const thing = require('./y').thing;\n";
+        let out = extract_file("m.js", src, Language::JavaScript).expect("extract");
+        let imports = cjs_imports(&out.records);
+        assert_eq!(imports.len(), 1, "{imports:?}");
+        let (_, _, local, aliases) = &imports[0];
+        assert_eq!(local.as_deref(), Some(&["thing".to_string()][..]));
+        assert!(aliases.is_none(), "same-name member pick needs no alias pair");
+    }
+
+    #[test]
+    fn js_module_exports_require_is_a_reexport_import() {
+        let src = b"module.exports = require('./y');\n";
+        let out = extract_file("m.js", src, Language::JavaScript).expect("extract");
+        let imports = cjs_imports(&out.records);
+        assert_eq!(
+            imports,
+            vec![("m".to_string(), "./y".to_string(), None, None)],
+            "re-export style still imports './y' (no local binding)"
+        );
+        assert!(!has_require_call(&out.records));
+    }
+
+    #[test]
+    fn js_require_call_result_binding_imports_without_local() {
+        // `require('debug')('express')` binds the RESULT of calling the
+        // module, not the module itself — import edge, conservatively no local.
+        let src = b"var debug = require('debug')('express:app');\n";
+        let out = extract_file("m.js", src, Language::JavaScript).expect("extract");
+        let imports = cjs_imports(&out.records);
+        assert_eq!(
+            imports,
+            vec![("m".to_string(), "debug".to_string(), None, None)]
+        );
+        assert!(!has_require_call(&out.records));
+    }
+
+    #[test]
+    fn js_dynamic_require_stays_an_unresolved_call() {
+        // Computed/dynamic specifiers must NOT invent import edges: they keep
+        // the legacy static_call shape (`?:require` downstream). Template
+        // strings are excluded too (conservative), and extra args disqualify.
+        let src = b"const a = require(name);\nrequire('./' + x);\nrequire(`./t`);\nrequire('./two', extra);\n";
+        let out = extract_file("m.js", src, Language::JavaScript).expect("extract");
+        assert!(
+            cjs_imports(&out.records).is_empty(),
+            "no import edge for any dynamic/computed require"
+        );
+        assert!(
+            has_require_call(&out.records),
+            "dynamic require must still be visible as a call"
+        );
+    }
+
+    #[test]
+    fn js_require_dot_resolve_is_not_an_import() {
+        // `require.resolve('./x')` is a member call on `require`, not a module
+        // import — unchanged legacy behavior.
+        let src = b"const p = require.resolve('./x');\n";
+        let out = extract_file("m.js", src, Language::JavaScript).expect("extract");
+        assert!(cjs_imports(&out.records).is_empty());
+    }
+
+    #[test]
+    fn js_require_inside_function_attributes_to_it() {
+        let src = b"function load() {\n  const x = require('./lazy');\n  return x;\n}\n";
+        let out = extract_file("m.js", src, Language::JavaScript).expect("extract");
+        let imports = cjs_imports(&out.records);
+        assert_eq!(imports.len(), 1, "{imports:?}");
+        assert_eq!(imports[0].0, "load", "nested require anchors on the enclosing definition");
+        assert_eq!(imports[0].1, "./lazy");
+    }
+
+    #[test]
+    fn js_cjs_export_assigned_callables_are_indexed() {
+        // `exports.foo = function` / `module.exports.bar = arrow` are the CJS
+        // public callable surface (express's entire lib/utils API) — indexed
+        // as functions. Arbitrary member mutations (prototype patching, test
+        // monkey-patching) and non-callable exports must NOT be.
+        let src = b"exports.normalizeType = function(type){ return type; };\n\
+module.exports.other = (x) => x;\n\
+res.send = function(){};\n\
+Foo.prototype.bar = function(){};\n\
+this.handler = function(){};\n\
+exports.methods = ['get'];\n\
+exports.etag = mkGenerator({ weak: false });\n";
+        let out = extract_file("lib/utils.js", src, Language::JavaScript).expect("extract");
+        let qnames = node_qnames(&out.records);
+        assert!(
+            qnames.contains(&("normalizeType".to_string(), "function".to_string())),
+            "exports.fn must be indexed: {qnames:?}"
+        );
+        assert!(
+            qnames.contains(&("other".to_string(), "function".to_string())),
+            "module.exports.fn must be indexed: {qnames:?}"
+        );
+        for absent in ["send", "bar", "handler", "methods", "etag"] {
+            assert!(
+                !qnames.iter().any(|(q, _)| q == absent),
+                "`{absent}` must NOT be indexed: {qnames:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn js_calls_inside_cjs_export_attribute_to_it() {
+        let src = b"exports.wrap = function(){ return inner(); };\nfunction inner(){}\n";
+        let out = extract_file("m.js", src, Language::JavaScript).expect("extract");
+        let calls = call_src_dst(&out.records);
+        assert!(
+            calls.contains(&("wrap".to_string(), "inner".to_string())),
+            "call inside an exported fn must attribute to the export entity: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn ts_cjs_export_assigned_callable_is_indexed() {
+        let src = b"exports.parse = (s: string): number => s.length;\nobj.notExport = () => 1;\n";
+        let out = extract_file("m.ts", src, Language::TypeScript).expect("extract");
+        let qnames = node_qnames(&out.records);
+        assert!(
+            qnames.contains(&("parse".to_string(), "function".to_string())),
+            "{qnames:?}"
+        );
+        assert!(!qnames.iter().any(|(q, _)| q == "notExport"), "{qnames:?}");
+    }
+
+    #[test]
+    fn ts_require_forms_match_js() {
+        // The TypeScript grammar spells all the shapes identically; pin the
+        // TS path (.ts/.cts) explicitly.
+        let src = b"const x = require('./y');\nconst {a, b: c} = require('./z');\n";
+        let out = extract_file("m.ts", src, Language::TypeScript).expect("extract");
+        let imports = cjs_imports(&out.records);
+        assert_eq!(imports.len(), 2, "{imports:?}");
+        assert_eq!(imports[0].2.as_deref(), Some(&["x".to_string()][..]));
+        assert_eq!(
+            imports[1].2.as_deref(),
+            Some(&["a".to_string(), "c".to_string()][..])
+        );
+        assert_eq!(
+            imports[1].3.as_deref(),
+            Some(
+                &[ImportAlias {
+                    local: "c".to_string(),
+                    imported: "b".to_string()
+                }][..]
+            )
+        );
+        assert!(!has_require_call(&out.records));
+    }
+
+    #[test]
+    fn ts_import_equals_require_is_an_import_with_local() {
+        // TS CJS-interop `import foo = require("./bar")` — an import_statement
+        // whose specifier lives on the import_require_clause.
+        let src = b"import foo = require('./bar');\n";
+        let out = extract_file("m.ts", src, Language::TypeScript).expect("extract");
+        let imports = cjs_imports(&out.records);
+        assert_eq!(
+            imports,
+            vec![(
+                "m".to_string(),
+                "./bar".to_string(),
+                Some(vec!["foo".to_string()]),
+                None
+            )]
+        );
+        assert!(!has_require_call(&out.records));
+    }
+
     #[test]
     fn non_js_import_omits_local() {
         // Python imports are not in the priority set: no `local` field.
         let src = b"import os\nfrom sys import argv\n";
         let out = extract_file("m.py", src, Language::Python).expect("extract");
         let imports = import_locals(&out.records);
-        assert!(
-            !imports.is_empty(),
-            "python imports must still emit: {imports:?}"
-        );
+        assert!(!imports.is_empty(), "python imports must still emit: {imports:?}");
         assert!(
             imports.iter().all(|(_, l)| l.is_none()),
             "non-priority langs must omit local: {imports:?}"
@@ -2602,7 +3407,9 @@ builder.queryField('photosByProject', (t) =>
         records
             .iter()
             .filter_map(|r| match r {
-                Record::Edge { dst_name, kind, .. } if kind == "import" => Some(dst_name.clone()),
+                Record::Edge {
+                    dst_name, kind, ..
+                } if kind == "import" => Some(dst_name.clone()),
                 _ => None,
             })
             .collect()
@@ -2663,7 +3470,10 @@ builder.queryField('photosByProject', (t) =>
                 _ => None,
             })
             .expect("module node");
-        assert_eq!(module[0], 1, "module starts at line 1: {module:?}");
+        assert_eq!(
+            module[0], 1,
+            "module starts at line 1: {module:?}"
+        );
         assert!(
             module[1] >= 6,
             "module must span past the closing fence into the template: {module:?}"
@@ -2705,10 +3515,7 @@ builder.queryField('photosByProject', (t) =>
         // Leading blank lines before the fence are tolerated.
         let src2 = b"\n\n---\nconst c = 3;\n---\n";
         let (slice2, offset2) = astro_frontmatter(src2).expect("frontmatter present");
-        assert_eq!(
-            offset2, 3,
-            "content starts on line index 3 after two blanks"
-        );
+        assert_eq!(offset2, 3, "content starts on line index 3 after two blanks");
         assert_eq!(std::str::from_utf8(slice2).unwrap(), "const c = 3;\n");
         // No fence → None.
         assert!(astro_frontmatter(b"<div>only template</div>\n").is_none());
@@ -2716,3 +3523,4 @@ builder.queryField('photosByProject', (t) =>
         assert!(astro_frontmatter(b"---\nconst d = 4;\n").is_none());
     }
 }
+

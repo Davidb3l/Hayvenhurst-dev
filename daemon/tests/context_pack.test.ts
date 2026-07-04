@@ -599,4 +599,173 @@ ${filler}`;
     );
     dbB.close();
   });
+
+  // ── OPT-IN CALLER HOP (maxCallers) ──────────────────────────────────────────
+  // The packer reaches CALLEES (outgoing) + referenced types, but never CALLERS.
+  // A higher-order target (`withRetry(fn)`) whose real behavior is the lambda the
+  // CALLER supplies has its load-bearing code invisible. `maxCallers > 0` adds the
+  // caller body as a via:"caller" slice; default (absent) adds nothing.
+
+  /** Fixture: `app/doWork` (the CALLER, body holds the real lambda) calls
+   *  `lib/withRetry` (the higher-order TARGET). Returns the repo root. */
+  function seedHof(db: Db): string {
+    db.migrate();
+    const root = mkdtempSync(join(tmpdir(), "hayven-ctxpack-hof-"));
+    const WITHRETRY_TS = `export function withRetry<T>(fn: () => T): T {
+  return fn()
+}
+`;
+    const DOWORK_TS = `import { withRetry } from "./withRetry"
+
+export function doWork(): number {
+  return withRetry(() => {
+    const LOAD_BEARING = 41 + 1
+    return LOAD_BEARING
+  })
+}
+`;
+    for (const [rel, content] of [
+      ["src/withRetry.ts", WITHRETRY_TS],
+      ["src/doWork.ts", DOWORK_TS],
+    ] as const) {
+      const abs = join(root, rel);
+      mkdirSync(dirname(abs), { recursive: true });
+      writeFileSync(abs, content);
+    }
+    // withRetry = lines 1..3; doWork = lines 3..9; doWork CALLS withRetry.
+    node(db, "lib/withRetry", "src/withRetry.ts", [1, 3]);
+    node(db, "app/doWork", "src/doWork.ts", [3, 9]);
+    edge(db, "app/doWork", "lib/withRetry", "static_call", 1);
+    return root;
+  }
+
+  it("includes the caller body as a via:\"caller\" slice with maxCallers:1", () => {
+    const db = new Db(":memory:");
+    const root = seedHof(db);
+    const pack = buildContextPack(db, root, "lib/withRetry", { maxCallers: 1 });
+    expect(pack).not.toBeNull();
+    const caller = (pack?.slices ?? []).find((s) => s.id === "app/doWork");
+    // The caller is inlined, tagged "caller", with the incoming edge weight…
+    expect(caller).toBeDefined();
+    expect(caller?.via).toBe("caller");
+    expect(caller?.role).toBe("neighbor");
+    expect(caller?.weight).toBe(1);
+    expect(caller?.file).toBe("src/doWork.ts");
+    // …and it carries the load-bearing lambda body the target alone never shows.
+    expect(caller?.text).toContain("const LOAD_BEARING = 41 + 1");
+    db.close();
+  });
+
+  it("adds NO caller slice by default (byte-identical to pre-caller-hop)", () => {
+    // Build the SAME target with and without maxCallers; the default pack must be
+    // byte-identical (same slices/ids/text/weights), i.e. maxCallers absent ⇒
+    // zero caller slices. This is the cost-wedge guarantee.
+    const db = new Db(":memory:");
+    const root = seedHof(db);
+    const dflt = buildContextPack(db, root, "lib/withRetry");
+    const withCallers = buildContextPack(db, root, "lib/withRetry", {
+      maxCallers: 1,
+    });
+    expect(dflt).not.toBeNull();
+    // No slice in the default pack was reached via "caller".
+    expect((dflt?.slices ?? []).some((s) => s.via === "caller")).toBe(false);
+    expect((dflt?.slices ?? []).some((s) => s.id === "app/doWork")).toBe(false);
+    // The caller-hop pack DID add it (proves the fixture wires a real caller).
+    expect((withCallers?.slices ?? []).some((s) => s.via === "caller")).toBe(true);
+    // Byte-identical default proof: serializing the default pack omitting the new
+    // pass yields exactly the caller-hop pack MINUS its caller slices.
+    const stripCallers = (p: typeof withCallers) =>
+      JSON.stringify((p?.slices ?? []).filter((s) => s.via !== "caller"));
+    expect(JSON.stringify(dflt?.slices)).toBe(stripCallers(withCallers));
+    db.close();
+  });
+
+  it("respects the maxCallers cap and notes the omission", () => {
+    const db = new Db(":memory:");
+    db.migrate();
+    const root = mkdtempSync(join(tmpdir(), "hayven-ctxpack-callercap-"));
+    const TARGET_TS = `export function target(): number {
+  return 0
+}
+`;
+    const C1_TS = `export function callerOne(): number {
+  return target() + 1
+}
+`;
+    const C2_TS = `export function callerTwo(): number {
+  return target() + 2
+}
+`;
+    for (const [rel, content] of [
+      ["src/target.ts", TARGET_TS],
+      ["src/c1.ts", C1_TS],
+      ["src/c2.ts", C2_TS],
+    ] as const) {
+      const abs = join(root, rel);
+      mkdirSync(dirname(abs), { recursive: true });
+      writeFileSync(abs, content);
+    }
+    node(db, "x/target", "src/target.ts", [1, 3]);
+    node(db, "x/callerOne", "src/c1.ts", [1, 3]);
+    node(db, "x/callerTwo", "src/c2.ts", [1, 3]);
+    // callerOne has the heavier incoming edge weight → kept; callerTwo omitted.
+    edge(db, "x/callerOne", "x/target", "static_call", 5);
+    edge(db, "x/callerTwo", "x/target", "static_call", 1);
+
+    const pack = buildContextPack(db, root, "x/target", { maxCallers: 1 });
+    const callers = (pack?.slices ?? []).filter((s) => s.via === "caller");
+    expect(callers).toHaveLength(1);
+    expect(callers[0]!.id).toBe("x/callerOne"); // highest incoming weight kept
+    expect(callers[0]!.weight).toBe(5);
+    expect(pack?.notes.some((n) => n.includes("caller(s) omitted"))).toBe(true);
+    db.close();
+  });
+
+  it("excludes a dangling / module / test caller from the caller hop", () => {
+    const db = new Db(":memory:");
+    db.migrate();
+    const root = mkdtempSync(join(tmpdir(), "hayven-ctxpack-callerskip-"));
+    const TARGET_TS = `export function target(): number {
+  return 0
+}
+`;
+    const REAL_TS = `export function realCaller(): number {
+  return target() + 1
+}
+`;
+    for (const [rel, content] of [
+      ["src/target.ts", TARGET_TS],
+      ["src/real.ts", REAL_TS],
+    ] as const) {
+      const abs = join(root, rel);
+      mkdirSync(dirname(abs), { recursive: true });
+      writeFileSync(abs, content);
+    }
+    node(db, "y/target", "src/target.ts", [1, 3]);
+    node(db, "y/realCaller", "src/real.ts", [1, 3]);
+    node(db, "src/mod.ts", "src/mod.ts", [1, 3], "module"); // a module CALLER
+    // A test-file caller node (no source file written — also exercises read-fail
+    // robustness) and a dangling caller (edge from an id with no node row).
+    node(db, "y.test/testCaller", "src/y.test.ts", [1, 3]);
+    edge(db, "y/realCaller", "y/target", "static_call", 1); // real → kept
+    edge(db, "src/mod.ts", "y/target", "static_call", 9); // module → excluded
+    edge(db, "y.test/testCaller", "y/target", "static_call", 9); // test → excluded
+    edge(db, "y/danglerCaller", "y/target", "static_call", 9); // dangler → excluded
+
+    const pack = buildContextPack(db, root, "y/target", { maxCallers: 10 });
+    const callerIds = (pack?.slices ?? [])
+      .filter((s) => s.via === "caller")
+      .map((s) => s.id);
+    // Only the real source caller survives the guards.
+    expect(callerIds).toEqual(["y/realCaller"]);
+    // None of the excluded kinds leaked in as any slice.
+    expect((pack?.slices ?? []).some((s) => s.id === "src/mod.ts")).toBe(false);
+    expect((pack?.slices ?? []).some((s) => s.id === "y.test/testCaller")).toBe(
+      false,
+    );
+    expect((pack?.slices ?? []).some((s) => s.id === "y/danglerCaller")).toBe(
+      false,
+    );
+    db.close();
+  });
 });

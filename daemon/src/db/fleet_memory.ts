@@ -25,6 +25,7 @@
  * and deterministically testable — no hidden `Date.now()`, and NEVER
  * `Math.random` for ids (the repo forbids it; see CLAUDE.md / style discipline).
  */
+import { buildFtsMatch, buildRelaxedFtsMatch } from "./fts.ts";
 import type { Db } from "./queries.ts";
 
 /** The four flavours of learning a note can carry. `decision` = a choice made;
@@ -204,6 +205,16 @@ const LIVE_PREDICATE = "(ttl IS NULL OR created + ttl * 1000 >= ?)";
 const ORDER_NEWEST = "ORDER BY created DESC, id ASC";
 
 /**
+ * `fleet_memory`-alias-qualified copies of {@link LIVE_PREDICATE} /
+ * {@link ORDER_NEWEST} for the FTS JOIN, where the base table is aliased `m` next
+ * to the FTS `f` alias. SAME liveness + newest-first semantics; only alias-
+ * prefixed so the columns are unambiguous in the joined query. Kept beside the
+ * originals so the two stay in lockstep. `?` binds `now`, exactly as above.
+ */
+const LIVE_PREDICATE_M = "(m.ttl IS NULL OR m.created + m.ttl * 1000 >= ?)";
+const ORDER_NEWEST_M = "ORDER BY m.created DESC, m.id ASC";
+
+/**
  * Insert a note and return the stored {@link MemoryNote} (with its id).
  *
  * The id is the caller-supplied `input.id` if present, else a deterministic hash
@@ -280,15 +291,24 @@ export function memoryForNode(db: Db, nodeId: string, now: number): MemoryNote[]
 }
 
 /**
- * LIVE notes whose `note` text contains `term` (case-insensitive), newest first.
+ * LIVE notes whose `note` text contains `term` (case-insensitive), newest first
+ * — the ORIGINAL blind-substring recall, kept as an EXPORTED function so the
+ * recall bench can A/B it against the FTS path ({@link searchMemory}) and so
+ * {@link searchMemory} can fall back to it.
  *
- * For an agent's "has anyone already learned X?" question. SQLite's `LIKE` is
- * case-insensitive for ASCII by default, which is the behaviour we want; we
- * still escape LIKE metacharacters in `term` so a literal `%`/`_` in the search
- * term matches itself rather than acting as a wildcard. `limit` caps the result
- * (default 100).
+ * SQLite's `LIKE` is case-insensitive for ASCII by default, which is the
+ * behaviour we want; we still escape LIKE metacharacters in `term` so a literal
+ * `%`/`_` in the search term matches itself rather than acting as a wildcard.
+ * `limit` caps the result (default 100).
+ *
+ * RECALL LIMIT (why {@link searchMemory} now wraps FTS+expansion in front of
+ * this): `LIKE` only matches a CONTIGUOUS run, so a note mentioning `authHandler`
+ * is invisible to the query `"auth handler"` (the space breaks the run), and a
+ * note saying `cfg` is invisible to `config` (no shared substring). The FTS path
+ * fixes both via identifier tokenization + the abbrev table; this stays the
+ * exact-substring baseline.
  */
-export function searchMemory(
+export function searchMemorySubstring(
   db: Db,
   term: string,
   now: number,
@@ -308,6 +328,99 @@ export function searchMemory(
     )
     .all(likePattern, now, cap)
     .map(rowToNote);
+}
+
+/**
+ * Internal: run ONE FTS pass for a pre-built MATCH expression. Queries
+ * `fleet_memory_fts MATCH ?`, JOINs back to `fleet_memory` by id, then applies
+ * the SAME {@link LIVE_PREDICATE} + {@link ORDER_NEWEST} + `limit` as every other
+ * read so liveness/ordering/determinism are identical to the substring path.
+ *
+ * The FTS table only indexes `note`; all the structured filtering/ordering
+ * happens on the joined base columns, and we project the EXPLICIT
+ * {@link MEMORY_COLUMNS} (qualified to `fleet_memory`) — never `SELECT *` — for
+ * the same stale-statement reason as the rest of this module. Param order mirrors
+ * the `?`s: MATCH expression, then `now` (LIVE_PREDICATE), then the cap.
+ */
+function searchMemoryFtsPass(
+  db: Db,
+  matchExpr: string,
+  now: number,
+  cap: number,
+): MemoryNote[] {
+  // The base-table columns/predicate/order are all qualified to the `m` alias
+  // (the JOINed `fleet_memory`) so they're unambiguous next to the FTS `f` alias.
+  // `LIVE_PREDICATE_M`/`ORDER_NEWEST_M` are the SAME liveness + newest-first
+  // definitions as the unqualified ones, just alias-prefixed.
+  const projection = MEMORY_COLUMNS.split(", ")
+    .map((c) => `m.${c}`)
+    .join(", ");
+  return db.handle
+    .query<FleetMemoryRow, [string, number, number]>(
+      `SELECT ${projection}
+         FROM fleet_memory_fts f
+         JOIN fleet_memory m ON m.id = f.id
+        WHERE fleet_memory_fts MATCH ?
+          AND ${LIVE_PREDICATE_M}
+        ${ORDER_NEWEST_M}
+        LIMIT ?`,
+    )
+    .all(matchExpr, now, cap)
+    .map(rowToNote);
+}
+
+/**
+ * LIVE notes whose `note` text RECALLS `term`, newest first — the upgraded
+ * recall path. Two-phase + expansion, mirroring `searchFts` in `fts.ts`:
+ *
+ *   1. PRECISE — `buildFtsMatch(term)` builds the AND-of-OR-groups MATCH with the
+ *      model-free expansion floor (identifier tokenization + abbrev table) baked
+ *      in, queried against `fleet_memory_fts` and JOINed back to `fleet_memory`.
+ *      So `"auth handler"` recalls a note about `authHandler`/`auth_handler`, and
+ *      `config` recalls `cfg` — neither reachable by a contiguous substring.
+ *   2. RELAXED fallback — fires ONLY when the precise pass returns ZERO rows:
+ *      `buildRelaxedFtsMatch(term)` drops English stopwords and OR-s the
+ *      remaining content groups, so a natural-language ask still surfaces the
+ *      notes that hit its content words instead of nothing.
+ *
+ * SUBSTRING fallback (preserves the old guarantees): if the MATCH string is
+ * EMPTY (punctuation-/stopword-only input that never reaches an FTS MATCH) OR the
+ * FTS query THROWS (e.g. the `fleet_memory_fts` table is somehow absent), we fall
+ * back to {@link searchMemorySubstring} so this function is never WORSE than the
+ * blind substring path — only ever better.
+ *
+ * Determinism, the {@link LIVE_PREDICATE}, the explicit column projection, and
+ * FTS-input escaping (via `buildFtsMatch`'s sanitizer) are all preserved. `limit`
+ * caps the result (default 100).
+ */
+export function searchMemory(
+  db: Db,
+  term: string,
+  now: number,
+  limit = 100,
+): MemoryNote[] {
+  const cap = Math.max(0, Math.trunc(limit));
+
+  const preciseExpr = buildFtsMatch(term);
+  // Empty MATCH (punctuation-/whitespace-only) never reaches FTS — the substring
+  // path is the only sensible answer (it self-escapes the literal term).
+  if (preciseExpr.length === 0) return searchMemorySubstring(db, term, now, cap);
+
+  try {
+    const precise = searchMemoryFtsPass(db, preciseExpr, now, cap);
+    if (precise.length > 0) return precise;
+
+    // Precise AND-path found nothing — try the relaxed OR-over-content-words
+    // match. Skip the redundant query when relaxing produced the SAME expression
+    // (single content term, nothing to drop) — the result would be identical-empty.
+    const relaxedExpr = buildRelaxedFtsMatch(term);
+    if (relaxedExpr.length === 0 || relaxedExpr === preciseExpr) return precise;
+    return searchMemoryFtsPass(db, relaxedExpr, now, cap);
+  } catch {
+    // FTS table missing / MATCH rejected — degrade to the substring baseline
+    // rather than dropping results entirely.
+    return searchMemorySubstring(db, term, now, cap);
+  }
 }
 
 /**
@@ -346,11 +459,22 @@ export function listMemory(
 
 /**
  * Delete a note by id. Returns true iff a row was actually removed (false when
- * the id didn't exist) — `bun:sqlite`'s `run()` reports `changes`.
+ * the id didn't exist).
+ *
+ * NB: we do NOT trust `run().changes` to count the deleted ROWS here. With the
+ * v7 `fleet_memory_fts` sync trigger in place, a DELETE on `fleet_memory` fires
+ * the FTS `AFTER DELETE` trigger, and `bun:sqlite` reports the TOTAL changes
+ * (base row + the trigram FTS rows the trigger touches) — so `.changes` is
+ * inflated. A `true`/`false` existence answer only needs "did the row exist", so
+ * we check that directly with an existence probe, immune to trigger inflation.
  */
 export function forgetMemory(db: Db, id: string): boolean {
-  const res = db.handle.query("DELETE FROM fleet_memory WHERE id = ?").run(id);
-  return res.changes > 0;
+  const existed =
+    db.handle
+      .query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM fleet_memory WHERE id = ?")
+      .get(id)?.n ?? 0;
+  db.handle.query("DELETE FROM fleet_memory WHERE id = ?").run(id);
+  return existed > 0;
 }
 
 /**
@@ -362,8 +486,22 @@ export function forgetMemory(db: Db, id: string): boolean {
  * ttl that has elapsed qualify.
  */
 export function pruneExpired(db: Db, now: number): number {
-  const res = db.handle
-    .query("DELETE FROM fleet_memory WHERE ttl IS NOT NULL AND created + ttl * 1000 < ?")
-    .run(now);
-  return res.changes;
+  // Count the expired ROWS first, then delete them. We can't read the count off
+  // `run().changes`: the v7 `fleet_memory_fts` sync trigger fires on each base
+  // delete and `bun:sqlite` reports the TOTAL changes (base rows + the trigram
+  // FTS rows the trigger touches), which would over-report the count. The COUNT
+  // and the DELETE share the EXACT same predicate (the negation of
+  // {@link LIVE_PREDICATE}) so they agree on which rows qualify. Wrapped in a
+  // transaction so the count and delete are atomic w.r.t. concurrent writes.
+  const expiredPredicate = "ttl IS NOT NULL AND created + ttl * 1000 < ?";
+  return db.transaction(() => {
+    const count =
+      db.handle
+        .query<{ n: number }, [number]>(
+          `SELECT COUNT(*) AS n FROM fleet_memory WHERE ${expiredPredicate}`,
+        )
+        .get(now)?.n ?? 0;
+    db.handle.query(`DELETE FROM fleet_memory WHERE ${expiredPredicate}`).run(now);
+    return count;
+  });
 }

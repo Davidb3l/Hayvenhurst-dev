@@ -65,6 +65,18 @@ interface CacheFileV2 {
 
 const EMPTY_ROOT_HEX = bytesToHex(blake3(Uint8Array.of(NODE_TAG)));
 
+// The leaf hash of a segment with ZERO op keys. A segment file can legitimately
+// hold zero ops — most importantly after a torn-write truncates a single-batch
+// segment to an empty (0-byte) file on crash recovery (the §14 hydrate path).
+// Such a segment carries no ops to converge, so it must contribute NO leaf:
+// otherwise a crash-recovered peer holds a phantom leaf that peers which never
+// wrote that day lack, and their Merkle roots diverge FOREVER despite identical
+// op-set content (sync has nothing to push for an empty segment). Skipping any
+// leaf equal to this hash drops empty segments on both the cache-hit and
+// cache-miss paths; a real segment has ≥1 op key and (blake3 being
+// collision-resistant) can never collide with it.
+const EMPTY_LEAF_HEX = bytesToHex(blake3(Uint8Array.of(LEAF_TAG)));
+
 /**
  * Compute a fresh snapshot from the op log's segments. Re-uses cached
  * per-segment leaf hashes when (mtime, size, tailHex) match; otherwise decodes
@@ -104,6 +116,10 @@ export function computeMerkle(oplog: OpLog): MerkleSnapshot {
           dirty = true;
         }
       }
+      // An empty segment (zero op keys — e.g. a torn-write-truncated single-batch
+      // file) contributes NO leaf, so a crash-recovered peer's root still matches
+      // peers that never held that day. See EMPTY_LEAF_HEX.
+      if (hash === EMPTY_LEAF_HEX) continue;
       typeLeaves.push({ path: day, hash });
     }
     leaves[type] = typeLeaves;

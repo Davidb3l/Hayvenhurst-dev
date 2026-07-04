@@ -9,8 +9,23 @@
 (class_declaration
   name: (type_identifier) @name.definition) @definition.class
 
+; `name` also matches ES `#private` methods (`#dispatch(...) {…}`) — the
+; grammar spells the name as `private_property_identifier` and the leading
+; `#` is part of its text, so the emitted entity is `Hono.#dispatch`.
 (method_definition
-  name: (property_identifier) @name.definition) @definition.method
+  name: [(property_identifier) (private_property_identifier)] @name.definition) @definition.method
+
+; CLASS-FIELD arrow/function-expression methods
+; (`class Context { get = (key) => {…} }`). The grammar spells these as a
+; `public_field_definition` (the node name says "public" but covers `#private`
+; and `private`-modifier fields too), NOT a `method_definition`, so the pattern
+; above misses them — hono's entire Context API is written this way. Only
+; CALLABLE-valued fields are captured (plain data fields `#var = new Map()`
+; stay unindexed). `extract.rs` promotes these to `method` nodes qualified by
+; the enclosing class (`Context.get`), exactly like `method_definition`.
+(public_field_definition
+  name: [(property_identifier) (private_property_identifier)] @name.definition
+  value: [(arrow_function) (function_expression)]) @definition.field
 
 ; Interface and type alias declarations.
 (interface_declaration
@@ -42,8 +57,21 @@
   value: [(arrow_function) (function_expression)]) @definition.pair
 
 ; Calls — both regular call_expression and `new Foo(...)`.
+; CommonJS EXPORT-ASSIGNED callables (`exports.foo = function(){}`,
+; `module.exports.foo = (x) => …`) — same capture as javascript.scm (the TS
+; grammar spells the assignment identically); the `exports`/`module.exports`
+; object guard lives in `extract.rs::cjs_export_target`.
+(assignment_expression
+  left: (member_expression
+    property: (property_identifier) @name.definition)
+  right: [(arrow_function) (function_expression)]) @definition.cjs_export
+
 (call_expression) @call
 (new_expression) @call
 
-; Imports.
+; Imports. CommonJS `require("…")` imports are NOT a query pattern: they're
+; recognized inside the `@call` handling in `extract.rs`
+; (`require_specifier`/`require_bindings`), since `(call_expression) @call`
+; already matches every require call. TS `import foo = require("…")` IS an
+; `import_statement` (with an `import_require_clause`) and resolves here.
 (import_statement) @import

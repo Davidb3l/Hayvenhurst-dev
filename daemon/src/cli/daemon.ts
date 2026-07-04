@@ -7,6 +7,7 @@
 import {
   buildMultiProjectApp,
   wireBranchAwareDb,
+  type DbRef,
   type ServerDependencies,
 } from "../daemon/server.ts";
 import {
@@ -31,10 +32,12 @@ import { startWatch, type WatchEvent, type WatchSupervisor } from "../native/wat
 import { rootLogger } from "../util/log.ts";
 import type { ParsedArgs } from "../cli.ts";
 import { Db } from "../db/queries.ts";
-import { existsSync } from "node:fs";
+import { activeBranchKey, resolveWriteIndex, resolveWriteIndexForKey } from "../db/branch_index.ts";
 import type { HayvenConfig } from "../config/defaults.ts";
-import { loadConfig } from "../config/load.ts";
+import { existsSync } from "node:fs";
 import { hayvenPathsFor, type HayvenPaths } from "../util/paths.ts";
+import type { Logger } from "../util/log.ts";
+import { loadConfig } from "../config/load.ts";
 import {
   readRegistry,
   registerProject,
@@ -44,6 +47,187 @@ import {
 import { requireProject } from "./_shared.ts";
 import { VERSION } from "../version.ts";
 
+/**
+ * How often the daemon polls `.git/HEAD` (via {@link activeBranchKey}) to detect
+ * a `git checkout` and re-point its served index to the new branch. The native
+ * file watcher does NOT reliably observe `.git/HEAD`, so branch changes are
+ * found by polling, not by the watcher. 2s is responsive without being chatty
+ * (it is a cheap fs read of one small file).
+ */
+export const BRANCH_POLL_INTERVAL_MS = 2000;
+
+/** How long shutdown waits for an in-flight ingest/re-point to settle before
+ *  closing the db. Bounded so a stuck ingest can't hang shutdown forever. */
+export const SHUTDOWN_DRAIN_MS = 5000;
+
+/**
+ * Await an in-flight ingest/re-point (the serialized `ingestChain`) before we
+ * close the db on shutdown — otherwise `db.close()` can fire while a `drainIngest`
+ * is mid-write, and the write throws "Database was closed" (use-after-close). The
+ * wait is BOUNDED: if the chain hasn't settled in `timeoutMs` we proceed anyway
+ * so a wedged ingest can't block process exit. Resolves regardless of whether the
+ * chain fulfilled or rejected (we only care that it's no longer writing).
+ */
+export async function drainIngestChain(
+  chain: Promise<unknown>,
+  timeoutMs: number,
+): Promise<"drained" | "timeout"> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), timeoutMs);
+  });
+  const drained = chain.then(
+    () => "drained" as const,
+    () => "drained" as const,
+  );
+  const result = await Promise.race([drained, timeout]);
+  if (timer) clearTimeout(timer);
+  return result;
+}
+
+/**
+ * Dependencies for {@link repointToBranch} — the LIVE branch re-point. Factored
+ * out of `startDaemon` so it is deterministically testable WITHOUT a real
+ * long-lived HTTP server (the test drives this function directly).
+ */
+export interface RepointDeps {
+  readonly dbRef: DbRef;
+  readonly paths: HayvenPaths;
+  readonly config: HayvenConfig;
+  readonly logger: Logger;
+  /**
+   * Run `fn` on the SAME serialized ingest chain the watcher/API use, so the
+   * swap never races a mid-flight ingest writer (review HIGH: concurrent SQLite
+   * writers corrupt the index). The re-point happens INSIDE this exclusion.
+   */
+  readonly runIngestExclusive: <T>(fn: () => Promise<T>) => Promise<T>;
+  /**
+   * Freshen the NEW branch db (full/incremental ingest) so it reflects the
+   * branch's current code before it is served. Receives the new db; it runs
+   * INSIDE the same exclusion as the swap. A throw here is non-fatal — the swap
+   * still happens (a seeded-but-stale index is better than serving the wrong
+   * branch), and the next watcher batch reconciles it.
+   */
+  readonly freshen: (db: Db) => Promise<void>;
+}
+
+/**
+ * Result of a re-point: the path now served AND the branch key it corresponds
+ * to. The poller sets its `lastBranchKey` to `branchKey` (NOT the key it
+ * detected) so the poller's transition tracker, `dbRef.branchKey`, and the
+ * served index all agree on the SAME key — no desync if a resolution reconciled
+ * to a different key than detected.
+ */
+export interface RepointResult {
+  readonly path: string;
+  readonly branchKey: string | null;
+}
+
+/**
+ * Re-point the served db to `newKey`'s branch index, serialized through the
+ * ingest chain. Resolves (seeding on first touch) FOR `newKey` specifically —
+ * NOT "whatever `.git/HEAD` says at execution time" — then migrates + freshens
+ * the new branch index, SWAPS it into `dbRef.current`, and closes the OLD db.
+ * Returns the path + branch key now served.
+ *
+ * (A) Consistency: the swap target is the branch the poller DETECTED (`newKey`).
+ * `freshen()` can take seconds; a `git checkout` during that window must not
+ * retarget the swap to a different branch than the poller already claimed. We
+ * resolve FOR `newKey` (via `resolveWriteIndexForKey`), and the returned
+ * `branchKey` is what the poller writes back to `lastBranchKey`, so all three
+ * (poller tracker, `dbRef.branchKey`, served index) stay in lockstep.
+ *
+ * (B) Never serve an EMPTY index: if `freshen` throws AND the new index was not
+ * seeded (no sibling / no legacy → a freshly-migrated empty Db with no nodes),
+ * we do NOT swap — we keep serving the OLD index, discard `next`, and warn. A
+ * seeded index (has content) or a successful freshen swaps as before. A later
+ * tick reconciles once the tree yields records.
+ *
+ * (C) Eviction safety: resolution protects BOTH `newKey` and the currently-
+ * served (old) branch key, so the still-open OLD branch dir is never the LRU
+ * victim mid-swap.
+ *
+ * No-op (returns the current path/key) when `newKey` is `null` — outside a git
+ * repo or with per-branch caching disabled, `activeBranchKey` is null and
+ * behavior is UNCHANGED. The swap runs entirely inside `runIngestExclusive`, so
+ * no ingest is mid-write when the db handle is replaced.
+ */
+export async function repointToBranch(deps: RepointDeps, newKey: string | null): Promise<RepointResult> {
+  const { dbRef, paths, config, logger, runIngestExclusive, freshen } = deps;
+  if (newKey === null) return { path: dbRef.path, branchKey: dbRef.branchKey };
+
+  return runIngestExclusive(async () => {
+    // Resolve FOR the DETECTED key (not a fresh HEAD read), protecting the
+    // still-open OLD served branch from eviction while we hold it (C).
+    const resolved = resolveWriteIndexForKey(paths, config, newKey, {
+      seed: true,
+      keepAlsoKey: dbRef.branchKey ?? undefined,
+    });
+    // If the resolver lands on the SAME file we already serve, there is nothing
+    // to swap (already on this branch). Reconcile `dbRef.branchKey` to the
+    // resolved key so the served holder + poller agree even in this no-op.
+    if (resolved.path === dbRef.path) {
+      dbRef.branchKey = resolved.branchKey;
+      return { path: dbRef.path, branchKey: resolved.branchKey };
+    }
+
+    const next = new Db(resolved.path);
+    next.migrate();
+    const seeded = resolved.seededFrom !== null;
+    let freshenOk = false;
+    try {
+      await freshen(next);
+      freshenOk = true;
+    } catch (err) {
+      logger.warn("watch: branch re-point freshen failed", {
+        branchKey: resolved.branchKey,
+        seeded,
+        error: (err as Error).message,
+      });
+    }
+
+    // (B) Only swap when the new index has real content: it freshened OK, OR it
+    // was seeded (from a sibling/legacy), OR — belt-and-suspenders — it happens
+    // to hold nodes already. If freshen failed on a NON-seeded (empty) index,
+    // keep serving the OLD index rather than swapping in an empty one.
+    const hasContent = freshenOk || seeded || next.counts().nodes > 0;
+    if (!hasContent) {
+      logger.warn(
+        "watch: branch re-point ABORTED — freshen failed on an empty (unseeded) index; " +
+          `keeping the current branch ${dbRef.branchKey ?? "(legacy)"} (${dbRef.path})`,
+        { detectedKey: newKey },
+      );
+      try {
+        next.close();
+      } catch (err) {
+        logger.warn("watch: closing discarded branch db failed (non-fatal)", {
+          error: (err as Error).message,
+        });
+      }
+      // Served index unchanged; report the still-served key so the poller
+      // reconciles `lastBranchKey` back to what is ACTUALLY served (a later tick
+      // re-attempts once the tree yields records).
+      return { path: dbRef.path, branchKey: dbRef.branchKey };
+    }
+
+    const old = dbRef.current;
+    // SWAP — subsequent requests + ingests resolve through `dbRef.current`.
+    dbRef.current = next;
+    dbRef.path = resolved.path;
+    dbRef.branchKey = resolved.branchKey;
+    try {
+      old.close();
+    } catch (err) {
+      logger.warn("watch: closing previous branch db failed (non-fatal)", {
+        error: (err as Error).message,
+      });
+    }
+
+    logger.info(`watch: re-pointed to branch ${resolved.branchKey ?? "(legacy)"} (${resolved.path})`);
+    return { path: resolved.path, branchKey: resolved.branchKey };
+  });
+}
+
 const DAEMON_USAGE = `hayven daemon <subcommand>
 
   start                    Start the daemon (foreground). Serves the cwd project
@@ -51,6 +235,8 @@ const DAEMON_USAGE = `hayven daemon <subcommand>
                            the primary's bind address.
   stop                     Send SIGTERM to the running daemon (via its pidfile).
   status                   Report whether the daemon is running.
+  restart                  Alias for stop + start.
+  logs                     Tail the daemon logs.
   register [<path>]        Register a project so the daemon serves it. Defaults
                            to the cwd project. --alias <x> names it.
   projects                 List registered projects (alias → root). --json for JSON.
@@ -203,19 +389,41 @@ async function startDaemon(args: ParsedArgs): Promise<number> {
   }
 
   /**
-   * Build the full per-project runtime — everything scoped to ONE project: the
-   * served db, migration, CRDT state, the serialized ingest chain, and the
-   * native file watcher with its incremental re-ingest (+ Layer B verify gate +
-   * cross-file edge re-resolution). Returns the wired {@link ServerDependencies}
-   * for this project plus a bounded `shutdown`.
+   * Build the full per-project runtime — everything that is scoped to ONE
+   * project: the branch-resolved served db (behind a swappable {@link DbRef}),
+   * migration, CRDT state, the serialized ingest chain, the native file watcher
+   * with its incremental re-ingest (+ Layer B verify gate + cross-file edge
+   * re-resolution), and the live branch-re-point poller. Returns the wired
+   * {@link ServerDependencies} for this project plus a bounded `shutdown`.
    *
    * Does NOT build an Elysia app: the daemon builds ONE app over ALL projects.
    */
   function initProject(alias: string, paths: HayvenPaths, config: HayvenConfig): ProjectRuntime {
     const plog = logger.child(alias);
 
-    const db = new Db(paths.sqliteFile);
-    const migration = db.migrate();
+    // Open the BRANCH-RESOLVED index — the SAME index `init`/reindex write to and
+    // `openProjectDb` (the daemonless read path) reads from for the current branch.
+    // `resolveWriteIndex` mirrors `resolveReadIndex`'s branch resolution (via
+    // `activeBranchKey`), so trace coverage + graph nodes co-locate. Outside a git
+    // repo, or when per-branch caching is disabled, this returns the legacy index.
+    const resolvedIndex = resolveWriteIndex(paths, config);
+    plog.info("index resolved", {
+      path: resolvedIndex.path,
+      branchKey: resolvedIndex.branchKey,
+      usedFallback: resolvedIndex.usedFallback,
+    });
+
+    // The served db lives behind a mutable holder so LIVE branch re-pointing can
+    // SWAP it (the daemon following a `git checkout`). The facade rewires the
+    // route `db` to read `dbRef.current` at request time; the ingest closures
+    // read `dbRef.current` too, so post-swap ingests write the new branch's index.
+    const dbRef: DbRef = {
+      current: new Db(resolvedIndex.path),
+      path: resolvedIndex.path,
+      branchKey: resolvedIndex.branchKey,
+    };
+    let lastBranchKey: string | null = resolvedIndex.branchKey;
+    const migration = dbRef.current.migrate();
     if (migration.crdtCutover) {
       plog.warn(
         `crdt_migration: dropped legacy v0.0.1 SQL state (traces=${migration.crdtCutover.droppedObservations}, claims=${migration.crdtCutover.droppedClaims}) — pre-MVP, intentional per ARCHITECTURE.md §13.4`,
@@ -265,8 +473,12 @@ async function startDaemon(args: ParsedArgs): Promise<number> {
         jobs: config.parse_jobs,
         timeoutMs: config.ingest_timeout_seconds * 1000,
         logger: plog,
+        includeVendored: config.index?.includeVendored ?? false,
+        includeFixtures: config.index?.includeFixtures ?? false,
       });
-      return drainIngest({ db, nodesDir: paths.nodesDir, run, logger: plog, repoRoot: paths.repoRoot });
+      // Read the CURRENT served db so a post-swap ingest writes the new branch's
+      // index, not the one captured at startup.
+      return drainIngest({ db: dbRef.current, nodesDir: paths.nodesDir, run, logger: plog, repoRoot: paths.repoRoot });
     }
 
     const ingest: IngestController = {
@@ -287,130 +499,208 @@ async function startDaemon(args: ParsedArgs): Promise<number> {
         root: paths.repoRoot,
         debounceMs: 200,
         logger: plog.child("watch"),
-      onBatch: async (events: WatchEvent[]) => {
-        // Classify by kind so we reconcile deletes + renames, not just
-        // re-parse (review HIGH H3: deleted files used to linger in the index
-        // forever). A rename's `from` path is treated as a delete.
-        const changed = new Set<string>();
-        const deleted = new Set<string>();
-        for (const e of events) {
-          if (e.kind === "delete") {
-            deleted.add(e.file);
-          } else if (e.kind === "rename") {
-            changed.add(e.file);
-            if (e.from) deleted.add(e.from);
-          } else {
-            changed.add(e.file);
-          }
-        }
-        for (const f of changed) deleted.delete(f); // changed wins over a stale delete
-        plog.info("watch: incremental re-ingest", { changed: changed.size, deleted: deleted.size });
-        await runIngestExclusive(async () => {
-          // Purge stale rows for every affected file FIRST, so the re-parse is
-          // a true reconcile (handles entities removed from a modified file
-          // and files deleted outright), not an additive upsert. Also clear any
-          // prior Layer B verify-gate state for the affected files so a file
-          // that now passes loses its stale `merge_rejected` flag (§17.2).
-          for (const f of deleted) db.deleteNodesByFile(f);
-          for (const f of changed) db.deleteNodesByFile(f);
-          db.clearMergeState([...changed, ...deleted]);
-          if (changed.size === 0) return;
-          try {
-            const run = startParse({
-              binary: watcherBinary,
-              root: paths.repoRoot,
-              languages: config.parse_languages,
-              jobs: config.parse_jobs,
-              timeoutMs: config.ingest_timeout_seconds * 1000,
-              logger: plog.child("watch.parse"),
-              files: [...changed],
-            });
-            await drainIngest({ db, nodesDir: paths.nodesDir, run, logger: plog.child("watch.ingest"), repoRoot: paths.repoRoot });
-
-            // BL-10 (ARCHITECTURE.md §7 / §10 Q4): an incremental batch only
-            // resolves edges within the changed file set, so a caller in an
-            // UNCHANGED file that referenced a now-renamed/moved entity keeps a
-            // stale `?:<name>` edge. Re-run the §7 resolver against the WHOLE
-            // node set — a cheap in-memory pass — so cross-file callers pick up
-            // the new id immediately instead of waiting for the next full
-            // ingest. Idempotent and additive (it only rewrites `?:` edges).
-            try {
-              const fixed = reresolveAllEdges(db);
-              if (fixed > 0) {
-                plog.info("watch: re-resolved cross-file edges", { fixed });
-              }
-            } catch (rerr) {
-              plog.warn("watch: cross-file edge re-resolution failed (non-fatal)", {
-                error: (rerr as Error).message,
-              });
+        onBatch: async (events: WatchEvent[]) => {
+          // Classify by kind so we reconcile deletes + renames, not just
+          // re-parse (review HIGH H3: deleted files used to linger in the index
+          // forever). A rename's `from` path is treated as a delete.
+          const changed = new Set<string>();
+          const deleted = new Set<string>();
+          for (const e of events) {
+            if (e.kind === "delete") {
+              deleted.add(e.file);
+            } else if (e.kind === "rename") {
+              changed.add(e.file);
+              if (e.from) deleted.add(e.from);
+            } else {
+              changed.add(e.file);
             }
-
-            // Layer B (ARCHITECTURE.md §17.2): re-validate the affected files
-            // AFTER the merge is materialized into the read cache. This is
-            // advisory — the CRDT/op-log is never rolled back; a failure only
-            // raises a `merge_rejected` record and flags the rows so an agent
-            // can re-base. Hooked here (not before storage) because this is the
-            // narrowest point where an accepted merge has a known affected-file
-            // set; the API full-ingest path re-walks the whole repo and has no
-            // "merge" semantics, so it is deliberately not gated.
+          }
+          for (const f of changed) deleted.delete(f); // changed wins over a stale delete
+          plog.info("watch: incremental re-ingest", { changed: changed.size, deleted: deleted.size });
+          await runIngestExclusive(async () => {
+            // Snapshot the CURRENT served db. The swap is serialized through this
+            // same chain, so within one batch the db never changes underfoot; a
+            // post-swap batch writes the new branch's index.
+            const db = dbRef.current;
+            // Purge stale rows for every affected file FIRST, so the re-parse is
+            // a true reconcile (handles entities removed from a modified file
+            // and files deleted outright), not an additive upsert. Also clear any
+            // prior Layer B verify-gate state for the affected files so a file
+            // that now passes loses its stale `merge_rejected` flag (§17.2).
+            for (const f of deleted) db.deleteNodesByFile(f);
+            for (const f of changed) db.deleteNodesByFile(f);
+            db.clearMergeState([...changed, ...deleted]);
+            if (changed.size === 0) return;
             try {
-              const verify = await verifyMerge([...changed], {
+              const run = startParse({
+                binary: watcherBinary,
                 root: paths.repoRoot,
-                native: nativeParseRunner({
-                  binary: watcherBinary,
-                  root: paths.repoRoot,
-                  languages: config.parse_languages,
-                  jobs: config.parse_jobs,
-                  timeoutMs: config.ingest_timeout_seconds * 1000,
-                  logger: plog.child("verify.parse"),
-                }),
-                typecheck: defaultTypecheck({ root: paths.repoRoot, logger: plog.child("verify.type") }),
-                logger: plog.child("verify"),
+                languages: config.parse_languages,
+                jobs: config.parse_jobs,
+                timeoutMs: config.ingest_timeout_seconds * 1000,
+                logger: plog.child("watch.parse"),
+                files: [...changed],
               });
-              if (!verify.ok) {
-                db.recordMergeRejections(
-                  verify.failures.map((f) => ({
-                    file: f.file,
-                    phase: f.phase,
-                    language: f.language,
-                    reason: f.reason,
-                    detected_at: f.detectedAt,
-                  })),
-                );
-                plog.warn("verify: merge_rejected — flagged in read cache (CRDT NOT rolled back)", {
-                  failures: verify.failures.length,
-                  files: [...new Set(verify.failures.map((f) => f.file))],
+              await drainIngest({ db, nodesDir: paths.nodesDir, run, logger: plog.child("watch.ingest"), repoRoot: paths.repoRoot });
+
+              // BL-10 (ARCHITECTURE.md §7 / §10 Q4): an incremental batch only
+              // resolves edges within the changed file set, so a caller in an
+              // UNCHANGED file that referenced a now-renamed/moved entity keeps a
+              // stale `?:<name>` edge. Re-run the §7 resolver against the WHOLE
+              // node set — a cheap in-memory pass — so cross-file callers pick up
+              // the new id immediately instead of waiting for the next full
+              // ingest. Idempotent and additive (it only rewrites `?:` edges).
+              try {
+                const fixed = reresolveAllEdges(db, paths.repoRoot);
+                if (fixed > 0) {
+                  plog.info("watch: re-resolved cross-file edges", { fixed });
+                }
+              } catch (rerr) {
+                plog.warn("watch: cross-file edge re-resolution failed (non-fatal)", {
+                  error: (rerr as Error).message,
                 });
               }
-            } catch (verr) {
-              // The gate is advisory; a gate error must never break ingest.
-              plog.warn("verify: gate errored — skipping (merge already materialized)", {
-                error: (verr as Error).message,
-              });
+
+              // Layer B (ARCHITECTURE.md §17.2): re-validate the affected files
+              // AFTER the merge is materialized into the read cache. This is
+              // advisory — the CRDT/op-log is never rolled back; a failure only
+              // raises a `merge_rejected` record and flags the rows so an agent
+              // can re-base. Hooked here (not before storage) because this is the
+              // narrowest point where an accepted merge has a known affected-file
+              // set; the API full-ingest path re-walks the whole repo and has no
+              // "merge" semantics, so it is deliberately not gated.
+              try {
+                const verify = await verifyMerge([...changed], {
+                  root: paths.repoRoot,
+                  native: nativeParseRunner({
+                    binary: watcherBinary,
+                    root: paths.repoRoot,
+                    languages: config.parse_languages,
+                    jobs: config.parse_jobs,
+                    timeoutMs: config.ingest_timeout_seconds * 1000,
+                    logger: plog.child("verify.parse"),
+                  }),
+                  typecheck: defaultTypecheck({ root: paths.repoRoot, logger: plog.child("verify.type") }),
+                  logger: plog.child("verify"),
+                });
+                if (!verify.ok) {
+                  db.recordMergeRejections(
+                    verify.failures.map((f) => ({
+                      file: f.file,
+                      phase: f.phase,
+                      language: f.language,
+                      reason: f.reason,
+                      detected_at: f.detectedAt,
+                    })),
+                  );
+                  plog.warn("verify: merge_rejected — flagged in read cache (CRDT NOT rolled back)", {
+                    failures: verify.failures.length,
+                    files: [...new Set(verify.failures.map((f) => f.file))],
+                  });
+                }
+              } catch (verr) {
+                // The gate is advisory; a gate error must never break ingest.
+                plog.warn("verify: gate errored — skipping (merge already materialized)", {
+                  error: (verr as Error).message,
+                });
+              }
+            } catch (err) {
+              plog.warn("watch: incremental re-ingest failed", { error: (err as Error).message });
             }
+          });
+        },
+        onOverflow: async ({ dropped, sinceMs }) => {
+          plog.warn("watch: overflow — full re-ingest", { dropped, sinceMs });
+          try {
+            await runIngestExclusive(fullIngest);
           } catch (err) {
-            plog.warn("watch: incremental re-ingest failed", { error: (err as Error).message });
+            plog.warn("watch: full re-ingest after overflow failed", { error: (err as Error).message });
           }
-        });
-      },
-      onOverflow: async ({ dropped, sinceMs }) => {
-        plog.warn("watch: overflow — full re-ingest", { dropped, sinceMs });
-        try {
-          await runIngestExclusive(fullIngest);
-        } catch (err) {
-          plog.warn("watch: full re-ingest after overflow failed", { error: (err as Error).message });
-        }
-      },
+        },
       });
     } else {
       plog.warn("hayven-native binary not found — file watcher disabled");
     }
 
-    // Build this project's request deps. buildMultiProjectApp reads them through
-    // its per-request facade; wireBranchAwareDb is a no-op unless a `dbRef`
-    // holder is supplied (this leaner build serves a fixed per-project db).
+    // LIVE branch re-pointing poller. The native watcher does NOT reliably see
+    // `.git/HEAD`, so detect a `git checkout` by POLLING the active branch key.
+    // When it changes, re-point the served db to the new branch's index (seeded +
+    // freshened), serialized through the SAME ingest chain so no ingest is
+    // mid-write during the swap. Outside a git repo / with per-branch caching
+    // disabled, `activeBranchKey` is null and nothing re-points (UNCHANGED).
+    const repointDeps: RepointDeps = {
+      dbRef,
+      paths,
+      config,
+      logger: plog,
+      runIngestExclusive,
+      // Freshen the NEW branch db with a full reconcile so it reflects the
+      // branch's current code. Reuses the existing parse→drainIngest path against
+      // the passed (new) db. We are already inside `runIngestExclusive`, so this
+      // calls `drainIngest` directly rather than re-entering the chain.
+      freshen: async (freshDb: Db) => {
+        const binary = locateNativeBinary({ repoRoot: paths.repoRoot });
+        const run = startParse({
+          binary,
+          root: paths.repoRoot,
+          languages: config.parse_languages,
+          jobs: config.parse_jobs,
+          timeoutMs: config.ingest_timeout_seconds * 1000,
+          logger: plog.child("watch.repoint"),
+          includeVendored: config.index?.includeVendored ?? false,
+          includeFixtures: config.index?.includeFixtures ?? false,
+        });
+        await drainIngest({
+          db: freshDb,
+          nodesDir: paths.nodesDir,
+          run,
+          logger: plog.child("watch.repoint"),
+          repoRoot: paths.repoRoot,
+        });
+      },
+    };
+    let repointing = false;
+    const branchPoll = setInterval(() => {
+      // Skip while a prior re-point is still resolving (poll faster than a full
+      // freshen ingest takes). `activeBranchKey` is a cheap one-file fs read.
+      if (repointing) return;
+      let currentKey: string | null;
+      try {
+        currentKey = activeBranchKey(paths, config);
+      } catch (err) {
+        plog.warn("watch: branch poll failed (non-fatal)", { error: (err as Error).message });
+        return;
+      }
+      if (currentKey === lastBranchKey) return;
+      const from = lastBranchKey;
+      lastBranchKey = currentKey; // claim the transition so we don't double-fire
+      repointing = true;
+      plog.info("watch: branch change detected", { from, to: currentKey });
+      void repointToBranch(repointDeps, currentKey)
+        .then((result) => {
+          // (A) Reconcile `lastBranchKey` to the key that was ACTUALLY swapped in
+          // (or is still served, if the swap was aborted/no-op), so the poller's
+          // transition tracker, `dbRef.branchKey`, and the served index all agree
+          // on ONE key. Prevents desync / flip-flop when the resolved-or-served
+          // key differs from the detected one.
+          lastBranchKey = result.branchKey;
+        })
+        .catch((err) => {
+          plog.warn("watch: branch re-point failed", { error: (err as Error).message });
+        })
+        .finally(() => {
+          repointing = false;
+        });
+    }, BRANCH_POLL_INTERVAL_MS);
+    // Don't let the poll timer keep the event loop alive on its own.
+    if (typeof branchPoll.unref === "function") branchPoll.unref();
+
+    // Build this project's request deps and rewire `deps.db` → `dbRef.current`
+    // at request time. buildMultiProjectApp passes branchAwareDb:false, so it
+    // will NOT wire this for us — we must call wireBranchAwareDb ourselves.
     const deps: ServerDependencies = {
-      db,
+      db: dbRef.current,
+      dbRef,
       config,
       paths,
       logger: plog,
@@ -424,12 +714,16 @@ async function startDaemon(args: ParsedArgs): Promise<number> {
     wireBranchAwareDb(deps);
 
     const shutdown = async (): Promise<void> => {
+      clearInterval(branchPoll);
       if (watcher) await watcher.stop();
-      // Let any in-flight ingest finish writing before we close the db — closing
-      // under a live write is a use-after-close.
-      await ingestChain.catch(() => undefined);
+      // Let any in-flight ingest/re-point finish writing before we close the db
+      // (bounded) — closing under a live write is a use-after-close.
+      const drain = await drainIngestChain(ingestChain, SHUTDOWN_DRAIN_MS);
+      if (drain === "timeout") {
+        plog.warn("shutdown: ingest still in flight after drain timeout; closing anyway");
+      }
       crdt.close();
-      db.close();
+      dbRef.current.close();
     };
 
     return { alias, deps, shutdown };

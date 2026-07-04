@@ -58,6 +58,96 @@ const tracer = await hayvenTrace.startFromEnv();
 // returns null (no-op) unless HAYVEN_TRACE is truthy
 ```
 
+### vitest (per-test coverage — the first-class test-suite entry)
+
+The parity answer to `pytest -p hayven_trace`: a setup entry that traces the
+suite **fork-safely under vitest's default parallelism** and emits **per-test
+coverage** (the daemon's `test_coverage` rows, enabling the precise `observed`
+tier in `hayven affected-tests`).
+
+```ts
+// vitest.config.ts
+export default defineConfig({
+  test: {
+    setupFiles: ["@hayvenhurst/trace-bun/vitest"], // or a path to trace/bun/vitest.ts
+  },
+});
+```
+
+```sh
+HAYVEN_TRACE=1 vitest run     # opt-in per run; default parallel forks are fine
+```
+
+What it does per worker (details in `src/vitest_core.ts`):
+
+- **Fork-safe profiler lifecycle.** The profiler + inspector session live ONLY
+  while a test file executes: `beforeAll` installs, `afterAll` fully uninstalls
+  (stop, disable, disconnect, flush). Idle pooled forks hold no live profiler.
+  Additionally `install()` **pre-warms OpenSSL's lock-guarded caches**
+  (`src/prewarm.ts`) before starting the profiler — first-use crypto under a
+  live SIGPROF storm deadlocks Node 25's namemap writer against its background
+  CA-certificate loader (root-caused on hono; the wedge that used to hang
+  `HAYVEN_TRACE=1 vitest` with default parallel forks).
+- **Per-test-file attribution.** `beforeEach` tags the tracer's coverage
+  context with the current test FILE's path-qualified module id
+  (`src/utils/body.test`); every harvested profile window attributes the
+  entities it executed to that context. Attribution is by **window boundary,
+  not stack frame**, so it works even though `it()` callbacks are anonymous
+  frames the profiler cannot name. Granularity is the test file — exactly the
+  unit vitest can re-run (`vitest run <file>`), and exactly the daemon's
+  vitest runnable.
+- **Test-suite sampling density.** Defaults `samplingIntervalUs` to `100`
+  (fast unit tests are invisible at the library's 1 ms default);
+  `HAYVEN_TRACE_SAMPLING_US` overrides.
+
+Measured on honojs/hono (121 files / 3,638 tests, default parallel forks):
+traced suite ~8–9.5 s vs 7.1 s untraced, 8/8 runs completed, zero wedges, zero
+zombie forks. (Known suite flake under profiling: hono's
+`logger > "Time in seconds"` asserts a ~1 s elapsed log and sits right on the
+boundary.)
+
+### bun:test (per-test coverage under Bun's NATIVE runner)
+
+The same feature for suites that run under `bun test` (not vitest) — a
+`--preload` entry, opt-in per run via `HAYVEN_TRACE=1`:
+
+```sh
+HAYVEN_TRACE=1 bun test --preload @hayvenhurst/trace-bun/bun-test
+# or by path: --preload /path/to/trace/bun/bun-test.ts
+```
+
+or persistently in the consumer's `bunfig.toml` (still env-gated):
+
+```toml
+[test]
+preload = ["@hayvenhurst/trace-bun/bun-test"]
+```
+
+How it maps onto bun:test's process model (probed empirically, Bun 1.3.13 —
+details in `bun-test.ts` / `src/test_driver.ts`):
+
+- **Single process, sequential files, run-scoped preload hooks.** `bun test`
+  executes every file in ONE process; preload `beforeAll`/`afterAll` fire once
+  per RUN. So the adapter holds one profiler window for the whole run — there
+  is no parallel forks pool, hence no idle-fork wedge class to defend against
+  (the vitest P0 does not exist here). The OpenSSL prewarm still runs before
+  `Profiler.start` as cheap defense-in-depth (the Node-25 deadlock it defuses
+  is Node-specific; Bun's crypto is BoringSSL-backed).
+- **Per-test-FILE attribution via `Bun.main`.** `beforeEach` reads the current
+  test file from `Bun.main` (bun re-points it at each file as the run
+  advances) and flips the coverage context, harvesting the pending profile
+  window FIRST so samples attribute to the file that produced them. Same
+  window-boundary model as the vitest entry; same `test_coverage` wire rows;
+  the daemon needs no changes.
+- **Granularity is the test file** (parity with vitest). Per-`it()`
+  attribution is not reachable: preload `beforeEach` receives no
+  arguments/`this` and Bun has no `expect.getState()`, so the test NAME is
+  never exposed — and file selection is bun test's own re-run granularity
+  anyway (`bun test <path>`), matching `hayven affected-tests --runner bun`.
+- Running from a monorepo **subdirectory** (e.g. `apps/api`)? Set
+  `HAYVEN_TRACE_MODULE_ROOT=/repo/root` so module hints and coverage contexts
+  stay repo-root-relative (what the daemon's index expects).
+
 ### Environment variables
 
 | Env var                 | Default                  | Notes |
@@ -67,6 +157,8 @@ const tracer = await hayvenTrace.startFromEnv();
 | `HAYVEN_TRACE_INTERVAL` | `30`                     | Flush + re-profile cadence, seconds. |
 | `HAYVEN_TRACE_PROJECT`  | (empty)                  | `:`-separated path / module-id prefixes to scope which frames are kept. Empty drops `node_modules` / `node:` / `bun:` internal frames by default. |
 | `HAYVEN_TRACE_RATE`     | `1`                      | Envelope `sample_rate`. **Stays `1` in the CPU-profiler model** (see below); honored only if you wire a true 1-in-N call hook upstream. |
+| `HAYVEN_TRACE_SAMPLING_US` | `1000` (`100` under the vitest entry) | V8 sampling interval in **µs**. Fast unit suites need `100` for usable edge density (measured on hono: 3 → 22 edges on the same file). Also exposed as `start({ samplingIntervalUs })`. |
+| `HAYVEN_TRACE_MODULE_ROOT` | `process.cwd()`       | Repo root for **path-qualified module hints** (`src/utils/body:parseBody` instead of `body:parseBody`). Set to the empty string to disable. |
 
 ## Capture model — V8 CPU profiler
 
@@ -169,18 +261,56 @@ This payload shape was confirmed end-to-end against a live daemon (HTTP 200,
 `{"ok":true,"accepted":1,"source":"bun","sample_rate":1}`), with a deliberate
 weight mismatch correctly rejected (HTTP 400).
 
+### Per-test coverage (`test_coverage`, additive)
+
+When a coverage context is active (the vitest entry sets it per test file), the
+flusher also emits the daemon's **additive** `test_coverage` array — the exact
+wire shape trace/python's pytest plugin sends:
+
+```json
+{
+  "source": "bun",
+  "sample_rate": 1,
+  "observations": [ … ],
+  "test_coverage": [
+    { "test": "src/utils/body.test", "entity": "src/utils/body:parseBody", "weight": 6 }
+  ]
+}
+```
+
+- `test` — the test context's runtime name. For vitest this is the **test
+  file's path-qualified module id** (vitest runs by file; `it()` callbacks are
+  anonymous and have no graph node to resolve to).
+- `entity` — a runtime name the test's execution reached (same shape as
+  `src`/`dst`); `weight` — accumulated sample count (advisory, NOT
+  sample-rate-scaled — coverage is not subject to the `weight` invariant).
+- The key is **omitted entirely** when there is nothing to report, so edge-only
+  batches stay byte-identical to the legacy shape. A coverage-only chunk sends
+  `observations: []`, which the daemon accepts.
+- Flushes are split into **bounded chunks** (1,000 rows per POST, mirroring
+  trace/python's `FLUSH_BATCH_SIZE` fix); a failed chunk is **re-buffered** and
+  retried on the next flush rather than dropped.
+
 ## Entity-id resolution
 
 **What this collector emits.** `src`/`dst` are runtime names in the form
 `<module>:<functionName>`, derived from each profile node's call frame:
 
-- `<module>` is the source file's basename without extension
-  (`auth.ts` → `auth`), decoded from the frame's `url`.
+- `<module>` is **path-qualified** when the frame's file lives under
+  `moduleRoot` (default `process.cwd()`): the repo-relative path without
+  extension (`src/auth/session.ts` → `src/auth/session`). Frames outside the
+  root (and when `moduleRoot` is disabled) fall back to the basename
+  (`auth.ts` → `auth`). Path qualification exists because basename-only hints
+  are near-useless in idiomatic TS — hono has 5 `router.ts` and dozens of
+  `index.ts`, and 69 of its 102 unresolved runtime names were ambiguous purely
+  for lack of a disambiguating hint. The daemon's resolver scores module-hint
+  segments against entity-id paths, so the extra segments strictly ADD signal.
 - `<functionName>` is V8's `callFrame.functionName`. V8 already qualifies
   methods as `Class.method` / `obj.method`, so a method shows up as
-  `auth:Session.login` and a bare function as `db:getUser`.
+  `src/auth/session:Session.login` and a bare function as `src/db:getUser`.
 
-This mirrors the Python collector's `<module>:<qualname>` shape.
+This mirrors the Python collector's `<module>:<qualname>` shape (dotted package
+path as the module hint).
 
 **How the daemon resolves them.** The daemon maps each runtime name to an
 indexed graph-entity id (`<scope>/<module>/<qualified_name>`) **conservatively**:
@@ -229,18 +359,23 @@ cost. Edge derivation runs once per flush window, off the hot path.
 | File                | Responsibility |
 |---------------------|----------------|
 | `index.ts`          | Public API: `start` / `stop` / `startFromEnv` / `isActive`, re-exports. |
-| `src/aggregator.ts` | `Aggregator`: `(src,dst,kind)` counts, atomic `drain()` reset. |
-| `src/profile.ts`    | `deriveEdges`: pure V8-CPU-profile-tree → edge derivation (the unit-testable core), `UINT16_MAX`. |
-| `src/names.ts`      | `makeResolver`: frame → `<module>:<fn>` id + scoping/filter rules. |
-| `src/flusher.ts`    | `Flusher` + `encodePayload`: background interval, JSON wire encode, injectable `Sender`, graceful no-op. |
-| `src/tracer.ts`     | `HayvenTracer`: drives the `node:inspector` CPU profiler, per-window harvest, lifecycle. |
+| `vitest.ts`         | The vitest setup entry (`@hayvenhurst/trace-bun/vitest`): thin adapter wiring `beforeAll`/`beforeEach`/`afterAll` to the driver. |
+| `bun-test.ts`       | The `bun test --preload` entry (`@hayvenhurst/trace-bun/bun-test`): thin adapter wiring bun:test's run-scoped preload hooks (+ `Bun.main` file tracking) to the same driver. |
+| `src/aggregator.ts` | `Aggregator`: `(src,dst,kind)` counts; `CoverageAggregator`: `(test,entity)` cells; atomic `drain()` resets. |
+| `src/profile.ts`    | `deriveEdges` + `deriveCoverage`: pure V8-CPU-profile-tree → edges / covered entities (the unit-testable core), `UINT16_MAX`. |
+| `src/names.ts`      | `makeResolver`: frame → `<module>:<fn>` id (path-qualified under `moduleRoot`) + scoping/filter rules; `moduleIdOf`. |
+| `src/flusher.ts`    | `Flusher` + `encodePayload`: background interval, JSON wire encode (+`test_coverage`), bounded chunks, re-buffer on failure, injectable `Sender`. |
+| `src/tracer.ts`     | `HayvenTracer`: drives the `node:inspector` CPU profiler, per-window harvest, coverage context, lifecycle. |
+| `src/prewarm.ts`    | OpenSSL cache pre-warm before `Profiler.start` (prevents the SIGPROF × first-use-crypto deadlock — the parallel-forks wedge). |
+| `src/test_driver.ts`| `TestTraceDriver` + suite-tuned config: the runner-agnostic integration logic both adapters share (install window, harvest-on-context-change attribution). |
+| `src/vitest_core.ts`| The vitest-named surface (`VitestTraceDriver` etc., re-exported from `test_driver.ts`) + the vitest-specific fork-safety rationale. |
 | `src/env.ts`        | `configFromEnv` / `isEnabled` from `HAYVEN_TRACE_*`. |
 
 ## Test
 
 ```sh
 cd trace/bun
-bun test          # 32 tests
+bun test          # 60 tests
 bunx tsc --noEmit # type check
 ```
 

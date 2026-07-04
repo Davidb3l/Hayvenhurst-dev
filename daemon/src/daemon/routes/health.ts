@@ -16,6 +16,13 @@ export function healthRoutes(deps: ServerDependencies) {
     // port 7777, so without an identity check a foreign repo's daemon on the
     // same port would be silently mutated.
     root: deps.paths.repoRoot,
+    // LIVE branch re-pointing: the branch key + index path the daemon CURRENTLY
+    // serves, read through the swappable holder so it reflects a `git checkout`
+    // the daemon followed mid-run. `null`/`branch_path` absent when no holder is
+    // wired (no per-branch caching / one-shot callers). A client can compare
+    // `branch` against its own `git` branch to confirm the daemon is in sync.
+    branch: deps.dbRef ? deps.dbRef.branchKey : null,
+    branch_path: deps.dbRef ? deps.dbRef.path : null,
     // Multi-project: the default project's alias + every project this daemon
     // serves. Absent (undefined → omitted from JSON) for a single-project
     // daemon, so the viewer's switcher stays hidden and old clients are

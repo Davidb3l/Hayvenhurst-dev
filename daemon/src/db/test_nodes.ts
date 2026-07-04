@@ -36,6 +36,11 @@ export interface TestCandidate {
   name: string;
   file: string | null;
   language?: string | null;
+  /** Node kind (`function`/`method`/`module`/…). A `module` node is the test
+   *  FILE, not a `::`-addressable test — its runnable is the file, never
+   *  `file::<module-name>` (which no runner can collect). Optional so existing
+   *  callers keep working; absent = treated as a non-module symbol. */
+  kind?: string | null;
 }
 
 /** Inferred test runner for a candidate. */
@@ -261,6 +266,33 @@ function qualnameLeaf(name: string): string {
 }
 
 /**
+ * True when `file` is a file pytest's DEFAULT collection would discover as a
+ * test module: basename `test_*.py` or `*_test.py` (pytest's default
+ * `python_files`). This is deliberately a LANGUAGE FACT, not project policy, so
+ * it is NOT driven by the configurable `test.patterns` (which control test
+ * *detection*, i.e. what counts as a test node — a wider net by design).
+ *
+ * WHY (the MEASURED bug, bench/requests-ci-RESULTS.md "Product gap found"):
+ * detection's wide net legitimately classifies nodes in `tests/conftest.py`
+ * and `tests/testserver/server.py` as test nodes (they live under `/tests/`,
+ * the impact walk reaches them), but pytest cannot RUN them —
+ * `tests/testserver/server.py::Server::run` → "not found", exit 4, ZERO tests
+ * executed; a bare `tests/conftest.py` arg collects nothing. Such nodes stay in
+ * the affected set as graph EVIDENCE (`runnable: null`), they just stop being
+ * run targets.
+ *
+ * Residual honesty note: a repo with a CUSTOM `python_files` ini wider than the
+ * default would have its extra test modules nulled here — the CI recipe's
+ * `--collect-only` intersection + full-suite fallbacks are the safety net for
+ * that (docs/CI_AFFECTED_TESTS.md).
+ */
+export function isPytestCollectableFile(file: string): boolean {
+  const norm = normalizePath(file);
+  const base = norm.slice(norm.lastIndexOf("/") + 1);
+  return /^test_.*\.py$/.test(base) || /^.+_test\.py$/.test(base);
+}
+
+/**
  * True when a pytest candidate is a REAL, pytest-COLLECTABLE test — i.e. a
  * module-level `test_*` function or a `test_*` method of a `Test*` class — and
  * NOT a function defined *inside* another function (a nested local), which
@@ -303,10 +335,31 @@ function qualnameLeaf(name: string): string {
  *      was observed polluting the list); a real test is `test_*` or a `Test*`
  *      method, never a lone `test`.
  *
- * Conservatism (the explicit design bias): when NONE of these fire we KEEP the
- * runnable. A plain top-level `test_echo` and a class method `TestFoo.test_echo`
- * are both collectable and unaffected. We only ever NULL on a positive nesting
- * signal, so we cannot drop a real test the impact walk legitimately reached.
+ *   4. POSITIVE collection shape (the requests-measured fix,
+ *      bench/requests-ci-RESULTS.md "Product gap found"): the id must mirror
+ *      what pytest's DEFAULT collection actually discovers —
+ *        - the file is a pytest test module (`test_*.py` / `*_test.py`,
+ *          {@link isPytestCollectableFile}) — excludes `conftest.py`,
+ *          `tests/testserver/server.py`, …;
+ *        - the LEAF is `test`-prefixed (pytest's default `python_functions`
+ *          prefix, so `test_x` AND `testX` both keep working) OR is itself a
+ *          `Test*` class name (a `file::TestClass` arg pytest collects whole);
+ *        - a dotted `Class.method` qualname requires a `Test*`-NAMED class
+ *          (pytest's default `python_classes`), not merely PascalCase — a
+ *          helper class in a test file (`RedirectSession.send`) and a non-test
+ *          method on a real test class (`TestRequests.build_response`) are
+ *          both "not found" to pytest and MUST NOT be emitted as run targets.
+ *      Checks 1–3 null on positive NESTING signals; check 4 additionally
+ *      requires the id to be positively test-shaped, because the measured
+ *      failure mode was helper callables that carried no nesting signal at all
+ *      (they aborted real CI runs with exit 4 and ZERO tests executed).
+ *
+ * A nulled runnable never DELETES information: the node stays in the affected
+ * set as graph evidence (`runnable: null`), it just stops being a run target.
+ * Residual honesty note: a `unittest.TestCase` subclass NOT named `Test*` (or a
+ * custom `python_classes`/`python_functions` ini) is collectable to pytest but
+ * invisible to this name-only predicate — those runnables are nulled; the CI
+ * recipe's full-suite fallbacks cover them (docs/CI_AFFECTED_TESTS.md).
  *
  * Only pytest distinguishes collectable-by-node-id; vitest/jest/go/cargo select
  * by FILE, so this predicate is pytest-scoped and returns `true` for the others
@@ -317,6 +370,10 @@ export function isCollectableTest(candidate: TestCandidate): boolean {
   if (runner !== "pytest") return true; // non-pytest runners select by file.
 
   const { name, id } = candidate;
+
+  // (4a) Only a pytest test MODULE yields node-id-runnable tests. conftest.py /
+  // testserver helpers are evidence, never run targets.
+  if (candidate.file !== null && !isPytestCollectableFile(candidate.file)) return false;
 
   // (1) CPython nested-scope marker — definitive, in either field.
   if (name.includes(".<locals>.") || id.includes(".<locals>.")) return false;
@@ -329,36 +386,88 @@ export function isCollectableTest(candidate: TestCandidate): boolean {
   // (3) A bare `test` leaf is not a collectable pytest test.
   if (qualnameLeaf(name) === "test" || qualnameLeaf(idTail) === "test") return false;
 
-  // (2) A dotted qualname qualified by a non-`Test*`-class head is nested.
+  // (2) A dotted qualname qualified by a non-`Test*`-class head is nested (a
+  // function-scoped local) — and per (4c) a merely-PascalCase HELPER class
+  // (`RedirectSession`) is not a pytest class either: the head must be
+  // `Test*`-named, mirroring pytest's default `python_classes`.
   for (const qual of name === idTail ? [name] : [name, idTail]) {
     const dot = qual.lastIndexOf(".");
-    if (dot <= 0) continue; // bare leaf — top-level, collectable.
+    if (dot <= 0) continue; // bare leaf — top-level; leaf shape checked in (4b).
     // The class candidate is the LAST head segment (`pkg.TestFoo` → `TestFoo`).
     const head = qual.slice(0, dot);
     const headLeaf = head.includes(".") ? head.slice(head.lastIndexOf(".") + 1) : head;
     if (!isPascalCase(headLeaf)) return false; // function-qualified ⇒ nested.
+    if (!/^Test/.test(headLeaf)) return false; // helper class ⇒ pytest won't collect it.
   }
+
+  // (4b) The LEAF itself must be test-shaped: a `test`-prefixed function/method
+  // (pytest's default `python_functions` prefix) or a `Test*` class node (a
+  // whole-class run target). `TestRequests.build_response` fails here — the
+  // class is real but the METHOD is not a test, so pytest reports "not found".
+  const qual = name.includes(".") ? name : idTail.includes(".") ? idTail : name;
+  const leaf = qualnameLeaf(qual);
+  if (!/^test/.test(leaf) && !/^Test/.test(leaf)) return false;
 
   return true;
 }
 
 /**
- * Derive the pytest runnable node id from a `file` + entity `name`. pytest
- * selects by node id `file::func`; for a method named `Class.method` whose class
- * is PascalCase (a real test class, not a `module.func` qualifier) it wants
- * `file::Class::method`. We split on the LAST `.` to get the method and the
- * segment before it as the class.
+ * Derive the pytest runnable node id from a `file` + entity `name` + node `id`.
+ * pytest selects by node id `file::func`; for a method of a `Test*` class it wants
+ * `file::Class::method`.
+ *
+ * The class qualifier is recovered from the richest qualname available: a dotted
+ * `name` (`TestFoo.test_x`) when the parser carried it, ELSE the id's local tail
+ * (`<scope>/<module>/<qualname>` → `TestRequests.test_content_…`). The fallback is
+ * load-bearing for CLASS-BASED test suites (unittest-style `class TestX:` — common
+ * in requests/Django): there the node `name` is just the BARE method, so a
+ * name-only derivation emitted `file::test_x` (MISSING the class), which pytest
+ * cannot collect — the test silently never runs (a real product bug + a spurious
+ * affected-tests "miss"). We take the LAST head segment as the class and emit the
+ * `Class::method` form only when it's PascalCase (a real class, not a `module.`
+ * namespace).
  */
-function pytestRunnable(file: string, name: string): string {
-  const dot = name.lastIndexOf(".");
+function pytestRunnable(file: string, name: string, id: string): string {
+  const idTail = id.includes("/") ? id.slice(id.lastIndexOf("/") + 1) : id;
+  // Prefer a dotted `name`; fall back to the dotted id tail (carries the class
+  // when `name` is the bare method).
+  const qual = name.includes(".") ? name : idTail.includes(".") ? idTail : name;
+  const dot = qual.lastIndexOf(".");
   if (dot > 0) {
-    const cls = name.slice(0, dot);
-    const method = name.slice(dot + 1);
-    // Only emit the Class::method form for a PascalCase class — a lowercase
-    // qualifier (e.g. `module.test_x`) is a namespace, not a pytest class.
+    const head = qual.slice(0, dot);
+    const method = qual.slice(dot + 1);
+    // The class is the LAST head segment (`pkg.TestFoo` → `TestFoo`); emit the
+    // Class::method form only for a PascalCase class, not a lowercase namespace.
+    const cls = head.includes(".") ? head.slice(head.lastIndexOf(".") + 1) : head;
     if (isPascalCase(cls)) return `${file}::${cls}::${method}`;
   }
   return `${file}::${name}`;
+}
+
+/**
+ * Derive the `go test` runnable handle from a `file` + entity `name`.
+ *
+ * WHY this exists (the MEASURED gap, bench/affected-tests-RESULTS.md "Go"): until
+ * now a Go test node's runnable was just its FILE (`command_test.go`), so the
+ * agent had no way to run the ONE affected test — it had to run the whole file.
+ * Go's per-test coverage (trace/go/coverage.go) now gives a high-precision
+ * `observed` tier; this makes that tier ACTIONABLE by emitting a `-run`-shaped
+ * handle so the agent can run exactly the affected test.
+ *
+ * Form (mirrors pytest's `file::func`, kept parseable): `file::TestName`, where
+ * `TestName` is the test FUNCTION name a `go test -run '^TestName$'` would select.
+ * The graph `name` is the bare function (`TestExecute`) for a top-level test, or a
+ * receiver-qualified `(*Suite).TestThing` for a method — we take the leaf via
+ * {@link qualnameLeaf} (after stripping a receiver group) so the `-run` target is
+ * the actual test symbol. When the name isn't a Go test shape (a reached helper in
+ * a `_test.go` file), we keep the FILE handle — `go test` selects that helper's
+ * package by file, and there is no single `-run` target for it.
+ */
+function goRunnable(file: string, name: string): string {
+  const leaf = qualnameLeaf(name);
+  // Only emit the per-test `-run` handle for a real Go test function name; a
+  // reached non-test helper has no `-run` target, so the file remains its handle.
+  return isGoName(leaf) ? `${file}::${leaf}` : file;
 }
 
 /**
@@ -384,14 +493,46 @@ export function classifyTest(
   let runnable: string | null;
   if (file === null) {
     runnable = null; // no file → nothing runnable, even for a name-only test
+  } else if (candidate.kind === "module") {
+    // A MODULE node is the test FILE, not a `::`-addressable test. Its name is
+    // the module stem (`test_http`), so the naive pytest handle would be
+    // `tests/test_http.py::test_http` — which pytest reports "not found" and,
+    // fatally, aborts an ENTIRE `pytest <ids…>` run when passed alongside real
+    // tests (measured: it silently zero'd a 170-test affected set). Run the file
+    // instead — valid for pytest AND the file-selecting runners. For pytest the
+    // file must ITSELF be a collectable test module: a `tests/conftest.py` /
+    // `tests/testserver/server.py` module node is graph evidence, not a run
+    // target (the requests-measured bare-file-path bug — bench/requests-ci-
+    // RESULTS.md "Product gap found" class 2).
+    runnable = runner === "pytest" && !isPytestCollectableFile(file) ? null : file;
   } else if (runner === "pytest") {
-    // A NESTED function (a callback / helper defined inside a real test) is a
-    // test-FILE node the impact walk reached, but pytest cannot collect it by
-    // node id (`file::cmd` → "not found", aborting a naive run). Keep the node
-    // (so counts are unaffected) but null its runnable. See isCollectableTest.
-    runnable = isCollectableTest(candidate) ? pytestRunnable(file, candidate.name) : null;
+    // A NESTED function (a callback / helper defined inside a real test), a
+    // helper-class callable (`RedirectSession.send`), a non-test method on a
+    // real Test* class (`TestRequests.build_response`), or ANY callable in a
+    // non-test-module file (`tests/testserver/server.py`) is a node the impact
+    // walk legitimately reached, but pytest cannot collect it by node id
+    // (`file::cmd` → "not found", exit 4, ZERO tests run — measured on
+    // psf/requests). Keep the node (so counts/evidence are unaffected) but null
+    // its runnable. See isCollectableTest.
+    runnable = isCollectableTest(candidate) ? pytestRunnable(file, candidate.name, candidate.id) : null;
+  } else if (runner === "go") {
+    // go: per-test `-run` handle (`file::TestName`) when the name is a Go test
+    // function, else the file (a reached `_test.go` helper has no `-run` target).
+    // Makes the high-precision per-test `observed` tier actionable (the affected
+    // test is runnable as `go test -run '^TestName$'`, not the whole file).
+    runnable = goRunnable(file, candidate.name);
+  } else if (runner === "vitest" || runner === "jest") {
+    // vitest / jest select by FILE — but only a file that IS a test/spec file
+    // (by the same PATH patterns detection uses) is a valid spec filter. A node
+    // detected as a test by NAME alone (`testFoo` in `src/helpers.ts`) would
+    // otherwise leak a NON-spec path into the emitted `vitest run <files…>` /
+    // `bun test <files…>` line — the same bug class as the pytest one (and a
+    // lone non-spec filter makes vitest exit "no test files found"). Keep the
+    // node as evidence; null the runnable.
+    runnable = isTestFile(file, patterns) ? file : null;
   } else {
-    // vitest / jest / go / cargo / unknown: the runner selects by file.
+    // go (non-test-shape fallback handled above) / cargo / unknown: the runner
+    // selects by file.
     runnable = file;
   }
 

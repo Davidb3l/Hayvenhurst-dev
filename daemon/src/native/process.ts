@@ -58,6 +58,15 @@ export interface ParseOptions {
   /** Incremental ingest: when present, native bypasses the gitignore
    *  walker and parses only these repo-relative paths. ARCHITECTURE.md §16.3. */
   files?: string[];
+  /** Also index dependency-source dirs (`vendor/`, `Godeps/`, `third_party/`).
+   *  Default false — first-party code only. No effect on the incremental
+   *  (`files`) path, which parses exactly what it's given. */
+  includeVendored?: boolean;
+  /** Also index test-fixture / example / benchmark dirs (`test/fixtures/`,
+   *  `examples/`, `benchmark(s)/`). Default false — fixture apps inflate the
+   *  index (measured 27.6% on astro) and dilute search. No effect on the
+   *  incremental (`files`) path, which parses exactly what it's given. */
+  includeFixtures?: boolean;
 }
 
 export interface ParseRun {
@@ -85,6 +94,12 @@ export function startParse(opts: ParseOptions): ParseRun {
   ];
   if (opts.jobs > 0) {
     args.push("--jobs", String(opts.jobs));
+  }
+  if (opts.includeVendored) {
+    args.push("--include-vendored");
+  }
+  if (opts.includeFixtures) {
+    args.push("--include-fixtures");
   }
   // BL-2: the incremental file list is passed NEWLINE-delimited on the
   // child's stdin (`--files-stdin`), NOT as a comma-delimited `--files <csv>`
