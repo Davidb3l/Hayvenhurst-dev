@@ -1,0 +1,51 @@
+name: "Hayven affected tests"
+description: >
+  Run only the tests a change can affect, with a never-miss safety net. Wraps
+  ci/hayven-affected-tests.sh: computes the changed files from a git diff, asks
+  `hayven affected-tests` (SAFE tier by default) for the tests that reach those
+  changes, and runs only those — falling back to the FULL suite on any doubt
+  (stale index, an unindexed change, a conftest/config/dependency edit). See
+  docs/CI_AFFECTED_TESTS.md for the full recipe (coverage population + index cache).
+
+inputs:
+  base-ref:
+    description: "Git ref to diff against (the PR base)."
+    required: false
+    default: "origin/main"
+  hayven:
+    description: "Path to the hayven binary."
+    required: false
+    default: "hayven"
+  tier:
+    description: "safe (never-miss, default) | observed (minimal fail-fast set)."
+    required: false
+    default: "safe"
+  fallback:
+    description: "full (run the whole suite on any doubt — safe default) | none."
+    required: false
+    default: "full"
+  test-runner:
+    description: "Command that runs tests; selected test ids are appended."
+    required: false
+    default: "python -m pytest -q"
+  run:
+    description: "1 = run the tests; 0 = only print the selection."
+    required: false
+    default: "1"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Select and run affected tests
+      shell: bash
+      env:
+        BASE_REF: ${{ inputs.base-ref }}
+        HAYVEN: ${{ inputs.hayven }}
+        HAYVEN_TIER: ${{ inputs.tier }}
+        FALLBACK: ${{ inputs.fallback }}
+        TEST_RUNNER: ${{ inputs.test-runner }}
+        RUN: ${{ inputs.run }}
+      # The diff needs history; the caller should checkout with fetch-depth: 0
+      # and `git fetch origin <base>` so BASE_REF resolves.
+      run: |
+        "${GITHUB_ACTION_PATH}/../../../ci/hayven-affected-tests.sh"
