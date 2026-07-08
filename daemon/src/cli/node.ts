@@ -13,7 +13,7 @@
  */
 import { readFileSync } from "node:fs";
 
-import { assertDaemonServesProject, isJson, reportIdentity, requireProject } from "./_shared.ts";
+import { assertDaemonServesProject, isJson, projectHeader, reportIdentity, requireProject } from "./_shared.ts";
 import type { ParsedArgs } from "../cli.ts";
 
 export async function runNode(args: ParsedArgs): Promise<number> {
@@ -64,7 +64,7 @@ export async function runNode(args: ParsedArgs): Promise<number> {
   try {
     res = await fetch(`${base}/api/nodes/${encodeURIComponent(id)}/body`, {
       method: "PUT",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...projectHeader(identity) },
       body: JSON.stringify({ body }),
     });
   } catch (err) {

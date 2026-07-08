@@ -13,7 +13,7 @@
  */
 import { createHash } from "node:crypto";
 
-import { assertDaemonServesProject, reportIdentity, requireProject } from "./_shared.ts";
+import { assertDaemonServesProject, projectHeader, reportIdentity, requireProject } from "./_shared.ts";
 import { isJson } from "./_shared.ts";
 import type { ParsedArgs } from "../cli.ts";
 
@@ -49,7 +49,8 @@ export async function runClaim(args: ParsedArgs): Promise<number> {
   const base = `http://${ctx.config.daemon_host}:${ctx.config.daemon_port}`;
 
   // Guard against mutating a DIFFERENT project's daemon (every project defaults
-  // to port 7777). Verify the daemon at `base` serves this repo before POSTing.
+  // to port 7777). Verify the daemon at `base` serves this repo (registering it
+  // live if needed) and address the request to OUR project on a shared daemon.
   const identity = await assertDaemonServesProject(base, ctx);
   if (!reportIdentity(identity)) return 1;
 
@@ -84,7 +85,7 @@ export async function runClaim(args: ParsedArgs): Promise<number> {
   try {
     res = await fetch(`${base}/api/claims`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...projectHeader(identity) },
       body: JSON.stringify(body),
     });
   } catch (err) {

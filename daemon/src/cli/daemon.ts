@@ -1,8 +1,14 @@
 /**
  * `hayven daemon <start|stop|status>` — daemon control.
  *
- * `start` is a foreground server for v1. `stop` sends SIGTERM to the PID
- * recorded in the project's pidfile. `status` reports the current state.
+ * `start` DETACHES by default: it re-execs this CLI as a background child
+ * (`--foreground` internally), redirects stdio to the daemon log, unrefs the
+ * child so it survives the launching shell/session, waits for the health
+ * endpoint, and exits 0. When a healthy hayven daemon already owns the port
+ * (started from another repo), `start` registers this project with it instead
+ * of failing with EADDRINUSE. `--foreground` keeps the classic in-terminal
+ * server for CI, tests, and external supervisors. `stop` sends SIGTERM to the
+ * PID recorded in the project's pidfile. `status` reports the current state.
  */
 import {
   buildMultiProjectApp,
@@ -35,9 +41,17 @@ import type { ParsedArgs } from "../cli.ts";
 import { Db } from "../db/queries.ts";
 import { activeBranchKey, resolveWriteIndex, resolveWriteIndexForKey } from "../db/branch_index.ts";
 import type { HayvenConfig } from "../config/defaults.ts";
-import { existsSync, realpathSync } from "node:fs";
-import { resolve } from "node:path";
-import { hayvenPathsFor, type HayvenPaths } from "../util/paths.ts";
+import { closeSync, existsSync, mkdirSync, openSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { join } from "node:path";
+import {
+  buildDetachedCommand,
+  probeDaemon,
+  waitForDaemon,
+  DETACH_HEALTH_TIMEOUT_MS,
+  type HayvenHealth,
+} from "../daemon/detach.ts";
+import { canonicalRoot, globalLogsDir, hayvenPathsFor, type HayvenPaths } from "../util/paths.ts";
 import type { Logger } from "../util/log.ts";
 import { loadConfig } from "../config/load.ts";
 import {
@@ -48,21 +62,6 @@ import {
 } from "../daemon/registry.ts";
 import { hotAddToRunningDaemon, requireProject } from "./_shared.ts";
 import { VERSION } from "../version.ts";
-
-/**
- * Canonical, symlink-resolved absolute path — the identity key for a served
- * project. `resolve` alone normalizes `.`/`..`/trailing slashes but NOT symlinks,
- * so two symlink-equivalent roots would otherwise dedupe as distinct and open a
- * SECOND Db on the SAME `.hayven/index.sqlite` (two writers on one WAL = corruption).
- * Falls back to `resolve` when the path doesn't exist yet (realpath throws on ENOENT).
- */
-function canonicalRoot(p: string): string {
-  try {
-    return realpathSync(resolve(p));
-  } catch {
-    return resolve(p);
-  }
-}
 
 /** Hard cap on repos one daemon serves live — a DoS backstop for the add endpoint
  *  (each project opens a Db + native watcher + branch poller). */
@@ -256,9 +255,12 @@ export async function repointToBranch(deps: RepointDeps, newKey: string | null):
 
 const DAEMON_USAGE = `hayven daemon <subcommand>
 
-  start                    Start the daemon (foreground). Serves the cwd project
-                           plus every registered project. --port/--host override
-                           the primary's bind address.
+  start                    Start the daemon detached (background) and return once
+                           it is healthy. Serves the cwd project plus every
+                           registered project; if a hayven daemon already owns
+                           the port, registers this project with it instead.
+                           --foreground runs it in this terminal (CI/supervisors);
+                           --port/--host override the primary's bind address.
   stop                     Send SIGTERM to the running daemon (via its pidfile).
   status                   Report whether the daemon is running.
   restart                  Alias for stop + start.
@@ -382,7 +384,217 @@ interface ProjectRuntime {
   readonly shutdown: () => Promise<void>;
 }
 
+/**
+ * Apply validated `--port`/`--host` overrides onto a copy of `config`.
+ * Returns the effective config, or an exit code (2) after printing a usage
+ * error. Shared by the detached parent (to know where to probe/poll) and the
+ * foreground server (to know where to bind) so the two can never disagree.
+ */
+function applyBindOverrides(
+  args: ParsedArgs,
+  config: HayvenConfig,
+): { config: HayvenConfig } | { exitCode: number } {
+  const effective = { ...config };
+
+  const hostFlag = args.flags["host"];
+  if (typeof hostFlag === "string" && hostFlag.length > 0) {
+    effective.daemon_host = hostFlag;
+  } else if (hostFlag === true) {
+    process.stderr.write("error: --host requires a value, e.g. --host 0.0.0.0\n");
+    return { exitCode: 2 };
+  }
+
+  const portFlag = args.flags["port"];
+  if (portFlag !== undefined && portFlag !== false) {
+    if (portFlag === true) {
+      process.stderr.write("error: --port requires a value, e.g. --port 7878\n");
+      return { exitCode: 2 };
+    }
+    const port = Number(portFlag);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      process.stderr.write(`error: --port must be an integer in 1..65535 (got ${portFlag})\n`);
+      return { exitCode: 2 };
+    }
+    effective.daemon_port = port;
+  }
+  return { config: effective };
+}
+
+/** Render the "serving N project(s): a, b" line from a health payload. */
+function renderServing(health: HayvenHealth): string {
+  const aliases = (health.projects ?? []).map((p) => p.alias);
+  if (aliases.length === 0) return "";
+  return `serving ${aliases.length} project(s): ${aliases.join(", ")}\n`;
+}
+
+/**
+ * DEFAULT `hayven daemon start`: spawn the daemon as a DETACHED background
+ * process and return once it is healthy.
+ *
+ * Why: the foreground server dies with the shell/session that launched it —
+ * clear a Claude Code session (or close the terminal) and every other repo's
+ * tools start failing with "could not reach daemon". Detaching (own process
+ * group via `detached: true`, stdio redirected to the daemon log, `unref()` so
+ * the parent exits freely) makes the daemon survive its launcher.
+ *
+ * Shared-daemon path: when a HEALTHY hayven daemon already owns the port
+ * (started from another repo — one daemon serves N projects), we do NOT fail
+ * with EADDRINUSE: we verify it via `/api/health`, ensure THIS project is
+ * registered with it (live hot-add), and exit 0. A port held by something that
+ * is not a hayven daemon stays a clear error.
+ */
+async function startDetachedDaemon(args: ParsedArgs): Promise<number> {
+  let ctx;
+  try {
+    ctx = requireProject();
+  } catch (err) {
+    process.stderr.write(`error: ${(err as Error).message}\n`);
+    return 1;
+  }
+  const bind = applyBindOverrides(args, ctx.config);
+  if ("exitCode" in bind) return bind.exitCode;
+  const config = bind.config;
+  const base = `http://${config.daemon_host}:${config.daemon_port}`;
+
+  // Is something already answering on the target address?
+  const probe = await probeDaemon(base);
+  if (probe.kind === "foreign") {
+    process.stderr.write(
+      `error: ${config.daemon_host}:${config.daemon_port} is in use by something that is NOT a hayven daemon.\n` +
+        "Stop it, or start with a free port (`hayven daemon start --port <N>`).\n",
+    );
+    return 1;
+  }
+  if (probe.kind === "hayven") {
+    return ensureServedByRunningDaemon(base, probe.health, ctx.paths.repoRoot);
+  }
+
+  // Nothing listening. If the pidfile claims a LIVE pid, the daemon is probably
+  // bound elsewhere (config/port drift) — refuse rather than start a duplicate.
+  const existing = daemonStatus(ctx.paths.pidFile);
+  if (existing.state === "running") {
+    process.stderr.write(
+      `error: pidfile reports a live daemon (pid ${existing.pid}) but ${base} is unreachable — ` +
+        "it may be bound to a different host/port.\n" +
+        "Stop it first (`hayven daemon stop`) or check `hayven config daemon_port`.\n",
+    );
+    return 1;
+  }
+  if (existing.state === "stale") {
+    removePidFile(ctx.paths.pidFile); // dead pid — clean and proceed
+  }
+
+  // Re-exec ourselves as the detached child, stdio → the daemon out-log.
+  const extraArgs: string[] = [];
+  if (typeof args.flags["host"] === "string") extraArgs.push("--host", args.flags["host"]);
+  if (typeof args.flags["port"] === "string") extraArgs.push("--port", args.flags["port"]);
+  const cmd = buildDetachedCommand({
+    execPath: process.execPath,
+    entryScript: process.argv[1],
+    extraArgs,
+  });
+
+  const logPath = join(globalLogsDir(), "daemon.out.log");
+  let child;
+  try {
+    mkdirSync(globalLogsDir(), { recursive: true });
+    const fd = openSync(logPath, "a");
+    try {
+      child = spawn(cmd[0]!, cmd.slice(1), {
+        cwd: ctx.paths.repoRoot,
+        detached: true, // own process group/session — survives the parent's terminal
+        stdio: ["ignore", fd, fd],
+      });
+    } finally {
+      closeSync(fd);
+    }
+  } catch (err) {
+    process.stderr.write(`error: failed to spawn the daemon: ${(err as Error).message}\n`);
+    return 1;
+  }
+  child.unref(); // let THIS process exit without waiting on the child
+
+  const health = await waitForDaemon(base, { timeoutMs: DETACH_HEALTH_TIMEOUT_MS });
+  if (health === null) {
+    process.stderr.write(
+      `error: daemon did not become healthy at ${base} within ${Math.round(DETACH_HEALTH_TIMEOUT_MS / 1000)}s.\n` +
+        `Check the log: ${logPath}\n` +
+        "(or run it in this terminal: `hayven daemon start --foreground`)\n",
+    );
+    return 1;
+  }
+
+  // TOCTOU guard: between our `unreachable` probe and the child's bind, ANOTHER
+  // daemon (e.g. a concurrent `daemon start` from a different repo) may have won
+  // the port — our child then died on EADDRINUSE while a hayven daemon still
+  // answers. Verify the answering daemon serves THIS repo before declaring
+  // success; if not, fall into the same register-with-it path as the pre-spawn
+  // probe instead of printing a false "started".
+  const ours = canonicalRoot(ctx.paths.repoRoot);
+  const servesUs =
+    (health.projects ?? []).some((p) => canonicalRoot(p.root) === ours) ||
+    (typeof health.root === "string" && canonicalRoot(health.root) === ours);
+  if (!servesUs) {
+    return ensureServedByRunningDaemon(base, health, ctx.paths.repoRoot);
+  }
+
+  const pid = readPidFile(ctx.paths.pidFile) ?? child.pid;
+  process.stdout.write(
+    `hayven daemon started (pid ${pid}) — listening on ${base}/\n` +
+      renderServing(health) +
+      "It runs detached from this shell; stop it with `hayven daemon stop`.\n",
+  );
+  return 0;
+}
+
+/**
+ * `daemon start` found a healthy hayven daemon already on the port: make sure
+ * it serves THIS project (registering it live when it doesn't) and exit 0 —
+ * one long-lived daemon serves every registered repo; a second `start` from a
+ * new repo should join it, not crash on EADDRINUSE.
+ */
+async function ensureServedByRunningDaemon(
+  base: string,
+  health: HayvenHealth,
+  repoRoot: string,
+): Promise<number> {
+  const ours = canonicalRoot(repoRoot);
+  const served = (health.projects ?? []).find((p) => canonicalRoot(p.root) === ours);
+  if (served) {
+    process.stdout.write(
+      `daemon already running at ${base}/ — serving this project as '${served.alias}'.\n` + renderServing(health),
+    );
+    return 0;
+  }
+  // Legacy/single-project daemon whose primary root IS this repo.
+  if (typeof health.root === "string" && canonicalRoot(health.root) === ours) {
+    process.stdout.write(`daemon already running at ${base}/ — serving this project.\n`);
+    return 0;
+  }
+  const hot = await hotAddToRunningDaemon(repoRoot, base);
+  if ((hot.kind === "added" || hot.kind === "exists") && hot.alias.length > 0) {
+    process.stdout.write(`daemon already running at ${base}/ — now serving '${hot.alias}'.\n`);
+    return 0;
+  }
+  const detail =
+    hot.kind === "error"
+      ? hot.message
+      : "it does not support live project registration (old version?)";
+  process.stderr.write(
+    `error: a hayven daemon is running at ${base} but this project could not be registered with it: ${detail}\n` +
+      "Restart it from this repo (`hayven daemon stop && hayven daemon start`).\n",
+  );
+  return 1;
+}
+
 async function startDaemon(args: ParsedArgs): Promise<number> {
+  // Detach by default; `--foreground` keeps the in-terminal server (CI, tests,
+  // supervisors, and the re-exec'd detached child itself).
+  const foreground = args.flags["foreground"] === true || args.flags["foreground"] === "true";
+  return foreground ? startForegroundDaemon(args) : startDetachedDaemon(args);
+}
+
+async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
   const logger = rootLogger().child("daemon");
   let ctx;
   try {
@@ -397,29 +609,9 @@ async function startDaemon(args: ParsedArgs): Promise<number> {
   // daemon always bound config.daemon_port/daemon_host). Build the effective
   // bind config from the PRIMARY project config, then apply validated overrides.
   // The daemon binds ONE port, so only the primary's bind config matters.
-  const primaryConfig = { ...ctx.config };
-
-  const hostFlag = args.flags["host"];
-  if (typeof hostFlag === "string" && hostFlag.length > 0) {
-    primaryConfig.daemon_host = hostFlag;
-  } else if (hostFlag === true) {
-    process.stderr.write("error: --host requires a value, e.g. --host 0.0.0.0\n");
-    return 2;
-  }
-
-  const portFlag = args.flags["port"];
-  if (portFlag !== undefined && portFlag !== false) {
-    if (portFlag === true) {
-      process.stderr.write("error: --port requires a value, e.g. --port 7878\n");
-      return 2;
-    }
-    const port = Number(portFlag);
-    if (!Number.isInteger(port) || port < 1 || port > 65535) {
-      process.stderr.write(`error: --port must be an integer in 1..65535 (got ${portFlag})\n`);
-      return 2;
-    }
-    primaryConfig.daemon_port = port;
-  }
+  const bind = applyBindOverrides(args, ctx.config);
+  if ("exitCode" in bind) return bind.exitCode;
+  const primaryConfig = bind.config;
 
   // Refuse to start twice (checked on the PRIMARY's pidfile — the one this
   // process writes and `hayven daemon stop` reads).
@@ -999,7 +1191,12 @@ async function startDaemon(args: ParsedArgs): Promise<number> {
   return 0;
 }
 
-function stopDaemon(): number {
+/** How long `daemon stop` waits for the signaled pid to actually exit. The
+ *  daemon's own shutdown drain is bounded (SHUTDOWN_DRAIN_MS per project), so a
+ *  healthy daemon dies well within this. */
+export const STOP_WAIT_MS = 10_000;
+
+async function stopDaemon(): Promise<number> {
   let ctx;
   try {
     ctx = requireProject();
@@ -1020,11 +1217,28 @@ function stopDaemon(): number {
   try {
     process.kill(pid, "SIGTERM");
     process.stdout.write(`SIGTERM sent to daemon (pid ${pid})\n`);
-    return 0;
   } catch (err) {
     process.stderr.write(`failed to signal pid ${pid}: ${(err as Error).message}\n`);
     return 1;
   }
+  // WAIT for the process to actually exit. The daemon keeps answering
+  // `/api/health` while its shutdown drains project runtimes, so returning
+  // immediately would let a follow-up `daemon start` (the sequence our own
+  // error messages recommend) probe the DYING daemon, report "already
+  // running", exit 0 — and moments later nothing is running.
+  const deadline = Date.now() + STOP_WAIT_MS;
+  while (Date.now() < deadline) {
+    if (!isAlive(pid)) {
+      process.stdout.write(`daemon stopped (pid ${pid})\n`);
+      return 0;
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  process.stderr.write(
+    `error: daemon (pid ${pid}) is still shutting down after ${Math.round(STOP_WAIT_MS / 1000)}s — ` +
+      "check `hayven daemon status` before restarting.\n",
+  );
+  return 1;
 }
 
 function statusDaemon(): number {

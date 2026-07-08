@@ -89,6 +89,15 @@ export interface ServerDependencies {
    * viewer updates its switcher the instant the set changes.
    */
   subscribeProjects?: SubscribeProjectsFn | undefined;
+  /**
+   * Multi-project only: resolve the LIVE per-project deps for an alias
+   * (`null` → the primary; `undefined` result → alias unknown). WebSocket
+   * handlers must pin a connection through this at open() time: the facade's
+   * AsyncLocalStorage-backed getters resolve per HTTP request, and that
+   * context does NOT reach Bun's ws message/close callbacks — reading the
+   * facade there silently yields the PRIMARY project's op-log.
+   */
+  resolveProject?: ((alias: string | null) => ServerDependencies | undefined) | undefined;
 }
 
 /** One row of the multi-project `/api/health` listing. */
@@ -118,8 +127,11 @@ export interface BuildAppOptions {
    * Per-request hook (multi-project): runs before every handler with the raw
    * Request, so the caller can select which project this request targets.
    * `buildMultiProjectApp` uses it to enter the AsyncLocalStorage project scope.
+   * Returning a `Response` SHORT-CIRCUITS the request (Elysia treats a value
+   * returned from `onRequest` as the response) — used to refuse a mutation
+   * addressed to a project this daemon does not serve.
    */
-  onRequest?: (request: Request) => void;
+  onRequest?: (request: Request) => Response | undefined;
   /**
    * When true (default), a supplied `deps.dbRef` rewires `deps.db` to read
    * `dbRef.current` at request time (live branch re-point). The multi-project
@@ -226,6 +238,10 @@ export interface MultiProjectDeps {
  */
 const projectContext = new AsyncLocalStorage<ServerDependencies>();
 
+/** HTTP methods that mutate state — the ones an unknown-project selector must
+ *  hard-refuse (404) rather than fall back to the primary project. */
+const MUTATING_METHODS: ReadonlySet<string> = new Set(["POST", "PUT", "DELETE", "PATCH"]);
+
 /**
  * Build ONE Elysia app that serves N projects from a single daemon. The route
  * modules are UNCHANGED: they close over a facade `deps` whose db/paths/config/
@@ -259,6 +275,10 @@ export function buildMultiProjectApp(multi: MultiProjectDeps) {
     addProject: multi.addProject,
     removeProject: multi.removeProject,
     subscribeProjects: multi.subscribeProjects,
+    // Live map lookup (not a snapshot): hot-added projects are ws-reachable
+    // immediately, removed ones stop resolving.
+    resolveProject: (alias: string | null) =>
+      alias === null ? primaryDeps : multi.projects.get(alias),
   } as ServerDependencies;
 
   for (const key of ["db", "dbRef", "config", "paths", "ingest", "crdt"] as const) {
@@ -269,15 +289,42 @@ export function buildMultiProjectApp(multi: MultiProjectDeps) {
     });
   }
 
-  const onRequest = (request: Request): void => {
+  const onRequest = (request: Request): Response | undefined => {
     let alias: string | null = null;
+    let pathname = "";
     try {
-      alias = new URL(request.url).searchParams.get("project");
+      const url = new URL(request.url);
+      alias = url.searchParams.get("project");
+      pathname = url.pathname;
     } catch {
       alias = null;
     }
     if (!alias) alias = request.headers.get("x-hayven-project");
-    projectContext.enterWith((alias && multi.projects.get(alias)) || primaryDeps);
+    const selected = alias ? multi.projects.get(alias) : undefined;
+
+    // SAFETY: a MUTATION that explicitly addresses a project this daemon does
+    // NOT serve must be refused, never silently routed to the primary — that
+    // would write into the WRONG project's CRDT op-log (e.g. a CLI whose alias
+    // went stale after a daemon restart). Reads keep the legacy fall-back to
+    // the primary (an unknown `?project=` in the viewer degrades gracefully) —
+    // EXCEPT the sync surface: a peer's `GET /api/sync/merkle` answered from
+    // the primary's tree would diff two different projects and start a
+    // bidirectional cross-contamination, so /api/sync/* is strict on every
+    // method once a selector is present.
+    // /ws/sync is the WebSocket sibling of POST /api/sync/push (it streams
+    // CRDT ops into the op-log), so its upgrade GET gets the same strictness.
+    const strictRoute = pathname.startsWith("/api/sync/") || pathname === "/ws/sync";
+    if (alias && !selected && (strictRoute || MUTATING_METHODS.has(request.method))) {
+      return new Response(
+        JSON.stringify({
+          error: `daemon does not serve a project with alias '${alias}' — register it (\`hayven daemon register\`) or restart the daemon from that repo`,
+        }),
+        { status: 404, headers: { "content-type": "application/json" } },
+      );
+    }
+
+    projectContext.enterWith(selected ?? primaryDeps);
+    return undefined;
   };
 
   // branchAwareDb:false — the facade's own `db` getter already resolves the

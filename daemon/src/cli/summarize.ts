@@ -49,6 +49,7 @@ import {
   assertDaemonServesProject,
   isJson,
   openProjectDb,
+  projectHeader,
   requireProject,
   type ProjectContext,
 } from "./_shared.ts";
@@ -225,8 +226,11 @@ export async function runSummarize(args: ParsedArgs): Promise<number> {
 
   // Decide the write transport: prefer the daemon when it's up and serves THIS
   // project (it owns the op log). Otherwise write directly via a local CrdtState.
+  // `daemonHeaders` carries the project selector so a SHARED multi-project
+  // daemon routes our reads/writes to THIS project, not its primary.
   const base = `http://${ctx.config.daemon_host}:${ctx.config.daemon_port}`;
-  const daemonUp = await daemonServesProject(base, ctx);
+  const daemonHeaders = await daemonServesProject(base, ctx);
+  const daemonUp = daemonHeaders !== null;
 
   // Report progress for the long `--all` run only (a single id is instant).
   const onProgress = all
@@ -245,7 +249,7 @@ export async function runSummarize(args: ParsedArgs): Promise<number> {
 
   let results: SummarizedNode[];
   if (daemonUp) {
-    results = await summarizeViaDaemon(base, ctx, ids, summarizer, budget, onProgress);
+    results = await summarizeViaDaemon(base, ctx, ids, summarizer, budget, onProgress, daemonHeaders);
   } else {
     results = await summarizeOfflineAsync(ctx, ids, summarizer, budget, onProgress);
   }
@@ -308,19 +312,27 @@ export async function runSummarize(args: ParsedArgs): Promise<number> {
   return 0;
 }
 
-/** True when a daemon is reachable at `base` AND serves this exact project. */
-async function daemonServesProject(base: string, ctx: ProjectContext): Promise<boolean> {
+/**
+ * When a daemon is reachable at `base` AND serves this exact project (register-
+ * on-the-fly included), returns the request headers to address it (the project
+ * selector for a shared daemon — possibly empty when we're the primary).
+ * Returns `null` when the daemon is down or cannot serve this project.
+ */
+async function daemonServesProject(
+  base: string,
+  ctx: ProjectContext,
+): Promise<Record<string, string> | null> {
   try {
     const res = await fetch(`${base}/api/health`);
-    if (!res.ok) return false;
-    const health = (await res.json()) as { root?: unknown };
+    if (!res.ok) return null;
     // Reuse the project-identity guard's logic: a foreign-serving daemon must
-    // not receive our writes. assertDaemonServesProject returns ok:false only on
-    // a genuine mismatch; an old daemon with no root warns but is ok:true.
+    // not receive our writes. assertDaemonServesProject returns ok:false only
+    // when this project can't be served/registered; it also resolves the alias
+    // we must address requests with on a shared multi-project daemon.
     const identity = await assertDaemonServesProject(base, ctx);
-    return identity.ok;
+    return identity.ok ? projectHeader(identity) : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -332,6 +344,8 @@ async function summarizeViaDaemon(
   summarizer: NodeSummarizer,
   budget?: RunBudget,
   onProgress?: (done: number) => void,
+  /** Project-selector headers for a shared multi-project daemon. */
+  daemonHeaders: Record<string, string> = {},
 ): Promise<SummarizedNode[]> {
   const out: SummarizedNode[] = [];
   // Arm the wall-clock deadline HERE so the budget covers summarization work, not
@@ -345,7 +359,9 @@ async function summarizeViaDaemon(
     // view (it owns the authoritative DB while it's running).
     let node: GraphNode | null = null;
     try {
-      const res = await fetch(`${base}/api/nodes/${encodeURIComponent(nodeId)}`);
+      const res = await fetch(`${base}/api/nodes/${encodeURIComponent(nodeId)}`, {
+        headers: daemonHeaders,
+      });
       if (res.ok) {
         const payload = (await res.json()) as { node?: GraphNode };
         node = payload.node ?? null;
@@ -359,7 +375,7 @@ async function summarizeViaDaemon(
     try {
       await fetch(`${base}/api/nodes/${encodeURIComponent(nodeId)}/body`, {
         method: "PUT",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", ...daemonHeaders },
         body: JSON.stringify({ body: result.summary }),
       });
     } catch {

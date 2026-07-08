@@ -112,7 +112,7 @@ const COMMANDS: readonly Command[] = [
   { name: "release", group: "coordination", run: runRelease,
     help: "release <claim_id>         Release a claim" },
   { name: "sync", group: "coordination", run: runSync,
-    help: "sync <peer_url>            Sync CRDT state with a peer" },
+    help: "sync <peer_url> [--peer-project <alias>]  Sync CRDT state with a peer" },
   { name: "traces", group: "coordination", run: runTraces,
     help: "traces <id>                Runtime trace history for an entity" },
   { name: "remember", group: "coordination", run: runRemember,

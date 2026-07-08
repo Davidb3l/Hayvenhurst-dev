@@ -159,21 +159,141 @@ function applyInboundFrame(deps: ServerDependencies, bytes: Uint8Array): ApplyRe
   return { applied, total: decoded.length };
 }
 
+/**
+ * Resolve which project's deps a ws connection is pinned to, from the upgrade
+ * URL's `?project=<alias>` (or the `x-hayven-project` header, for parity with
+ * the HTTP surface). MUST be called at open() time and the result reused for
+ * the connection's whole life: on a multi-project daemon `deps` is the
+ * AsyncLocalStorage-backed facade, whose per-request context does not reach
+ * Bun's ws message/close callbacks — reading it there silently resolves to
+ * the PRIMARY project and streams a peer's ops into the wrong op-log.
+ *
+ * `ok:false` = an explicit selector the daemon does not serve. onRequest
+ * already refuses such upgrades with a 404 (strictRoute covers /ws/sync);
+ * this is the in-handler backstop for callers that wire wsRoutes directly.
+ */
+function connectionProject(
+  deps: ServerDependencies,
+  ws: { data?: unknown },
+): { ok: true; deps: ServerDependencies; alias: string | null } | { ok: false; error: string } {
+  const data = ws.data as
+    | {
+        query?: Record<string, string | undefined>;
+        headers?: Record<string, string | undefined>;
+      }
+    | undefined;
+  // `||` (not `??`): an EMPTY `?project=` must fall through to the header,
+  // matching the HTTP path's `if (!alias)` precedence in server.ts.
+  const raw = data?.query?.["project"] || data?.headers?.["x-hayven-project"];
+  const alias = typeof raw === "string" && raw.length > 0 ? raw : null;
+  // Single-project app (no resolver): the passed deps ARE the project. Alias
+  // is reported as null — there is no project set to be evicted from.
+  if (deps.resolveProject === undefined) return { ok: true, deps, alias: null };
+  const resolved = deps.resolveProject(alias);
+  if (resolved === undefined) {
+    return {
+      ok: false,
+      error: `daemon does not serve a project with alias '${alias ?? ""}'`,
+    };
+  }
+  return { ok: true, deps: resolved, alias };
+}
+
+/** Minimal socket surface the hot-remove sweep needs to evict a peer. */
+interface WsHandle {
+  send(data: string): unknown;
+  close(code?: number, reason?: string): unknown;
+}
+
+/** Everything a live connection is pinned to: the project's deps, the alias it
+ *  was selected by (`null` = primary/single-project), and the socket handle so
+ *  a hot-remove sweep can close it. */
+interface PinnedConnection {
+  deps: ServerDependencies;
+  alias: string | null;
+  ws: WsHandle;
+}
+
 export function wsRoutes(deps: ServerDependencies) {
-  // Per-connection unsubscribe handles, keyed by the socket's stable id. Elysia
-  // gives each ws an `id`; we use it so close() can detach the exact listener.
+  // Per-connection state, keyed by the socket's stable id (Elysia gives each
+  // ws an `id`): the onOps unsubscribe handle, and the project pin taken at
+  // open() that message()/the hot-remove sweep read.
   const unsubscribers = new Map<string, () => void>();
+  const connections = new Map<string, PinnedConnection>();
+
+  /** Idempotent teardown of a connection's book-keeping — shared by close()
+   *  and the hot-remove sweep (whichever runs first; the other no-ops). */
+  const dropConnection = (id: string): void => {
+    const unsubscribe = unsubscribers.get(id);
+    if (unsubscribe) {
+      unsubscribe();
+      unsubscribers.delete(id);
+    }
+    connections.delete(id);
+  };
+
+  // Hot-remove eviction: when the served project set changes, close every
+  // socket whose pinned project no longer resolves — by IDENTITY, so a
+  // remove-then-re-add under the same alias (a NEW runtime; the pinned deps'
+  // CrdtState/Db are closed) also evicts. Without this, a peer pinned to a
+  // removed project lingers forever getting per-frame errors and its ops are
+  // silently dropped. The notification fires AFTER the removal's grace window
+  // + runtime shutdown, so in-flight frames drain into the still-live op-log
+  // first. Primary-pinned (`alias: null`) sockets are never evicted — the
+  // primary cannot be removed. The subscription lives for the daemon's life.
+  const resolveProject = deps.resolveProject;
+  if (deps.subscribeProjects !== undefined && resolveProject !== undefined) {
+    deps.subscribeProjects(() => {
+      for (const [id, conn] of [...connections]) {
+        if (conn.alias === null) continue;
+        if (resolveProject(conn.alias) === conn.deps) continue;
+        deps.logger.info("ws/sync evicting peer of removed project", {
+          id,
+          alias: conn.alias,
+        });
+        try {
+          conn.ws.send(
+            JSON.stringify({
+              type: "error",
+              error: `project '${conn.alias}' was removed from this daemon`,
+            }),
+          );
+          conn.ws.close(4004, "project removed");
+        } catch (err) {
+          deps.logger.error("ws/sync eviction failed", {
+            id,
+            message: (err as Error).message,
+          });
+        }
+        // Drop book-keeping NOW rather than waiting for the close event, so a
+        // socket that never fires one (already torn down) cannot leak its pin.
+        dropConnection(id);
+      }
+    });
+  }
 
   return new Elysia().ws("/ws/sync", {
     open(ws) {
+      // 0. Pin the connection to its project FIRST — everything below (hello
+      //    identity, outbound subscription, inbound applies) must speak for
+      //    the selected project, never the facade's request-scoped default.
+      const pinned = connectionProject(deps, ws);
+      if (!pinned.ok) {
+        deps.logger.info("ws/sync refused connection", { id: ws.id, error: pinned.error });
+        ws.send(JSON.stringify({ type: "error", error: pinned.error }));
+        ws.close(4004, "unknown project");
+        return;
+      }
+      const conn = pinned.deps;
+      connections.set(ws.id, { deps: conn, alias: pinned.alias, ws });
       deps.logger.info("ws/sync peer connected", { id: ws.id });
 
       // 1. Hello: identity + state vector + Merkle roots (§15.3).
       const hello: HelloEnvelope = {
         type: "hello",
-        writer_id: writerIdToHex(deps.crdt.writer),
-        versions: opVersions(deps),
-        roots: computeRootsSafe(deps),
+        writer_id: writerIdToHex(conn.crdt.writer),
+        versions: opVersions(conn),
+        roots: computeRootsSafe(conn),
       };
       ws.send(JSON.stringify(hello));
 
@@ -181,7 +301,7 @@ export function wsRoutes(deps: ServerDependencies) {
       //    §15.3 binary frame. `onOps` only fires on local writes (observe /
       //    applyOr / recordLww), never on inbound peer ops, so there is no
       //    re-broadcast loop. Best-effort: a send fault is logged, not fatal.
-      const unsubscribe = deps.crdt.onOps(({ type, ops }) => {
+      const unsubscribe = conn.crdt.onOps(({ type, ops }) => {
         try {
           ws.send(frameOps(type, ops));
         } catch (err) {
@@ -195,6 +315,18 @@ export function wsRoutes(deps: ServerDependencies) {
     },
 
     message(ws, raw) {
+      // The deps this connection was pinned to at open(). EVERY accepted
+      // connection has an entry (single-project included), so a missing pin
+      // means open() refused this socket (unknown project) — or the hot-remove
+      // sweep evicted it — and a frame raced the close. Refuse it rather than
+      // fall back to the facade, whose request-scoped getters would resolve to
+      // the PRIMARY project here.
+      const pin = connections.get(ws.id);
+      if (pin === undefined) {
+        ws.send(JSON.stringify({ type: "error", error: "connection is not pinned to a project" }));
+        return;
+      }
+      const conn = pin.deps;
       // 3. Inbound apply. Binary frames carry ops; text frames carry control
       //    messages (ping, or a peer's own hello). NB: Elysia auto-parses an
       //    incoming JSON text frame into an OBJECT before this handler runs, so
@@ -210,7 +342,7 @@ export function wsRoutes(deps: ServerDependencies) {
         return;
       }
       try {
-        const { applied, total } = applyInboundFrame(deps, bytes);
+        const { applied, total } = applyInboundFrame(conn, bytes);
         // A lightweight ack is handy for tests + flow visibility; harmless to a
         // peer that ignores unknown text frames.
         ws.send(JSON.stringify({ type: "ack", applied, total }));
@@ -222,12 +354,10 @@ export function wsRoutes(deps: ServerDependencies) {
 
     close(ws) {
       deps.logger.info("ws/sync peer disconnected", { id: ws.id });
-      // 4. Cleanup: detach the op listener so a dead socket isn't fed forever.
-      const unsubscribe = unsubscribers.get(ws.id);
-      if (unsubscribe) {
-        unsubscribe();
-        unsubscribers.delete(ws.id);
-      }
+      // 4. Cleanup: detach the op listener so a dead socket isn't fed forever,
+      //    and drop the connection's project pin. No-op if the hot-remove
+      //    sweep already tore this connection down.
+      dropConnection(ws.id);
     },
   });
 }

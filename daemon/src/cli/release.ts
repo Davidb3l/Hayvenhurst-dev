@@ -13,7 +13,7 @@
  *   200 → released.
  *   404 → no active claim with that id (already released / never existed).
  */
-import { assertDaemonServesProject, isJson, reportIdentity, requireProject } from "./_shared.ts";
+import { assertDaemonServesProject, isJson, projectHeader, reportIdentity, requireProject } from "./_shared.ts";
 import type { ParsedArgs } from "../cli.ts";
 
 export async function runRelease(args: ParsedArgs): Promise<number> {
@@ -41,6 +41,7 @@ export async function runRelease(args: ParsedArgs): Promise<number> {
   try {
     res = await fetch(`${base}/api/claims/${encodeURIComponent(id)}`, {
       method: "DELETE",
+      headers: projectHeader(identity),
     });
   } catch (err) {
     process.stderr.write(

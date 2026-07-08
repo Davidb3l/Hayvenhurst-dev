@@ -4,9 +4,24 @@
  * Centralizes repo-root detection (walk up looking for `.git/` then `.hayven/`)
  * and the canonical sub-paths inside `.hayven/`.
  */
-import { existsSync, statSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
+
+/**
+ * Canonical, symlink-resolved absolute path — the identity key for a served
+ * project. `resolve` alone normalizes `.`/`..`/trailing slashes but NOT symlinks,
+ * so two symlink-equivalent roots would otherwise dedupe as distinct and open a
+ * SECOND Db on the SAME `.hayven/index.sqlite` (two writers on one WAL = corruption).
+ * Falls back to `resolve` when the path doesn't exist yet (realpath throws on ENOENT).
+ */
+export function canonicalRoot(p: string): string {
+  try {
+    return realpathSync(resolve(p));
+  } catch {
+    return resolve(p);
+  }
+}
 
 export interface HayvenPaths {
   /** Absolute path of the user's project root. */

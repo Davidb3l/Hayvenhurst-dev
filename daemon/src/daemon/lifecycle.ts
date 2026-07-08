@@ -1,9 +1,11 @@
 /**
  * Daemon lifecycle: start/stop/status using a PID file in `.hayven/`.
  *
- * We do not yet daemonize via `fork()` — `hayven daemon start` runs in the
- * foreground for v1. The PID file lets `hayven daemon status` and external
- * supervisors check liveness.
+ * `hayven daemon start` detaches by default (see `daemon/detach.ts`): the CLI
+ * re-execs itself with `--foreground`, redirects stdio to the daemon log, and
+ * unrefs the child so it survives the launching shell/session. `--foreground`
+ * keeps the v1 behavior for CI, tests, and external supervisors. The PID file
+ * lets `hayven daemon status` and supervisors check liveness.
  */
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 
@@ -52,8 +54,22 @@ export function daemonStatus(pidFile: string): DaemonStatus {
   return { state: "stale", pid };
 }
 
-/** Install signal handlers that remove the PID file on shutdown. */
-export function installShutdownHandlers(pidFile: string, onShutdown?: () => void | Promise<void>): void {
+/**
+ * Signals that trigger a graceful shutdown (drain + pidfile cleanup).
+ * SIGHUP is included so an abrupt terminal/session close (the controlling
+ * terminal going away) cleans up exactly like SIGINT/SIGTERM instead of
+ * killing the process with a stale pidfile left behind.
+ */
+export const SHUTDOWN_SIGNALS: readonly NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGHUP"];
+
+/**
+ * Install signal handlers that remove the PID file on shutdown.
+ * Returns an uninstall function (used by tests; the daemon never calls it).
+ */
+export function installShutdownHandlers(
+  pidFile: string,
+  onShutdown?: () => void | Promise<void>,
+): () => void {
   let shuttingDown = false;
   const handler = async (signal: NodeJS.Signals): Promise<void> => {
     if (shuttingDown) return;
@@ -66,7 +82,11 @@ export function installShutdownHandlers(pidFile: string, onShutdown?: () => void
       process.exit(signal === "SIGINT" ? 130 : 0);
     }
   };
-  process.on("SIGINT", handler);
-  process.on("SIGTERM", handler);
-  process.on("beforeExit", () => removePidFile(pidFile));
+  for (const sig of SHUTDOWN_SIGNALS) process.on(sig, handler);
+  const onBeforeExit = (): void => removePidFile(pidFile);
+  process.on("beforeExit", onBeforeExit);
+  return () => {
+    for (const sig of SHUTDOWN_SIGNALS) process.removeListener(sig, handler);
+    process.removeListener("beforeExit", onBeforeExit);
+  };
 }

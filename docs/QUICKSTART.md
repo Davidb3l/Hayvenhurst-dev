@@ -105,15 +105,25 @@ hayven neighbors auth/session/validate --depth 2 --json
 The daemon serves the HTTP API and the viewer, holds the CRDT state in memory, runs the native file watcher for incremental re-ingest, and answers claim requests.
 
 ```sh
-hayven daemon start            # foreground; serves http://127.0.0.1:7777
+hayven daemon start            # detached (background); serves http://127.0.0.1:7777
 ```
 
-It runs in the foreground (press Ctrl-C to stop). To run it in the background, append `&` in your shell. Other controls:
+`start` spawns the daemon as a detached background process, waits until it answers on the health endpoint, prints where it is listening and which projects it serves, and returns. The daemon survives the shell (or agent session) that launched it — no `&` needed. If a hayven daemon already owns the port (started from another repo), `start` registers the current project with it instead of failing: one long-lived daemon serves every registered repo.
+
+To run it in the foreground instead (CI, tests, supervisors like systemd/launchd), pass `--foreground`:
+
+```sh
+hayven daemon start --foreground   # runs in this terminal; Ctrl-C to stop
+```
+
+Other controls:
 
 ```sh
 hayven daemon status           # running / stale / stopped (exit 0 only when running)
 hayven daemon stop             # SIGTERM the recorded pid
 ```
+
+Daemon output goes to `~/.hayven/logs/daemon.out.log` (structured logs in `~/.hayven/logs/daemon.log`); check there if `start` reports the daemon did not become healthy.
 
 The host and port come from the project config (defaults `127.0.0.1:7777`). Inspect or change them:
 
