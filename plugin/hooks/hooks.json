@@ -5,7 +5,11 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/install-hayven.sh\" --check || true"
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/install-hayven.sh\" --check 2>&1 || true"
+          },
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/ensure-daemon.sh\" 2>&1 || true"
           }
         ]
       }

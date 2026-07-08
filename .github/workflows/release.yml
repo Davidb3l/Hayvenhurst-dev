@@ -208,11 +208,12 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.platform }}
+          # NB: sigstore-python v3 emits `<input>.sigstore.json` bundles (not
+          # the v2-era .sig/.crt/.sigstore trio) — the old list here is why the
+          # v0.0.5 release shipped with no signature assets at all.
           path: |
             ${{ steps.bundle.outputs.tarball }}
-            ${{ steps.bundle.outputs.tarball }}.sig
-            ${{ steps.bundle.outputs.tarball }}.sigstore
-            ${{ steps.bundle.outputs.tarball }}.crt
+            ${{ steps.bundle.outputs.tarball }}.sigstore.json
             ${{ steps.bundle.outputs.checksum }}
           if-no-files-found: ignore
           retention-days: 30

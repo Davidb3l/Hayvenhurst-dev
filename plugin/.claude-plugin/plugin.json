@@ -1,6 +1,6 @@
 {
   "name": "hayvenhurst",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "description": "Reach for `hayven` over grep. Ships the Hayvenhurst Agent Skill so Claude Code queries a persistent, trace-augmented code graph of your repo (callers/callees, dependencies, runtime traces) through the local Hayvenhurst daemon instead of grepping or reading large files.",
   "author": {
     "name": "Hayvenhurst",

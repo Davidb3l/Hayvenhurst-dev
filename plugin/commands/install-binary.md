@@ -12,11 +12,18 @@ is not committed to the repo). This command bridges that gap: it downloads the
 release tarball matching this machine's OS + CPU arch, verifies its sha256, and
 installs `hayven` (+ `hayven-native`) into the plugin's persistent data directory.
 
-Run the bundled install script. If the user passed a tag in `$ARGUMENTS` (e.g.
-`v0.0.3`), forward it as `--version`; otherwise install the latest release:
+Run the bundled install script. If the user passed a tag (e.g. `v0.0.5`),
+forward it explicitly:
 
 ```sh
-"${CLAUDE_PLUGIN_ROOT}/scripts/install-hayven.sh" ${ARGUMENTS:+--version "$ARGUMENTS"}
+"${CLAUDE_PLUGIN_ROOT}/scripts/install-hayven.sh" --version "$ARGUMENTS"
+```
+
+If no tag was passed, install the latest release instead (do NOT pass an empty
+`--version`):
+
+```sh
+"${CLAUDE_PLUGIN_ROOT}/scripts/install-hayven.sh"
 ```
 
 After it finishes:

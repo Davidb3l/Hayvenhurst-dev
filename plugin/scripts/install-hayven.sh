@@ -44,10 +44,14 @@ MODE="install"
 while [ $# -gt 0 ]; do
   case "$1" in
     --check) MODE="check" ;;
-    --version) shift; TAG="${1:-}" ;;
-    --prefix) shift; PREFIX="${1:-}" ;;
+    --version)
+      [ -n "${2:-}" ] || { echo "install-hayven: --version needs a tag (e.g. v0.0.5)" >&2; exit 2; }
+      TAG="$2"; shift ;;
+    --prefix)
+      [ -n "${2:-}" ] || { echo "install-hayven: --prefix needs a directory" >&2; exit 2; }
+      PREFIX="$2"; shift ;;
     --help|-h)
-      sed -n '2,40p' "$0"
+      sed -n '2,31p' "$0"
       exit 0
       ;;
     *) echo "install-hayven: unknown argument: $1" >&2; exit 2 ;;
@@ -88,6 +92,34 @@ detect_platform() {
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# ---- suite awareness --------------------------------------------------------
+# Hayvenhurst is the code graph of a four-tool suite: Ametrite holds the task
+# board, Sirius Forester runs the foreman loop, Catryna Wikinelli keeps the
+# living docs. One short nudge, only when something is missing — full fleet
+# control needs all four.
+#
+# suite_repo: true when the cwd already uses any suite tool. The SessionStart
+# --check runs in EVERY repo; the nudge stays quiet outside suite repos so it
+# never nags unrelated projects.
+suite_repo() {
+  # .docs/ alone is too generic a name; require Catryna's index file.
+  [ -d .sirius ] || [ -d .ametrite ] || [ -d .hayven ] || [ -f .docs/_index.json ]
+}
+
+suite_hint() {
+  s_missing=""
+  have amt    || s_missing="$s_missing Ametrite"
+  have sirius || s_missing="$s_missing Sirius"
+  grep -qs '"catryna@catryna-wikinelli"' "$HOME/.claude/plugins/installed_plugins.json" \
+    || s_missing="$s_missing Catryna"
+  if [ -z "$s_missing" ]; then return 0; fi
+  log ""
+  log "fleet suite: missing:$s_missing. Hayvenhurst is the suite's code graph; for full fleet control install the whole suite:"
+  case "$s_missing" in *Sirius*)   log "  Sirius Forester (fleet foreman): /plugin marketplace add Davidb3l/Sirius-Forester, /plugin install sirius@sirius-forester, then /sirius:install-binary" ;; esac
+  case "$s_missing" in *Catryna*)  log "  Catryna Wikinelli (code wiki): /plugin marketplace add Davidb3l/Catryna-Wikinelli, then /plugin install catryna@catryna-wikinelli" ;; esac
+  case "$s_missing" in *Ametrite*) log "  Ametrite (task board): ask Claude to \"ametrite this repo\" — the skill bootstraps the amt CLI" ;; esac
+}
+
 # A downloader that works on a stock macOS or Linux box.
 fetch() { # fetch <url> <dest>
   url="$1"; dest="$2"
@@ -123,7 +155,9 @@ sha256_of() { # sha256_of <file> -> hex on stdout
 }
 
 # Resolve "latest" to a concrete tag via the GitHub redirect (no API token,
-# no jq). /releases/latest 302-redirects to /releases/tag/<TAG>.
+# no jq). /releases/latest 302-redirects to /releases/tag/<TAG>. On curl-less
+# boxes, fall back to the public API (wget works there; light rate limit is
+# fine for an installer).
 resolve_latest_tag() {
   if [ -n "$TAG" ]; then return 0; fi
   loc=""
@@ -134,6 +168,10 @@ resolve_latest_tag() {
     */releases/tag/*) TAG="${loc##*/releases/tag/}" ;;
     *) TAG="" ;;
   esac
+  if [ -z "$TAG" ] && have wget; then
+    TAG="$(fetch_stdout "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
+      | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1 || true)"
+  fi
   [ -n "$TAG" ] || fail "could not resolve the latest release tag for $REPO (pass --version vX.Y.Z)"
 }
 
@@ -152,14 +190,17 @@ print_path_hint() {
 if [ "$MODE" = "check" ]; then
   if have hayven; then
     log "hayven: already on PATH ($(command -v hayven))"
+    if suite_repo; then suite_hint; fi
     exit 0
   fi
   if [ -x "$BIN_DIR/hayven" ]; then
     log "hayven: installed at $BIN_DIR/hayven (not on PATH)"
     print_path_hint
+    if suite_repo; then suite_hint; fi
     exit 0
   fi
   log "hayven: not installed. Run /hayvenhurst:install-binary (or plugin/scripts/install-hayven.sh) to install it."
+  if suite_repo; then suite_hint; fi
   exit 3
 fi
 
@@ -247,3 +288,4 @@ log ""
 log "Next steps:"
 log "  hayven init          # set up .hayven/ and do the first ingestion"
 log "  hayven daemon start  # serves the code graph on :7777"
+suite_hint
