@@ -98,7 +98,7 @@ const COMMANDS: readonly Command[] = [
   { name: "daemon", group: "common", run: runDaemon,
     help: "daemon <start|stop|status> Daemon control" },
   { name: "doctor", group: "common", run: runDoctor,
-    help: "doctor                     Check Bun, native binary, and config" },
+    help: "doctor [--json]            Check Bun, native binary, and config (--json: the SUITE_CONTRACTS §3 discovery envelope)" },
   { name: "config", group: "common", run: runConfig,
     help: "config [key] [value]       Read/write configuration values" },
   { name: "reindex", group: "common", run: runReindex,
