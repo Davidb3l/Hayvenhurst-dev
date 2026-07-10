@@ -2,6 +2,10 @@
 
 All notable user-facing changes. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project adheres to [Semantic Versioning](https://semver.org/). Pre-release (`0.x`): expect breaking changes in every `0.x` until v1.0.
 
+## [Unreleased]
+
+- **`hayven doctor --json` speaks the suite discovery handshake.** It emits exactly one envelope on stdout (`tool`, `version`, `schemaVersion`, `ok`, `capabilities`, `checks`, `report`) so companion tools can discover Hayvenhurst instead of classifying it absent. Health is carried by `ok`: under `--json` doctor exits 0 whenever it produced an envelope, so an installed-but-degraded daemon reads as unhealthy rather than missing. Human output and its exit codes are unchanged.
+
 ## [0.0.6]
 
 - **The daemon outlives its session.** `hayven daemon start` detaches by default (`--foreground` opts out), handles SIGHUP cleanly, cleans stale pidfiles, and a second repo's `start` joins the running daemon (live registration) instead of dying on a port collision. The Claude Code plugin gains a session-start hook that auto-starts the daemon in Hayvenhurst repos.
