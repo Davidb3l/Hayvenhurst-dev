@@ -2,6 +2,12 @@
 
 All notable user-facing changes. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project adheres to [Semantic Versioning](https://semver.org/). Pre-release (`0.x`): expect breaking changes in every `0.x` until v1.0.
 
+## [0.0.6]
+
+- **The daemon outlives its session.** `hayven daemon start` detaches by default (`--foreground` opts out), handles SIGHUP cleanly, cleans stale pidfiles, and a second repo's `start` joins the running daemon (live registration) instead of dying on a port collision. The Claude Code plugin gains a session-start hook that auto-starts the daemon in Hayvenhurst repos.
+- **Project-addressed writes on shared daemons.** Mutating CLI commands address their own project; the daemon refuses writes naming a project it doesn't serve. `hayven sync` resolves the peer-side project before any exchange (`--peer-project` required when the peer serves several) and the live-sync WebSocket pins each connection to its selected project, evicting peers of hot-removed projects.
+- **Signed releases fixed.** Earlier releases published no signature assets due to an artifact-name mismatch; tarballs now ship with their `.sigstore.json` bundles.
+
 ## [0.0.5]
 
 - **One daemon serves multiple repos.** A running daemon now serves every registered project at once, not just the directory it started in. `hayven init` auto-registers each project; manage the set with `hayven daemon register <path>` / `projects` / `unregister`. The viewer gains a project switcher in the nav, and every API endpoint accepts `?project=<alias>` (defaulting to the primary). Single-repo setups are unchanged — the switcher stays hidden and nothing new is required.
