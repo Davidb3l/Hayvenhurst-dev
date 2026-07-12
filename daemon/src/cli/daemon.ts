@@ -36,6 +36,7 @@ import {
   verifyMerge,
 } from "../conflict/verify.ts";
 import { startWatch, type WatchEvent, type WatchSupervisor } from "../native/watcher.ts";
+import { emitCodeChanged } from "../spine.ts";
 import { rootLogger } from "../util/log.ts";
 import type { ParsedArgs } from "../cli.ts";
 import { Db } from "../db/queries.ts";
@@ -767,7 +768,38 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
             for (const f of deleted) db.deleteNodesByFile(f);
             for (const f of changed) db.deleteNodesByFile(f);
             db.clearMergeState([...changed, ...deleted]);
-            if (changed.size === 0) return;
+
+            // Suite spine PRODUCER (SUITE_CONTRACTS §2): after this batch is
+            // durable, append one `code.changed` event. Best-effort — the emitter
+            // itself never throws; this guard only covers the symbol query.
+            // `files` = sorted union of changed+deleted (a delete still shows up
+            // though its nodes are already gone); `symbols` = the surviving node
+            // ids of the changed files.
+            const emitSpine = () => {
+              if (changed.size === 0 && deleted.size === 0) return;
+              try {
+                const files = [...new Set([...changed, ...deleted])].sort();
+                const symbols: string[] = [];
+                const q = db.handle.query<{ id: string }, [string]>(
+                  "SELECT id FROM nodes WHERE file = ? AND kind != 'module'",
+                );
+                for (const f of changed) {
+                  for (const r of q.all(f)) symbols.push(r.id);
+                }
+                emitCodeChanged({ repoRoot: paths.repoRoot, files, symbols });
+              } catch (spineErr) {
+                plog.warn("watch: spine code.changed emit failed (non-fatal)", {
+                  error: (spineErr as Error).message,
+                });
+              }
+            };
+
+            if (changed.size === 0) {
+              // Delete-only batch: nodes already purged above and durable, so the
+              // deletion is real — emit before returning (no re-parse).
+              emitSpine();
+              return;
+            }
             try {
               const run = startParse({
                 binary: watcherBinary,
@@ -841,6 +873,11 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
                   error: (verr as Error).message,
                 });
               }
+
+              // Re-ingest is durable (drainIngest returned) — emit the spine
+              // event. Inside the try so a failed re-ingest (caught below) never
+              // emits a `code.changed` for a change that didn't land.
+              emitSpine();
             } catch (err) {
               plog.warn("watch: incremental re-ingest failed", { error: (err as Error).message });
             }
