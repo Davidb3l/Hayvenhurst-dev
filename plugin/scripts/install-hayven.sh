@@ -75,7 +75,7 @@ detect_platform() {
   case "$uname_s" in
     Linux)  os="linux" ;;
     Darwin) os="macos" ;;
-    *) fail "unsupported OS '$uname_s' (this script covers macOS + Linux; on Windows install from the release tarball manually — see plugin/README.md)" ;;
+    *) fail "unsupported OS '$uname_s' (this script covers macOS + Linux; on Windows install from the release tarball manually, see plugin/README.md)" ;;
   esac
   case "$uname_m" in
     x86_64|amd64) arch="x64" ;;
@@ -110,14 +110,17 @@ suite_hint() {
   s_missing=""
   have amt    || s_missing="$s_missing Ametrite"
   have sirius || s_missing="$s_missing Sirius"
-  grep -qs '"catryna@catryna-wikinelli"' "$HOME/.claude/plugins/installed_plugins.json" \
+  # Prefix match: catryna installs as `catryna@<marketplace>` and there are two
+  # legitimate marketplaces (its own `catryna-wikinelli`, and the Sothis bundle
+  # `sirius-forester`). Pinning one key nags bundle users forever.
+  grep -qs '"catryna@' "$HOME/.claude/plugins/installed_plugins.json" \
     || s_missing="$s_missing Catryna"
   if [ -z "$s_missing" ]; then return 0; fi
   log ""
   log "fleet suite: missing:$s_missing. Hayvenhurst is the suite's code graph; for full fleet control install the whole suite:"
   case "$s_missing" in *Sirius*)   log "  Sirius Forester (fleet foreman): /plugin marketplace add Davidb3l/Sirius-Forester, /plugin install sirius@sirius-forester, then /sirius:install-binary" ;; esac
-  case "$s_missing" in *Catryna*)  log "  Catryna Wikinelli (code wiki): /plugin marketplace add Davidb3l/Catryna-Wikinelli, then /plugin install catryna@catryna-wikinelli" ;; esac
-  case "$s_missing" in *Ametrite*) log "  Ametrite (task board): ask Claude to \"ametrite this repo\" — the skill bootstraps the amt CLI" ;; esac
+  case "$s_missing" in *Catryna*)  log "  Catryna Wikinelli (code wiki): /plugin marketplace add Davidb3l/Catryna-Wikinelli, then /plugin install catryna@catryna-wikinelli (Sothis bundle users: /plugin install catryna@sirius-forester)" ;; esac
+  case "$s_missing" in *Ametrite*) log "  Ametrite (task board): ask Claude to \"ametrite this repo\" (the skill bootstraps the amt CLI)" ;; esac
 }
 
 # A downloader that works on a stock macOS or Linux box.
@@ -218,9 +221,9 @@ log "install-hayven: asset=$TARBALL"
 
 # Allow a dry run of just the detection/mapping logic without network I/O.
 if [ "${HAYVEN_INSTALL_DRY_RUN:-}" = "1" ]; then
-  log "DRY RUN — would download: $TARBALL_URL"
-  log "DRY RUN — would verify:   $CHECKSUM_URL"
-  log "DRY RUN — would install into: $BIN_DIR"
+  log "DRY RUN: would download: $TARBALL_URL"
+  log "DRY RUN: would verify:   $CHECKSUM_URL"
+  log "DRY RUN: would install into: $BIN_DIR"
   exit 0
 fi
 
@@ -282,7 +285,7 @@ if [ -d "$STAGE/skill" ]; then
 fi
 
 log ""
-log "install-hayven: done — hayven $VERSION installed for $PLATFORM."
+log "install-hayven: done. hayven $VERSION installed for $PLATFORM."
 print_path_hint
 log ""
 log "Next steps:"
