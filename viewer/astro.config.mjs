@@ -44,8 +44,16 @@ function pruneOrphanChunks() {
         };
         walk(distDir);
 
-        const chunkRe = /_a\/([A-Za-z0-9_-]+\.js)/g;
-        const localRe = /["'](?:\.\/|_a\/)([A-Za-z0-9_-]+\.js)["']/g;
+        // NOTE: the name may contain DOTS. Astro 5 emitted hash-only chunks
+        // (`P4Fj0MHm.js`); Astro 7 emits `<name>.<hash>.js`
+        // (`SearchBox.BC2z29UO.js`). A dot-less character class matches the
+        // former and NOTHING in the latter, which made every HTML root come
+        // back empty, marked every chunk unreachable, and deleted the entire
+        // client bundle — a viewer that renders as dead static HTML while the
+        // build exits 0. Keep both shapes matchable.
+        const NAME = "[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*";
+        const chunkRe = new RegExp(`_a\\/(${NAME}\\.js)`, "g");
+        const localRe = new RegExp(`["'](?:\\.\\/|_a\\/)(${NAME}\\.js)["']`, "g");
         /**
          * @param {string} src
          * @param {RegExp} re
