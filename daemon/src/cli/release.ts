@@ -13,6 +13,11 @@
  *   200 → released.
  *   404 → no active claim with that id (already released / never existed).
  */
+import {
+  CLI_REQUEST_TIMEOUT_MS,
+  describeDaemonFetchFailure,
+  fetchWithTimeout,
+} from "./_fetch.ts";
 import { assertDaemonServesProject, isJson, projectHeader, reportIdentity, requireProject } from "./_shared.ts";
 import type { ParsedArgs } from "../cli.ts";
 
@@ -39,14 +44,17 @@ export async function runRelease(args: ParsedArgs): Promise<number> {
 
   let res: Response;
   try {
-    res = await fetch(`${base}/api/claims/${encodeURIComponent(id)}`, {
-      method: "DELETE",
-      headers: projectHeader(identity),
-    });
+    // BOUNDED (T1). A release that parks for Bun's 5-minute default is worse
+    // than most: the caller is trying to HAND BACK a scope, so every other
+    // agent waiting on that scope is blocked for the whole 300 s too.
+    res = await fetchWithTimeout(
+      `${base}/api/claims/${encodeURIComponent(id)}`,
+      { method: "DELETE", headers: projectHeader(identity) },
+      CLI_REQUEST_TIMEOUT_MS,
+    );
   } catch (err) {
     process.stderr.write(
-      `error: could not reach daemon at ${base} (${(err as Error).message}).\n` +
-        "Start it with `hayven daemon start`.\n",
+      `error: ${describeDaemonFetchFailure(base, err, CLI_REQUEST_TIMEOUT_MS)}`,
     );
     return 1;
   }

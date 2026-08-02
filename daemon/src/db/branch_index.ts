@@ -37,6 +37,7 @@ import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
 import type { HayvenConfig } from "../config/defaults.ts";
+import { isSeedableIndex, readIndexIntegrity } from "./index_health.ts";
 import type { HayvenPaths } from "../util/paths.ts";
 
 /** Default LRU cap on cached per-branch indexes (config `index.maxBranches`). */
@@ -302,46 +303,28 @@ function freshestSeed(paths: HayvenPaths, exceptKey: string): string | null {
 
 /**
  * True unless we can POSITIVELY determine that `path` is a hayven index with no
- * usable graph — i.e. it opens, its `nodes` table is readable, and either that
- * table is empty or an interrupted ingest left the in-progress marker set.
+ * usable graph.
  *
- * The asymmetry is deliberate and narrow. This function exists to stop ONE
- * thing: a real hayven index that an interrupted ingest emptied being copied
- * into a new branch. It must NOT change the outcome for anything else, so
- * "cannot tell" (not a SQLite file, no `nodes`/`stats` table, a pre-schema or
- * foreign index) returns TRUE and preserves the previous seed-it-anyway
- * behaviour, exactly as the legacy `.hayven/index.sqlite` fallback relies on.
- * Rejecting those too would have been a bigger, unrelated behaviour change.
+ * This is now a THIN ADAPTER over the shared decision in `db/index_health.ts`
+ * ({@link readIndexIntegrity} + {@link isSeedableIndex}), not a second opinion.
+ * It used to be an admitted MIRROR of `Db.checkIndexIntegrity` that re-read the
+ * marker row itself, and the two disagreed on five of eight states: this copy
+ * treated ANY existing `ingest_in_progress` row as broken while the other
+ * treated `"0"`/`""`/garbage as absent, and the two answered the empty-graph
+ * case opposite ways. Where seeding genuinely needs a different ANSWER (an empty
+ * but structurally-fine index is readable yet useless to copy; "cannot tell"
+ * must stay seedable), that lives in `isSeedableIndex`, documented there — one
+ * decision, one derivation, no duplicate state machine.
  *
- * A wrong TRUE costs what today already costs (a seed that may be useless, then
- * a normal ingest); a wrong FALSE costs one full re-parse. Neither loses data.
- * Never throws.
+ * Still a plain `bun:sqlite` read: no `Db` wrapper, so no migrate/pragma side
+ * effects on a file we are only inspecting. Never throws.
  */
 function hasSeedableContent(path: string): boolean {
   if (!existsSync(path)) return false;
   let db: Database | null = null;
   try {
     db = new Database(path, { readonly: true });
-    let nodes: number;
-    try {
-      nodes = db.query<{ c: number }, []>("SELECT COUNT(*) AS c FROM nodes").get()?.c ?? 0;
-    } catch {
-      return true; // no `nodes` table → not a hayven graph index; leave as-is
-    }
-    if (nodes === 0) return false; // THE BUG: an emptied index must not propagate
-    // A set `ingest_in_progress` marker means an ingest cleared or half-rewrote
-    // this index and never finished — the other state we must not propagate.
-    // Mirrors `Db.checkIndexIntegrity`; read directly here so this stays a plain
-    // `bun:sqlite` read with no Db-wrapper (and no migrate) side effects.
-    try {
-      const marker = db
-        .query<{ value: string }, [string]>("SELECT value FROM stats WHERE key = ?")
-        .get("ingest_in_progress");
-      if (marker !== null && marker !== undefined) return false;
-    } catch {
-      // no `stats` table — the node count above already vouched for content
-    }
-    return true;
+    return isSeedableIndex(readIndexIntegrity(db));
   } catch {
     return true; // unopenable/unreadable → unchanged from prior behaviour
   } finally {

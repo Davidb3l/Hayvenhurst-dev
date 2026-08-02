@@ -211,13 +211,14 @@ describe("round 2 — file TYPE gate (a FIFO must not wedge the server)", () => 
   // cooperative). It lives in `fix_a_wedge_subprocess.test.ts`, under a
   // wall-clock SIGKILL, where a hang is an observable failure.
 
-  it("a directory named as a file is refused", () => {
-    const { root, db } = makeRepo();
-    expect(
-      buildContextPackForChange(db, root, "src", [{ startLine: 1, endLine: 10 }]),
-    ).toBeNull();
-    db.close();
-  });
+  // S6 — the "a directory named as a file is refused" test that used to live
+  // here PASSED WITH `statPackable` DELETED: driven through the packer,
+  // `readFileSync` on a directory throws EISDIR by itself, so the assertion
+  // documented the outcome instead of pinning the guard. It has moved to
+  // `gap_s_packer_indexer_parity.test.ts`, where `isPackableFile` is asserted
+  // DIRECTLY (removing the `isFile()` check fails it) — necessary now for a
+  // second reason too: indexer parity refuses `src` earlier, for having no
+  // extension, so no end-to-end probe can reach the file-type guard at all.
 });
 
 describe("round 2 — file SIZE gate", () => {

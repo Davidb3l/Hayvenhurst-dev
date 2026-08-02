@@ -15,6 +15,7 @@ import { runBranches } from "./cli/branches.ts";
 import { runClaim } from "./cli/claim.ts";
 import { runConfig } from "./cli/config.ts";
 import { runContext } from "./cli/context.ts";
+import { runCrdt } from "./cli/crdt.ts";
 import { runDaemon } from "./cli/daemon.ts";
 import { runDoctor } from "./cli/doctor.ts";
 import { runImpact } from "./cli/impact.ts";
@@ -72,7 +73,7 @@ interface Command {
  */
 export const COMMANDS: readonly Command[] = [
   { name: "init", group: "common", run: runInit,
-    help: "init                       Initialize .hayven/ in the current project and run a first ingest" },
+    help: "init [--max-files N|off]   Initialize .hayven/ and run a first ingest; refuses a root over N indexable files (default ceiling on)" },
   { name: "ingest", group: "common", run: runIngest,
     help: "ingest [path] [--full]     Re-scan the codebase (incremental by default)" },
   { name: "query", group: "common", run: runQuery,
@@ -96,11 +97,11 @@ export const COMMANDS: readonly Command[] = [
   { name: "mcp", group: "common", run: runMcp,
     help: "mcp                        Serve the context packer over MCP (stdio JSON-RPC) — stateless, read-only" },
   { name: "proxy", group: "common", run: runProxy,
-    help: "proxy [--provider ...] [--compact-history] Transparent LLM-API proxy: graph slices + history compaction" },
+    help: "proxy [--provider ...] [--host H] [--port N] [--upstream URL] [--compact-history [--keep-recent N]] Transparent LLM-API proxy: graph slices + history compaction (binds 127.0.0.1)" },
   { name: "node", group: "common", run: runNode,
     help: "node body <id> [--body|--file] Update a node's markdown body (LWW CRDT write)" },
   { name: "summarize", group: "common", run: runSummarize,
-    help: "summarize [<id>] [--all] [--json] Summarize one node or every node (heuristic; LLM when a model is present)" },
+    help: "summarize [<id>] [--all] [--limit N] [--max-seconds S] [--json] Summarize one node or every node (heuristic; LLM when a model is present)" },
   { name: "view", group: "common", run: runView,
     help: "view                       Open the Astro viewer at http://localhost:7777" },
   { name: "daemon", group: "common", run: runDaemon,
@@ -121,6 +122,8 @@ export const COMMANDS: readonly Command[] = [
     help: "release <claim_id>         Release a claim" },
   { name: "sync", group: "coordination", run: runSync,
     help: "sync <peer_url> [--peer-project <alias>]  Sync CRDT state with a peer" },
+  { name: "crdt", group: "coordination", run: runCrdt,
+    help: "crdt [retention] [--json]  Op-log size, segment counts and growth-bound violations (it is never pruned)" },
   { name: "traces", group: "coordination", run: runTraces,
     help: "traces <id>                Runtime trace history for an entity" },
   { name: "remember", group: "coordination", run: runRemember,

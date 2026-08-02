@@ -12,6 +12,7 @@ import { pruneOrphanNodeMarkdowns, writeNodeMarkdowns } from "./nodeWriter.ts";
 import { normalizePosix, SpecifierResolver } from "./specifierResolve.ts";
 import { WorkspaceMap } from "./workspace.ts";
 import type { GraphEdge, GraphNode, RawEdge } from "./types.ts";
+import { pruneExpired } from "../db/fleet_memory.ts";
 import type { Db } from "../db/queries.ts";
 import { describeFailure, type ParseRun } from "../native/process.ts";
 import type { NativeRecord } from "../native/protocol.ts";
@@ -19,6 +20,15 @@ import type { Logger } from "../util/log.ts";
 
 const NODE_BATCH = 1000;
 const EDGE_BATCH = 1000;
+
+/** `stats` key holding when expired fleet memory was last reclaimed (epoch ms).
+ *  See the prune block at the end of {@link runIngest} for why it is rate-limited. */
+const FLEET_MEMORY_PRUNED_AT_KEY = "fleet_memory_pruned_at";
+
+/** How often a successful ingest may reclaim expired fleet memory. One hour: the
+ *  watcher can run dozens of incremental ingests a minute, and an expired note
+ *  costs nothing but a table row until it is collected. */
+const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 
 /**
  * HARD CAPS on a single ingest run — the "unbounded work with no user-visible
@@ -112,6 +122,13 @@ export interface IngestResult {
   warnings: number;
   /** Native-reported elapsed_ms (from `done` record). */
   nativeElapsedMs: number;
+  /**
+   * How many of this run's source files were OVERWRITTEN by another file
+   * deriving the same module id (ids are the `nodes` primary key, so the loser
+   * vanishes from the graph). Counted once per losing file. Normally 0; also
+   * logged per occurrence and recorded as the `last_ingest_id_collisions` stat.
+   */
+  idCollisions: number;
 }
 
 export interface IngestOptions {
@@ -223,6 +240,12 @@ export async function runIngest(opts: IngestOptions): Promise<IngestResult> {
   // same transaction that records success. Any reader that finds the flag treats
   // the index as broken rather than fresh. Idempotent — `clearGraph()` already
   // stamped it inside its own wipe transaction and the earliest start wins.
+  //
+  // Read BEFORE marking: true when the CALLER already declared an ingest on this
+  // handle, which in practice means it cleared the graph itself (`cli/daemon.ts`
+  // does, ahead of both its full-ingest and its branch-re-point paths). A refused
+  // run must not retract a marker it did not raise — see the abort path below.
+  const callerDeclaredIngest = db.hasDeclaredIngest();
   db.markIngestInProgress(startedAt);
 
   const nodes: GraphNode[] = [];
@@ -256,6 +279,35 @@ export async function runIngest(opts: IngestOptions): Promise<IngestResult> {
    * function/class/method record from the same file.
    */
   const moduleByFile = new Map<string, string>();
+
+  /**
+   * module entity id → the FIRST file that claimed it, so a second file
+   * deriving the same id is REPORTED instead of silently overwriting it.
+   *
+   * WHY: `scopeForFile` elides the first `src/` path segment, so `a/src/b.ts`
+   * and `a/b.ts` both derive the module id `a/b`. Ids are the `nodes` PRIMARY
+   * KEY, so the second file's rows UPSERT over the first's and one file
+   * disappears from the graph with no error anywhere — the same class as the
+   * monorepo collision that erased 22% of a real repo. Fixing the derivation is
+   * an id-scheme migration (every stored id, markdown path and `fleet_memory`
+   * anchor changes), which is out of scope here; making the collision LOUD is
+   * not, and it is the difference between a wrong answer and a reported one.
+   *
+   * Module-level is sufficient AND cheap: a non-module id is
+   * `<scope>/<module>/<qn>`, so two files can only collide on an entity id if
+   * they already collide on their module id. One entry per parsed file, bounded
+   * by the file cap.
+   *
+   * SCOPE: per-RUN. A scoped/incremental run only sees the files it re-parsed,
+   * so a collision against a file that was NOT re-parsed goes unreported until
+   * the next whole-repo ingest. That is a detection gap, not a correctness one —
+   * the overwrite it reports is pre-existing either way.
+   */
+  const fileByModuleId = new Map<string, string>();
+  /** How many parsed files were OVERWRITTEN by an id collision this run (one
+   *  per losing file, so three files sharing an id counts 2). Reported, never
+   *  silent. */
+  let idCollisions = 0;
 
   let filesTotal = 0;
   let filesDone = 0;
@@ -328,6 +380,27 @@ export async function runIngest(opts: IngestOptions): Promise<IngestResult> {
           qn,
           moduleName ? { moduleName, kind: rec.kind } : { kind: rec.kind },
         );
+        if (rec.kind === "module") {
+          const owner = fileByModuleId.get(id);
+          if (owner === undefined) {
+            fileByModuleId.set(id, rec.file);
+          } else if (owner !== rec.file) {
+            // Two source files derive the SAME primary key: the second silently
+            // UPSERTs over the first. See `fileByModuleId` for why we report
+            // rather than fix (an id-scheme migration) — but never stay quiet.
+            idCollisions++;
+            logger?.warn("entity-id COLLISION — two files derive the same module id", {
+              id,
+              file: rec.file,
+              collidesWith: owner,
+              hint:
+                "ids are the `nodes` primary key, so one of these files is being " +
+                "overwritten in the graph. Usually caused by a `src/` segment " +
+                "being elided from the id scope (`a/src/b.ts` and `a/b.ts` both " +
+                "derive `a/b`).",
+            });
+          }
+        }
         const node: GraphNode = {
           id,
           name: rec.name,
@@ -456,7 +529,14 @@ export async function runIngest(opts: IngestOptions): Promise<IngestResult> {
     // made the next run ineligible for the incremental path, so it took the
     // full path, refused again, and stayed wedged). If we DID write, the flag
     // stays: the index really is partial.
-    if (!mutatedIndex) db.endIngest();
+    //
+    // `callerDeclaredIngest` is the second half of that test. `endIngest()`
+    // retracts the HANDLE's token, and a caller that cleared the graph itself
+    // stamped that same token — so retracting on its behalf un-flags an index
+    // the caller just EMPTIED, leaving a zero-node graph reading as healthy.
+    // "We wrote nothing" is only "the index is untouched" when nobody else on
+    // this handle wrote either.
+    if (!mutatedIndex && !callerDeclaredIngest) db.endIngest();
     logger?.error("ingest aborted — hard cap exceeded", { reason: abortReason });
     throw new Error(abortReason);
   }
@@ -491,7 +571,14 @@ export async function runIngest(opts: IngestOptions): Promise<IngestResult> {
   // key this run re-emits is a key it fully re-derived.
   const aggregated = new Map<string, GraphEdge>();
   for (const e of [...resolved, ...unresolved]) {
-    const key = `${e.src} ${e.dst} ${e.kind}`;
+    // NUL is the field separator (it cannot occur in an id or kind), written
+    // as the ESCAPE `\x00` and never as a literal byte: a raw NUL makes
+    // `file(1)` report this source as `data` and makes GNU grep/ripgrep
+    // classify it as BINARY and skip it SILENTLY. Two separate audits of this
+    // file (the ingest caps, the edge writes, the orphan sweep) came back empty
+    // for exactly that reason. The escape costs nothing and keeps the file
+    // visible to every tool.
+    const key = `${e.src}\x00${e.dst}\x00${e.kind}`;
     const prior = aggregated.get(key);
     if (prior === undefined) aggregated.set(key, { ...e });
     else prior.weight += e.weight;
@@ -588,10 +675,53 @@ export async function runIngest(opts: IngestOptions): Promise<IngestResult> {
     db.recordNodeWatermark(db.counts().nodes, opts.fullRebuild === true);
     db.setStat("last_ingest_native_nodes", String(nativeNodes));
     db.setStat("last_ingest_warnings", String(warnings));
+    // Persisted so `doctor`/a later reader can see that this index is missing
+    // files, rather than the fact living only in a log line that has scrolled.
+    db.setStat("last_ingest_id_collisions", String(idCollisions));
     // Retracts ONLY this handle's token, so a concurrent ingest keeps its own
     // protection rather than being silently un-flagged by our success.
     db.endIngest();
   });
+
+  if (idCollisions > 0) {
+    // One line at the END, because the per-occurrence warnings above are easy to
+    // lose in a long parse log. This means the graph is MISSING FILES.
+    logger?.error("ingest finished with entity-id COLLISIONS — files are missing from the graph", {
+      collisions: idCollisions,
+      filesParsed: parsedFiles.size,
+    });
+  }
+
+  // Reclaim TTL'd fleet memory. Expired notes were filtered out at READ time and
+  // never deleted, so `fleet_memory` grew monotonically forever — and this
+  // round's reindex fix now PRESERVES that table, so nothing reclaimed it at
+  // all. A successful ingest is the natural hook: we already hold a writable
+  // handle, and it is the one moment we know no rebuild is mid-flight.
+  //
+  // BOUNDED AND NOT A SURPRISE, deliberately:
+  //   - only rows whose non-null TTL has ALREADY elapsed qualify — exactly the
+  //     rows every reader already hides. Permanent notes (`ttl IS NULL`) are
+  //     untouchable here.
+  //   - rate-limited to once per PRUNE_INTERVAL_MS, so the watcher's
+  //     per-file-save incremental ingests don't re-scan the table on every
+  //     keystroke;
+  //   - AFTER the success transaction and fully best-effort: a prune failure
+  //     must never turn a good ingest into a failed one, or re-flag the index.
+  try {
+    const last = Number(db.getStat(FLEET_MEMORY_PRUNED_AT_KEY) ?? "0");
+    const lastAt = Number.isFinite(last) && last > 0 ? last : 0;
+    // `lastAt > finishedAt` means the stamp is in the FUTURE — a stepped-back
+    // clock, or an index copied from a machine whose clock ran ahead. Treating
+    // that as "recently pruned" would suppress the prune indefinitely, so a
+    // future stamp prunes (and re-stamps to now) instead.
+    if (lastAt > finishedAt || finishedAt - lastAt >= PRUNE_INTERVAL_MS) {
+      const removed = pruneExpired(db, finishedAt);
+      db.setStat(FLEET_MEMORY_PRUNED_AT_KEY, String(finishedAt));
+      if (removed > 0) logger?.info("reclaimed expired fleet memory", { removed });
+    }
+  } catch (err) {
+    logger?.warn("fleet-memory prune failed (non-fatal)", { error: (err as Error).message });
+  }
 
   return {
     startedAt,
@@ -603,6 +733,7 @@ export async function runIngest(opts: IngestOptions): Promise<IngestResult> {
     unresolvedEdges: unresolved.length,
     warnings,
     nativeElapsedMs: nativeElapsedMs || finishedAt - startedAt,
+    idCollisions,
   };
 }
 

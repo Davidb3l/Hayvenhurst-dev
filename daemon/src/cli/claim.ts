@@ -13,6 +13,11 @@
  */
 import { createHash } from "node:crypto";
 
+import {
+  CLI_REQUEST_TIMEOUT_MS,
+  describeDaemonFetchFailure,
+  fetchWithTimeout,
+} from "./_fetch.ts";
 import { assertDaemonServesProject, projectHeader, reportIdentity, requireProject } from "./_shared.ts";
 import { isJson } from "./_shared.ts";
 import type { ParsedArgs } from "../cli.ts";
@@ -83,15 +88,23 @@ export async function runClaim(args: ParsedArgs): Promise<number> {
 
   let res: Response;
   try {
-    res = await fetch(`${base}/api/claims`, {
-      method: "POST",
-      headers: { "content-type": "application/json", ...projectHeader(identity) },
-      body: JSON.stringify(body),
-    });
+    // BOUNDED (T1). Un-bounded this inherited Bun's 5-minute idle default, so
+    // an agent claiming a scope against a busy-but-alive daemon blocked for
+    // 300 s with no output — indistinguishable from a hang, which is what made
+    // the incident invisible. The signal stays armed through the body read
+    // below (`res.json()`), or the stall just moves there.
+    res = await fetchWithTimeout(
+      `${base}/api/claims`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", ...projectHeader(identity) },
+        body: JSON.stringify(body),
+      },
+      CLI_REQUEST_TIMEOUT_MS,
+    );
   } catch (err) {
     process.stderr.write(
-      `error: could not reach daemon at ${base} (${(err as Error).message}).\n` +
-        "Start it with `hayven daemon start`.\n",
+      `error: ${describeDaemonFetchFailure(base, err, CLI_REQUEST_TIMEOUT_MS)}`,
     );
     return 1;
   }

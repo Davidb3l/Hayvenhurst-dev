@@ -18,14 +18,48 @@
 // would also change merge results (G-Set weights are summed honestly across
 // every observation op, `materializeGset`). Both violate the brief's "preserve
 // data over delete" and "do not silently drop data that changes merge
-// results", so this module is deliberately observe-and-shout only. The
-// compaction design that WOULD be safe is written up in the lane report; it
-// needs a negotiated retention horizon exchanged in the Merkle handshake, and
-// that is a protocol change, not a patch.
+// results", so this module is deliberately observe-and-shout only.
+//
+// ── T5 VERDICT: PRUNING IS A PROTOCOL CHANGE. STILL NOT IMPLEMENTED. ────────
+//
+// The candidate design was: peers exchange `oldest_retained_day` in the Merkle
+// handshake; `diffSnapshots` ignores every day below `max(mine, theirs)`; and a
+// peer prunes a day only once EVERY KNOWN PEER has acknowledged it. Assessed
+// against the code as it stands, that design cannot be built here, and the
+// blocker is the third clause rather than the first two:
+//
+//   1. The handshake half IS cheap. `GET /api/sync/merkle` returns
+//      `Record<CrdtType, string>`; adding an `oldest_retained_day` field is
+//      backward-compatible (old peers ignore unknown fields) and the
+//      `diffSnapshots` floor is a few lines. Roughly a day of work.
+//   2. "Every known peer has acknowledged it" has NO SUBSTRATE. There is no
+//      peer set: `config.sync_peers` is declared in `config/defaults.ts` and
+//      read by nothing. There is no peer identity, no ack store, no
+//      last-seen-per-peer table, and no peer-initiated callback. `hayven sync
+//      <peer_url>` is a ONE-SHOT, initiator-driven CLI invocation against a URL
+//      typed on the command line; the responding daemon does not even learn who
+//      called it. So "every known peer" evaluates over the empty set, which
+//      makes the safety condition vacuously true — i.e. the design would prune
+//      immediately and reintroduce exactly the divergence it exists to prevent.
+//   3. Shipping only half of it is WORSE than shipping none. A peer that prunes
+//      while advertising a floor an OLD peer does not read gets its data pushed
+//      straight back by that old peer, forever, on every sync — the pull/push
+//      loop above with extra steps. So the floor must be understood by BOTH
+//      ends before either end may prune, which makes this a two-sided,
+//      version-gated rollout.
+//
+// The honest cost is therefore: a durable peer registry (identity + last-acked
+// day per peer, persisted), an ack exchange, a `MIN_COMPATIBLE_DAEMON_VERSION`
+// bump so a pruning peer refuses to prune against a peer that predates the
+// floor field, and a migration for existing logs. That is its own release
+// cycle, not a patch in a gap-closing round, and attempting it inside this pass
+// would risk silent, unrecoverable data loss across replicas. It is NOT done.
 //
 // What IS enforced here is the hard inbound cap in `oplog.ts`
 // (`maxPushBatchBytes` / `maxSegmentBytes` / the segment-day window), which
-// bounds what an untrusted peer can make us store in the first place.
+// bounds what an untrusted peer can make us store in the first place — plus,
+// as of T6, a PERIODIC re-measurement so the warnings are reachable during a
+// long-running session and not only at daemon start.
 
 import type { CrdtType, OpLog } from "./oplog.ts";
 
@@ -66,6 +100,21 @@ export const CRDT_LIMITS: CrdtLimits = {
   maxPushBatchBytes: 8 * 1024 * 1024,
   maxSegmentBytes: 512 * 1024 * 1024,
 };
+
+/**
+ * How often the op log re-measures itself while a daemon is RUNNING
+ * (`OpLog.maybeCheckRetention`). Five minutes.
+ *
+ * WHY (T6): the F2 bounds were evaluated in exactly one place —
+ * `CrdtState.hydrate()`, i.e. daemon start — which is the moment the log is
+ * smallest. The incident's daemon ran for six hours in a single process and
+ * would have crossed every threshold in this file without emitting one line,
+ * because the only code that could emit had already finished. Five minutes is
+ * short enough that a runaway producer is named while it is still running, and
+ * long enough that the cost (one `stat` pass over the segment directories, no
+ * segment contents read) is irrelevant next to the writes it rides along with.
+ */
+export const RETENTION_RECHECK_INTERVAL_MS = 5 * 60 * 1000;
 
 export interface RetentionViolation {
   /** Stable machine-readable code, e.g. `total_bytes`, `segment_bytes`. */

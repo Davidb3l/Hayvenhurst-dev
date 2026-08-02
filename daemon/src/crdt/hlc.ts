@@ -107,6 +107,60 @@ export function encodeComposite(hlc: Hlc, writer: WriterId): Uint8Array {
 }
 
 /**
+ * How far AHEAD of this machine's physical clock a remote HLC may be and still
+ * be adopted by {@link HlcGenerator.observe}. 24 hours.
+ *
+ * WHY A BOUND EXISTS AT ALL. `observe` used to adopt max(local, remote)
+ * unconditionally, so ONE op carrying `wall_ms` in the year 2099 — from a
+ * hostile peer, or far more likely a peer whose RTC is dead — moved this
+ * replica's logical clock there PERMANENTLY. The damage is not abstract:
+ * `OpLog.appendOps` buckets a segment by the op's HLC day, so every subsequent
+ * LOCAL write lands in a year-2099 segment file. Every honest peer refuses
+ * those on receipt (`MAX_FUTURE_SEGMENT_DAYS`, 7 days), so the poisoned replica
+ * silently stops being able to propagate ANY of its own work — a self-inflicted
+ * partition that looks exactly like a healthy daemon. And it survives restart,
+ * because `hydrate()` replays the poisoning op off our own disk and re-adopts
+ * it every single start.
+ *
+ * WHY THIS DOES NOT BREAK CONVERGENCE. Strong eventual consistency here rests
+ * on exactly two things: (1) replicas exchange the same op SET, and (2) merges
+ * are a deterministic total order over each op's OWN embedded `[hlc][writer]`
+ * composite key (`compareComposite`, used by `applyLww` / the OR-Set / the
+ * G-Set). `observe` participates in NEITHER. It mutates only `this.last`, which
+ * is consulted solely when MINTING a new local op. Refusing an adoption cannot
+ * change the stored key of any existing op, cannot change any Merkle leaf (a
+ * leaf is the op-key set of a segment), and cannot change which side wins a
+ * merge of ops that already exist. Two replicas holding the same op set still
+ * materialize identical state no matter what their generators did.
+ *
+ * WHAT IT DOES COST, STATED PLAINLY. HLC's causality guarantee — "a local write
+ * issued after seeing remote op R dominates R" — is weakened for exactly the
+ * ops we refuse. A local write made after seeing a year-2099 op will now LOSE
+ * an LWW race against it. That is a fairness/liveness property, not a safety
+ * one, and it is the same exposure LWW already has to any clock skew. The trade
+ * is deliberate: losing one register to a peer with a broken clock is strictly
+ * better than losing our own replica's ability to sync at all. This is also
+ * what the original HLC paper prescribes — reject a remote timestamp beyond the
+ * maximum tolerated drift rather than absorb it.
+ *
+ * WHY 24 HOURS. It must sit comfortably INSIDE `MAX_FUTURE_SEGMENT_DAYS` (7
+ * days), because the whole point is that a clock pushed to this bound still
+ * mints segment days every peer accepts — 24 h leaves six days of margin, so
+ * there is no boundary case where our own writes become unsyncable. In the
+ * other direction it is far more skew than any NTP-synced machine has, and more
+ * than a wrong-timezone clock produces. The bound is recomputed against the
+ * PHYSICAL clock on every call, never against `this.last`, so repeated hostile
+ * observations cannot ratchet the clock forward step by step.
+ *
+ * A machine more than 24 h BEHIND real time will now refuse its peers' honest
+ * timestamps. It keeps working and keeps converging; its writes just lose LWW
+ * races, and it gets a loud `crdt_clock:` line naming the skew — which is the
+ * diagnosis its operator needs and previously never got, because silent
+ * adoption made a badly wrong clock look completely fine.
+ */
+export const MAX_OBSERVED_SKEW_MS = 24 * 60 * 60 * 1000;
+
+/**
  * HLC generator. Monotonic per replica: emitted HLCs never decrease over the
  * lifetime of the instance, even when the wall clock jumps backwards or a
  * remote HLC has already advanced past us.
@@ -114,10 +168,33 @@ export function encodeComposite(hlc: Hlc, writer: WriterId): Uint8Array {
 export class HlcGenerator {
   private last: Hlc;
   private readonly now: () => number;
+  private readonly maxSkewMs: number;
+  private readonly warn: (line: string) => void;
+  /** Remote HLCs refused by the skew bound since construction. */
+  private skewRejections = 0;
+  /** One warning line per generator, then silence — a peer streaming a million
+   *  skewed ops must not turn a diagnostic into its own unbounded output. The
+   *  running count stays available via {@link rejectedSkewCount}. */
+  private warnedSkew = false;
 
-  constructor(opts: { now?: () => number; seed?: Hlc } = {}) {
+  constructor(
+    opts: {
+      now?: () => number;
+      seed?: Hlc;
+      /** Override the {@link MAX_OBSERVED_SKEW_MS} acceptance window. */
+      maxSkewMs?: number;
+      /** Sink for the skew warning; injectable so tests need not capture stderr. */
+      warn?: (line: string) => void;
+    } = {},
+  ) {
     this.now = opts.now ?? Date.now;
     this.last = opts.seed ?? { wallMs: 0, counter: 0 };
+    this.maxSkewMs = opts.maxSkewMs ?? MAX_OBSERVED_SKEW_MS;
+    this.warn =
+      opts.warn ??
+      ((line: string) => {
+        process.stderr.write(line);
+      });
   }
 
   /** Emit a fresh HLC. */
@@ -144,15 +221,50 @@ export class HlcGenerator {
   /**
    * Update the local clock after receiving a remote HLC. Per the §11.4 skew
    * absorption rule, the local clock advances to max(local, remote) so the
-   * next `tick()` is guaranteed to dominate everything we have ever seen.
+   * next `tick()` dominates everything we have seen — but ONLY within
+   * {@link MAX_OBSERVED_SKEW_MS} of this machine's physical clock. Beyond that
+   * the observation is refused, counted and (once) shouted about; see the
+   * constant's docs for the full convergence argument and the cost.
+   *
+   * Returns `true` if the observation was accepted (adopted or already
+   * dominated), `false` if the skew bound refused it. Callers may ignore the
+   * result — nothing in the apply path branches on it — but the sync/ws routes
+   * and tests can use it to tell "applied" from "applied, clock untouched".
    */
-  observe(remote: Hlc): void {
+  observe(remote: Hlc): boolean {
+    // Compare against the PHYSICAL clock, never against `this.last`: bounding
+    // relative to our own (possibly already-advanced) logical time would let a
+    // peer ratchet us forward one window at a time, which is the same poisoning
+    // with extra steps.
+    const horizon = this.now() + this.maxSkewMs;
+    if (remote.wallMs > horizon) {
+      this.skewRejections += 1;
+      if (!this.warnedSkew) {
+        this.warnedSkew = true;
+        this.warn(
+          `crdt_clock:remote_skew_rejected remote_wall_ms=${remote.wallMs} ` +
+            `local_wall_ms=${this.now()} max_skew_ms=${this.maxSkewMs} ` +
+            "action=a peer sent an HLC beyond the accepted skew window; NOT adopting it " +
+            "(adopting would push every local op into a segment day that all peers refuse, " +
+            "silently ending this replica's ability to sync). Check the clocks on both machines; " +
+            "further occurrences are counted, not logged\n",
+        );
+      }
+      return false;
+    }
     if (compareHlc(remote, this.last) === 1) {
       // Keep our counter at the remote counter so the next local tick is
       // strictly greater than the observed remote — this is the standard
       // HLC merge rule and the one that absorbs forward skew correctly.
       this.last = { wallMs: remote.wallMs, counter: remote.counter };
     }
+    return true;
+  }
+
+  /** How many remote HLCs the skew bound has refused. Surfaced for diagnostics
+   *  — a nonzero count means some peer's clock (or ours) is wrong. */
+  rejectedSkewCount(): number {
+    return this.skewRejections;
   }
 
   /** Read-only view of the last emitted/observed HLC. */

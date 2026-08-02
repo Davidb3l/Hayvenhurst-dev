@@ -1,3 +1,12 @@
 # Bun runtime configuration for the Hayvenhurst daemon.
 [install]
 exact = false
+
+# Every `bun test` process gets a throwaway $HAYVEN_HOME before any test file is
+# imported. Hayvenhurst writes global state to ~/.hayven, and per-file sandboxing
+# proved insufficient: work that outlives the test which started it (a detached
+# daemon, a queued ingest, a floating promise) writes AFTER `afterEach` has
+# restored the real home, silently corrupting the developer's project registry.
+# See daemon/tests/_sandbox_preload.ts for the incident history.
+[test]
+preload = ["./tests/_sandbox_preload.ts"]

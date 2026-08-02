@@ -6,6 +6,7 @@
  */
 import type { Database } from "bun:sqlite";
 
+import { INGEST_IN_PROGRESS_KEY, inProgressSince, readInFlight } from "./index_health.ts";
 import {
   FTS_FLEET_MEMORY_SQL,
   FTS_FLEET_MEMORY_TRIGGERS_SQL,
@@ -347,22 +348,29 @@ export const REINDEX_PRESERVED_TABLES = [
  * ingest that has not happened yet, and leaving `last_ingest_at` behind is what
  * makes staleness lie.
  *
- * COUPLING, FLAGGED: these literals mirror private constants in
- * `db/queries.ts` (`INGEST_IN_PROGRESS_KEY`) and `cli/ingest.ts`. The
- * `fix_c_reindex_*` tests drive Lane B's PUBLIC API (`beginIngest` /
- * `ingestInProgressSince`) rather than these strings, so a rename over there
- * turns those tests red instead of silently disarming the detector.
+ * The marker key is the SHARED constant from `db/index_health.ts`, not a
+ * literal: it used to be duplicated here (and privately in `db/queries.ts`), so
+ * a rename could have silently taken this list out of sync with the detector it
+ * exists to preserve.
  */
-export const REINDEX_PRESERVED_STAT_KEYS = ["ingest_in_progress", "last_ingest_nodes"] as const;
+export const REINDEX_PRESERVED_STAT_KEYS = [
+  INGEST_IN_PROGRESS_KEY,
+  "last_ingest_nodes",
+] as const;
 
-/** True when an ingest has declared itself in flight (any live token). */
+/**
+ * True when an ingest has declared itself in flight (any live token).
+ *
+ * Delegates to the ONE marker grammar in `db/index_health.ts`. This used to
+ * hand-roll a third interpretation of the same row (`""` and `"[]"` absent,
+ * everything else present), which disagreed with both `Db.ingestInProgressSince`
+ * and `hasSeedableContent` on `"0"` and on non-numeric junk. Three readers of
+ * one marker is how a detector ends up armed in one code path and disarmed in
+ * another.
+ */
 function hasIngestMarker(db: Database): boolean {
   try {
-    const row = db
-      .query<{ value: string }, []>("SELECT value FROM stats WHERE key = 'ingest_in_progress'")
-      .get();
-    const raw = row?.value;
-    return raw !== undefined && raw !== null && raw !== "" && raw !== "[]";
+    return inProgressSince(readInFlight(db)) !== null;
   } catch {
     return false; // no `stats` table at all — nothing has been marked.
   }

@@ -487,7 +487,17 @@ export function createContextMcpServer(db: Db, repoRoot: string): ContextMcpServ
         return fail(id, ERR_INVALID_PARAMS, "`file` must be repo-relative, not absolute.");
       }
       if (resolveWithinRepo(repoRoot, file) === null) {
-        return fail(id, ERR_INVALID_PARAMS, "`file` resolves outside the repository.");
+        // The gate widened past containment (it now also refuses credential
+        // shapes and anything the INDEXER would not open — hidden paths, build
+        // output, non-source extensions), so the message must not keep claiming
+        // "outside the repository" for an in-repo `README.md` or `package.json`.
+        return fail(
+          id,
+          ERR_INVALID_PARAMS,
+          "`file` is not a packable repo-relative source path — it resolves outside the " +
+            "repository, or is a path the indexer does not read (hidden, build output, " +
+            "credential-shaped, or not a supported source language).",
+        );
       }
       const regions = readRegions(args["regions"]);
       if (typeof regions === "string") return fail(id, ERR_INVALID_PARAMS, regions);
@@ -632,6 +642,130 @@ export const MAX_PENDING_LINE_CHARS = 64 * 1024 * 1024;
 export const MAX_RESPONSE_CHARS = 16 * 1024 * 1024;
 
 /**
+ * Max RESPONSE characters we will let sit un-flushed before the loop stops
+ * consuming input.
+ *
+ * MEASURED (S3): with an MCP host that has stopped reading its end of the pipe,
+ * `runStdioLoop` kept pulling requests and handing responses to a
+ * fire-and-forget `write`, which buffered them INSIDE the process. Pipelined
+ * `ping`s with a ~64 KiB payload each grew RSS linearly and without limit —
+ * 500 → 80 MB, 2 000 → 134 MB, 8 000 → 270 MB, 30 000 → 1 458 MB, still
+ * climbing. Nothing in the loop bounded it, and no error was produced: the same
+ * silent unbounded-growth shape as the 6-hour indexing loop, reached through the
+ * output side.
+ *
+ * The cap is one {@link MAX_RESPONSE_CHARS} worth, so a single maximum-size
+ * response never trips it on its own; the bound the loop holds is therefore
+ * "one in-flight response plus this cap".
+ *
+ * Counted in BYTES, not UTF-16 code units, because that is what the stream
+ * actually buffers — a response of non-ASCII text would otherwise be
+ * under-counted by up to 3x against a cap the name claims is about size.
+ */
+export const MAX_UNFLUSHED_RESPONSE_BYTES = 16 * 1024 * 1024;
+
+/**
+ * How long {@link createDrainAwareWriter} will wait on one write completion
+ * before giving up on it and letting the loop proceed.
+ *
+ * The backpressure signal is the stream's per-chunk completion callback, and a
+ * stream that is DESTROYED mid-write (EPIPE — precisely the stalled-host case
+ * this exists for) may simply never call it. Without a ceiling the loop would
+ * then wait forever: no more requests answered, `runStdioLoop` never returns, so
+ * the caller's `finally` never runs and the process wedges holding the read DB
+ * handle. That is the same permanent-wedge failure the whole round is about,
+ * reintroduced by the fix for it. Waiting is a throttle, never a latch.
+ */
+export const FLUSH_WAIT_MS = 30_000;
+
+/**
+ * How {@link runStdioLoop} writes one response line.
+ *
+ * Returning a PROMISE is the backpressure contract: the loop awaits it before
+ * consuming any more input, so a writer that knows when its bytes have actually
+ * left the process can stop the loop from producing faster than the host reads.
+ * Any other return value is ignored, which keeps the old fire-and-forget
+ * behaviour — and that is exactly what has no bound, so prefer
+ * {@link createDrainAwareWriter}. The return type is `unknown` rather than
+ * `void | PromiseLike` so the existing non-signalling call sites
+ * (`(line) => process.stdout.write(line)`, `(line) => lines.push(line)`) still
+ * typecheck unchanged.
+ */
+export type StdioWriter = (line: string) => unknown;
+
+/** The subset of a Node writable stream {@link createDrainAwareWriter} needs. */
+export interface WritableLike {
+  write(chunk: string, cb?: (err?: Error | null) => void): unknown;
+}
+
+/**
+ * Wrap a writable stream as a backpressure-aware {@link StdioWriter}.
+ *
+ * WHY THE WRITE CALLBACK AND NOT THE USUAL SIGNALS — measured on Bun 1.3.14
+ * against a stalled pipe reader, `process.stdout` lies in every other channel:
+ * `write()` returned `true` MORE often with a stalled reader (382/500) than with
+ * an active one (334/500), and `writableLength` / `writableNeedDrain` reported
+ * `0` / `false` after 13 MB had been written to a reader that never read a byte.
+ * The per-chunk completion CALLBACK is the only signal that tracks reality: with
+ * an active reader it lagged by at most 18 chunks, with a stalled one by 237.
+ *
+ * The returned writer only makes the loop WAIT once more than
+ * {@link MAX_UNFLUSHED_RESPONSE_BYTES} is outstanding, so a healthy session pays
+ * no per-response round-trip. Because stream writes complete in order, awaiting
+ * the newest chunk's callback also confirms every earlier one.
+ *
+ * `waitMs` is the ceiling on any single wait ({@link FLUSH_WAIT_MS} by default);
+ * it is a parameter so the never-latches property can be tested in milliseconds
+ * instead of half a minute.
+ */
+export function createDrainAwareWriter(
+  stream: WritableLike,
+  waitMs: number = FLUSH_WAIT_MS,
+): StdioWriter {
+  let outstanding = 0;
+  return (line: string): void | PromiseLike<unknown> => {
+    const bytes = Buffer.byteLength(line, "utf8");
+    outstanding += bytes;
+    let settle: (() => void) | null = null;
+    // EXACTLY-ONCE accounting. A stream is free to invoke a write callback
+    // twice, or with an error, or (if it is destroyed) never. A double credit
+    // drove `outstanding` negative and silently disabled backpressure for the
+    // rest of the session; never calling it wedged the loop. Both are handled
+    // here rather than trusted away.
+    let settled = false;
+    const done = (): void => {
+      if (settled) return;
+      settled = true;
+      outstanding -= bytes;
+      settle?.();
+    };
+    try {
+      // An error argument still means "this chunk is no longer queued", so the
+      // callback settles the same way either way.
+      stream.write(line, done);
+    } catch {
+      // A synchronous throw means the chunk never entered the queue at all —
+      // release it, or the counter drifts up and pins the loop at the cap.
+      done();
+      return undefined;
+    }
+    if (outstanding <= MAX_UNFLUSHED_RESPONSE_BYTES) return undefined;
+    if (settled) return undefined; // already flushed synchronously
+    // Only past the cap do we allocate the promise + timer, so a healthy
+    // session really does pay nothing per response.
+    return new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, waitMs);
+      // Never hold the process open on this timer alone.
+      (timer as unknown as { unref?: () => void }).unref?.();
+      settle = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+    });
+  };
+}
+
+/**
  * Run the server over a newline-delimited (one JSON object per line) JSON-RPC
  * stream. Reads requests from `input`, writes responses to `write`. Each inbound
  * line is parsed independently; a parse error yields a JSON-RPC parse-error
@@ -643,6 +777,10 @@ export const MAX_RESPONSE_CHARS = 16 * 1024 * 1024;
  * line boundary. Dropping it loudly beats buffering it until the OOM killer
  * takes the whole server down mid-session.
  *
+ * OUTPUT BACKPRESSURE: when `write` returns a promise the loop awaits it before
+ * pulling the next input chunk — see {@link StdioWriter} and
+ * {@link MAX_UNFLUSHED_RESPONSE_BYTES} for the unbounded growth that closes.
+ *
  * Split out from the loop's I/O so the framing is testable without real fds:
  * the test drives {@link createContextMcpServer}'s `handle` directly; this
  * function exists for the real `hayven mcp` process.
@@ -650,12 +788,50 @@ export const MAX_RESPONSE_CHARS = 16 * 1024 * 1024;
 export async function runStdioLoop(
   server: ContextMcpServer,
   input: AsyncIterable<Uint8Array | string>,
-  write: (line: string) => void,
+  write: StdioWriter,
 ): Promise<void> {
   const decoder = new TextDecoder();
-  let buf = "";
+  /**
+   * The pieces of the CURRENT, not-yet-terminated line, plus their total length.
+   *
+   * WHY PIECES AND NOT ONE ACCUMULATING STRING (S4) — the old loop did
+   * `buf += text` then `buf.indexOf("\n")` on every chunk, which re-scans (and,
+   * on a rope, re-flattens) the whole accumulation each time: quadratic. Feeding
+   * a newline-less line in 64 KiB pipe-sized chunks measured 4 MiB → 85 MB RSS,
+   * 8 MiB → 154 MB, 16 MiB → 214 MB, 32 MiB → 397 MB, with time going 10 → 26 →
+   * 79 → 303 ms — so the 64 MiB named in {@link MAX_PENDING_LINE_CHARS} actually
+   * cost the better part of a gigabyte, an order of magnitude more than the
+   * constant's name implies. Scanning only the NEW chunk and joining the pieces
+   * once, when the line completes, makes both linear.
+   */
+  let pending: string[] = [];
+  let pendingLen = 0;
   /** True while we are discarding the tail of an over-long line. */
   let skipping = false;
+  /** Set by a backpressure-aware `write`; awaited before more work is done. */
+  let flushed: PromiseLike<unknown> | null = null;
+  /** Wait for the writer to catch up, if it has said it is behind. Awaited after
+   *  EVERY response, not once per input chunk: one 64 KiB chunk can hold a
+   *  thousand pipelined requests, and per-chunk waiting would let a thousand
+   *  responses be produced before the first pause — overshooting the cap by
+   *  three orders of magnitude. Costs nothing when the writer is keeping up,
+   *  since it only ever returns a promise past the cap. */
+  const awaitFlush = async (): Promise<void> => {
+    if (!flushed) return;
+    const p = flushed;
+    flushed = null;
+    await p;
+  };
+
+  const rawWrite = (line: string): void => {
+    const r = write(line);
+    // Keep only the NEWEST promise: stream writes complete in order, so awaiting
+    // the last one subsumes every earlier one.
+    if (r && typeof (r as PromiseLike<unknown>).then === "function") {
+      flushed = r as PromiseLike<unknown>;
+    }
+  };
+
   const emit = (resp: JsonRpcResponse | null): void => {
     if (resp === null) return;
     let line: string;
@@ -665,7 +841,7 @@ export async function runStdioLoop(
       // `JSON.stringify` is where a too-large response actually dies (a
       // RangeError, thrown before anything reaches stdout). Answer the client
       // instead of taking the server down mid-session.
-      write(
+      rawWrite(
         JSON.stringify({
           jsonrpc: "2.0",
           id: (resp as { id: string | number | null }).id,
@@ -678,7 +854,7 @@ export async function runStdioLoop(
       return;
     }
     if (line.length > MAX_RESPONSE_CHARS) {
-      write(
+      rawWrite(
         JSON.stringify({
           jsonrpc: "2.0",
           id: (resp as { id: string | number | null }).id,
@@ -692,7 +868,7 @@ export async function runStdioLoop(
       );
       return;
     }
-    write(line + "\n");
+    rawWrite(line + "\n");
   };
   const processLine = (line: string): void => {
     const trimmed = line.trim();
@@ -722,42 +898,61 @@ export async function runStdioLoop(
     // Decode BEFORE the skip branch so a multi-byte character split across the
     // chunk boundary is still stitched by the streaming decoder — dropping the
     // chunk undecoded would corrupt the first character of the NEXT line.
-    const text = typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
+    let text = typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
     if (skipping) {
       // Still inside the over-long line: throw characters away until a newline
       // gives us a clean frame boundary again.
       const nl = text.indexOf("\n");
       if (nl < 0) continue;
       skipping = false;
-      buf = text.slice(nl + 1);
-    } else {
-      buf += text;
+      text = text.slice(nl + 1);
     }
     // Drain complete lines, refusing any SINGLE line longer than the cap. The
     // length test lives inside this loop, not after it, so the cap is absolute:
     // an over-long line whose terminating newline arrives in the same chunk as
     // the overflow is refused too, rather than being parsed because the buffer
-    // happened to be drained before the check.
+    // happened to be drained before the check. Only the NEW chunk is scanned —
+    // already-buffered pieces are known to hold no newline.
+    let pos = 0;
     for (;;) {
-      const nl = buf.indexOf("\n");
-      if ((nl < 0 ? buf.length : nl) > MAX_PENDING_LINE_CHARS) {
-        tooLong();
-        if (nl < 0) {
-          // No boundary yet — drop what we hold and skip to the next newline.
-          buf = "";
+      const nl = text.indexOf("\n", pos);
+      if (nl < 0) {
+        const segLen = text.length - pos;
+        if (pendingLen + segLen > MAX_PENDING_LINE_CHARS) {
+          tooLong();
+          pending = [];
+          pendingLen = 0;
           skipping = true;
-          break;
+        } else if (segLen > 0) {
+          pending.push(pos === 0 ? text : text.slice(pos));
+          pendingLen += segLen;
         }
-        buf = buf.slice(nl + 1); // drop the whole over-long line, keep the rest
+        break;
+      }
+      const segLen = nl - pos;
+      if (pendingLen + segLen > MAX_PENDING_LINE_CHARS) {
+        tooLong();
+        pending = []; // drop the whole over-long line, keep the rest of the chunk
+        pendingLen = 0;
+        pos = nl + 1;
         continue;
       }
-      if (nl < 0) break;
-      const line = buf.slice(0, nl);
-      buf = buf.slice(nl + 1);
+      // Join ONCE, here, where the line is known complete and known under cap.
+      const line =
+        pendingLen === 0 ? text.slice(pos, nl) : pending.join("") + text.slice(pos, nl);
+      pending = [];
+      pendingLen = 0;
+      pos = nl + 1;
       processLine(line);
+      // Backpressure: stop producing while the writer says its bytes have not
+      // left the process. Without this the loop answers as fast as a host can
+      // pipeline requests, and a host that has stopped reading gets every
+      // response buffered in our heap instead — measured at 1.4 GB / 30k
+      // requests and 2.7 GB / 60k, with nothing bounding it.
+      await awaitFlush();
     }
   }
   // Flush a trailing line with no terminating newline (never the discarded tail
   // of an over-long one).
-  if (!skipping && buf.trim().length > 0) processLine(buf);
+  if (!skipping && pendingLen > 0) processLine(pending.join(""));
 }

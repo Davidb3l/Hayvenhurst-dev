@@ -388,6 +388,16 @@ export function nativeParseRunner(opts: {
   jobs: number;
   timeoutMs?: number | undefined;
   logger?: Logger | undefined;
+  /**
+   * SCOPE PARITY — must be the project's `index.includeVendored` /
+   * `index.includeFixtures`, identical to the ingest that produced the rows this
+   * gate is validating. `--files-stdin` applies the shared `ScopeFilter`
+   * (native/src/parse/mod.rs), so a narrower scope here makes the gate re-parse
+   * a vendored file, get ZERO records back, and conclude the merge dropped every
+   * entity in it — a `merge_rejected` flag against a file that is perfectly fine.
+   */
+  includeVendored?: boolean | undefined;
+  includeFixtures?: boolean | undefined;
 }): NativeParseFn {
   return async (files: string[]): Promise<NativeParseOutcome> => {
     const run = startParse({
@@ -397,6 +407,8 @@ export function nativeParseRunner(opts: {
       jobs: opts.jobs,
       ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
       ...(opts.logger ? { logger: opts.logger } : {}),
+      includeVendored: opts.includeVendored ?? false,
+      includeFixtures: opts.includeFixtures ?? false,
       files,
     });
     const records: NativeParseRecord[] = [];

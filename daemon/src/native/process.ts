@@ -58,14 +58,27 @@ export interface ParseOptions {
   /** Incremental ingest: when present, native bypasses the gitignore
    *  walker and parses only these repo-relative paths. ARCHITECTURE.md §16.3. */
   files?: string[];
-  /** Also index dependency-source dirs (`vendor/`, `Godeps/`, `third_party/`).
-   *  Default false — first-party code only. No effect on the incremental
-   *  (`files`) path, which parses exactly what it's given. */
+  /**
+   * Also index dependency-source dirs (`vendor/`, `Godeps/`, `third_party/`).
+   * Default false — first-party code only.
+   *
+   * APPLIES TO THE INCREMENTAL (`files`) PATH TOO. This comment used to say the
+   * flags had "no effect" there, which was true only while `--files-stdin`
+   * parsed whatever it was handed. It now runs the same `ScopeFilter` as the
+   * full walk (native/src/parse/mod.rs `candidates_from_explicit_files`), so
+   * every caller MUST pass the project's `index.includeVendored` here — a full
+   * ingest and an incremental re-ingest that disagree write different node sets
+   * into one graph, and the incremental path deletes a file's rows before
+   * re-parsing, so the narrower side wins by erasure.
+   */
   includeVendored?: boolean;
-  /** Also index test-fixture / example / benchmark dirs (`test/fixtures/`,
-   *  `examples/`, `benchmark(s)/`). Default false — fixture apps inflate the
-   *  index (measured 27.6% on astro) and dilute search. No effect on the
-   *  incremental (`files`) path, which parses exactly what it's given. */
+  /**
+   * Also index test-fixture / example / benchmark dirs (`test/fixtures/`,
+   * `examples/`, `benchmark(s)/`). Default false — fixture apps inflate the
+   * index (measured 27.6% on astro) and dilute search.
+   *
+   * Same incremental-path caveat as {@link ParseOptions.includeVendored}.
+   */
   includeFixtures?: boolean;
 }
 

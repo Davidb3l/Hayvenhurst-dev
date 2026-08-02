@@ -25,11 +25,11 @@
  *     in the op log and participates in sync on the daemon's next start.
  * Either way the summary mints an LWW op and lands in both stores.
  */
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync, statSync } from "node:fs";
 
 import type { ParsedArgs } from "../cli.ts";
 import { CrdtState } from "../crdt/state.ts";
+import { MAX_PACK_FILE_BYTES, resolveWithinRepo } from "../db/context_pack.ts";
 import {
   edgeRowToGraphEdge,
   nodeRowToGraphNode,
@@ -45,6 +45,7 @@ import { countUnsummarized, selectUnsummarizedIds } from "../graph/summarize_sca
 import type { GraphNode } from "../graph/types.ts";
 import { tryLocateNativeBinary } from "../native/locate.ts";
 import { rootLogger } from "../util/log.ts";
+import { CLI_PROBE_TIMEOUT_MS, CLI_REQUEST_TIMEOUT_MS, fetchWithTimeout } from "./_fetch.ts";
 import {
   assertDaemonServesProject,
   isJson,
@@ -323,7 +324,12 @@ async function daemonServesProject(
   ctx: ProjectContext,
 ): Promise<Record<string, string> | null> {
   try {
-    const res = await fetch(`${base}/api/health`);
+    // BOUNDED (T1). This probe decides which write TRANSPORT the whole run
+    // uses. Un-bounded it inherited Bun's 5-minute idle default, so a wedged
+    // daemon made `hayven summarize` sit for 300 s before it had summarized a
+    // single node — and the `--max-seconds` budget it prints is armed AFTER
+    // this call, so the user's stated bound could not possibly cover it.
+    const res = await fetchWithTimeout(`${base}/api/health`, undefined, CLI_PROBE_TIMEOUT_MS);
     if (!res.ok) return null;
     // Reuse the project-identity guard's logic: a foreign-serving daemon must
     // not receive our writes. assertDaemonServesProject returns ok:false only
@@ -359,9 +365,15 @@ async function summarizeViaDaemon(
     // view (it owns the authoritative DB while it's running).
     let node: GraphNode | null = null;
     try {
-      const res = await fetch(`${base}/api/nodes/${encodeURIComponent(nodeId)}`, {
-        headers: daemonHeaders,
-      });
+      // BOUNDED (T1). This runs ONCE PER NODE: with no signal, a `--all` run
+      // over a wedged daemon would burn Bun's 5-minute default per node, so a
+      // 500-node run could not finish this side of a week — and `--max-seconds`
+      // only stops it BETWEEN nodes, so the budget could not interrupt it.
+      const res = await fetchWithTimeout(
+        `${base}/api/nodes/${encodeURIComponent(nodeId)}`,
+        { headers: daemonHeaders },
+        CLI_REQUEST_TIMEOUT_MS,
+      );
       if (res.ok) {
         const payload = (await res.json()) as { node?: GraphNode };
         node = payload.node ?? null;
@@ -373,11 +385,18 @@ async function summarizeViaDaemon(
 
     const result = await summarizer.summarize(buildInput(ctx, node));
     try {
-      await fetch(`${base}/api/nodes/${encodeURIComponent(nodeId)}/body`, {
-        method: "PUT",
-        headers: { "content-type": "application/json", ...daemonHeaders },
-        body: JSON.stringify({ body: result.summary }),
-      });
+      // BOUNDED (T1) — same per-node reasoning as the GET above; this is the
+      // write half, so an unbounded stall here also leaves the operator unsure
+      // whether the summary landed.
+      await fetchWithTimeout(
+        `${base}/api/nodes/${encodeURIComponent(nodeId)}/body`,
+        {
+          method: "PUT",
+          headers: { "content-type": "application/json", ...daemonHeaders },
+          body: JSON.stringify({ body: result.summary }),
+        },
+        CLI_REQUEST_TIMEOUT_MS,
+      );
     } catch {
       // The daemon went away mid-run; skip this node rather than fail the batch.
       continue;
@@ -396,13 +415,41 @@ function buildInput(ctx: ProjectContext, node: GraphNode): SummaryInput {
 
 /**
  * Best-effort read of the first meaningful source line of a node's span. Pure
- * filesystem read; any failure (file gone, range stale) yields `undefined` and
- * the heuristic falls back to metadata only.
+ * filesystem read; any failure (file gone, range stale, path refused) yields
+ * `undefined` and the heuristic falls back to metadata only.
+ *
+ * GATED (T2) — this was the last ungated `readFileSync` on a graph-row path.
+ * `node.file` is NOT trustworthy input: on the daemon transport the row comes
+ * back over HTTP from whatever daemon owns port 7777, and on either transport
+ * the row was written by the indexer from repo content. A bare
+ * `join(repoRoot, node.file)` therefore accepted `../../.ssh/id_rsa` (a
+ * traversal), a symlink pointing out of the repo, a 200 MiB blob (measured
+ * elsewhere at +835 MB RSS for one read), and — worst — a FIFO, which makes
+ * `readFileSync` block FOREVER, synchronously and uninterruptibly, wedging the
+ * process in exactly the invisible way this whole pass exists to eliminate.
+ *
+ * The gate is the packer's, imported rather than re-implemented, so containment
+ * + the credential denylist stay defined in ONE place and this call site
+ * inherits any tightening Lane S makes to `resolveWithinRepo`. The
+ * regular-file + size check mirrors the packer's private `statPackable`;
+ * `statSync` follows symlinks but — unlike `open`/`read` — never blocks on a
+ * FIFO, so it is safe to ask.
+ *
+ * Exported ONLY so the gate can be tested directly. Reaching it through
+ * `summarizeOfflineAsync` would need a populated DB and a hydrated CrdtState,
+ * and the FIFO case cannot be asserted at all from there — an ungated read
+ * blocks the whole test process forever rather than failing.
  */
-function readFirstSourceLine(ctx: ProjectContext, node: GraphNode): string | undefined {
+export function readFirstSourceLine(ctx: ProjectContext, node: GraphNode): string | undefined {
   if (!node.file) return undefined;
-  const abs = join(ctx.paths.repoRoot, node.file);
-  if (!existsSync(abs)) return undefined;
+  const abs = resolveWithinRepo(ctx.paths.repoRoot, node.file);
+  if (abs === null) return undefined;
+  try {
+    const st = statSync(abs);
+    if (!st.isFile() || st.size > MAX_PACK_FILE_BYTES) return undefined;
+  } catch {
+    return undefined; // gone, or unstattable
+  }
   let text: string;
   try {
     text = readFileSync(abs, "utf8");

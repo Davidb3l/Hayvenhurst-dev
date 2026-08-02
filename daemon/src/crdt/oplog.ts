@@ -26,7 +26,13 @@ import {
 import { dirname, join } from "node:path";
 
 import { encodeHlc, type WriterId } from "./hlc.ts";
-import { CRDT_LIMITS } from "./retention.ts";
+import {
+  CRDT_LIMITS,
+  inspectRetention,
+  RETENTION_RECHECK_INTERVAL_MS,
+  warnRetention,
+  type CrdtLimits,
+} from "./retention.ts";
 import { openWireBridge, type WireBridge, type WireOp } from "./wire.ts";
 
 export type CrdtType = "lww" | "gset" | "orset";
@@ -97,6 +103,11 @@ export interface OpLogOptions {
   now?: () => number;
   /** Inject a wire bridge for tests; default opens the subprocess one. */
   bridge?: WireBridge;
+  /** Growth bounds for the periodic self-check. Defaults to {@link CRDT_LIMITS}. */
+  limits?: CrdtLimits;
+  /** How often the periodic self-check may run. Defaults to
+   *  {@link RETENTION_RECHECK_INTERVAL_MS}; `0` disables it entirely. */
+  retentionCheckIntervalMs?: number;
 }
 
 interface SegmentHandle {
@@ -118,12 +129,23 @@ export class OpLog {
   private readonly flushEveryWrites: number;
   private readonly flushEveryMs: number;
   private readonly segments = new Map<CrdtType, SegmentHandle>();
+  private readonly limits: CrdtLimits;
+  private readonly retentionCheckIntervalMs: number;
+  /** Wall-clock ms of the last periodic retention check. Seeded at CONSTRUCTION
+   *  so the first check is one interval away, not on the first append — the
+   *  hydrate-time check has just run and a second identical burst of warnings
+   *  on daemon start would be noise. */
+  private lastRetentionCheckMs: number;
 
   constructor(private readonly crdtRoot: string, opts: OpLogOptions = {}) {
     this.bridge = opts.bridge ?? openWireBridge();
     this.now = opts.now ?? Date.now;
     this.flushEveryWrites = opts.flushEveryWrites ?? 32;
     this.flushEveryMs = opts.flushEveryMs ?? 250;
+    this.limits = opts.limits ?? CRDT_LIMITS;
+    this.retentionCheckIntervalMs =
+      opts.retentionCheckIntervalMs ?? RETENTION_RECHECK_INTERVAL_MS;
+    this.lastRetentionCheckMs = this.now();
     for (const t of TYPES) mkdirSync(join(this.crdtRoot, t), { recursive: true });
   }
 
@@ -221,6 +243,7 @@ export class OpLog {
       } finally {
         closeSync(fd);
       }
+      this.maybeCheckRetention();
       return buf.length;
     }
 
@@ -236,7 +259,40 @@ export class OpLog {
       seg.pendingWrites = 0;
       seg.lastFlushMs = nowMs;
     }
+    this.maybeCheckRetention();
     return buf.length;
+  }
+
+  /**
+   * Periodic growth self-check, run from the append chokepoint.
+   *
+   * WHY THIS EXISTS (T6). The retention bounds added in F2 were measured ONLY
+   * in `CrdtState.hydrate()` — i.e. at daemon start. That is precisely the
+   * moment the log is smallest, and a daemon that runs for days never calls it
+   * again. The original incident ran for SIX HOURS in one process: a log that
+   * grows from nothing to gigabytes inside a single session would have crossed
+   * every threshold and reported none of them, because the only thing that
+   * could report was the code path that had already finished running. A bound
+   * nobody re-evaluates is a bound that fires once, on the wrong data.
+   *
+   * Cheap by construction: `inspectRetention` is `stat`-only (never reads a
+   * segment — reading them would BE the read amplification it detects), and the
+   * interval gate means the cost is one directory stat pass per interval no
+   * matter how hot the write path is. Failures are swallowed: a diagnostic must
+   * never be able to fail a CRDT write.
+   */
+  private maybeCheckRetention(): void {
+    if (this.retentionCheckIntervalMs <= 0) return;
+    const nowMs = this.now();
+    // `<` not `<=` on a zero-elapsed fake clock: tests that pin `now` to a
+    // constant must not re-stat on every single append.
+    if (nowMs - this.lastRetentionCheckMs < this.retentionCheckIntervalMs) return;
+    this.lastRetentionCheckMs = nowMs;
+    try {
+      warnRetention(inspectRetention(this, this.limits));
+    } catch {
+      // Never let a diagnostic break an append.
+    }
   }
 
   /** One `crdt_retention:local_day_out_of_window` line per (type, day), not

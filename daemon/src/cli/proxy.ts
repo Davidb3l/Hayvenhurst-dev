@@ -18,10 +18,14 @@
  * Point a client at it, e.g. `ANTHROPIC_BASE_URL=http://localhost:7788`
  * (or `OPENAI_BASE_URL` / a Gemini base URL for the other providers).
  *
- * It binds LOOPBACK ONLY by default (`--host` to override, with a warning) —
- * see {@link DEFAULT_HOST}.
+ * It binds LOOPBACK ONLY by default. `--host` may override it, but a
+ * NON-loopback address is REFUSED unless `--allow-remote-access` (or
+ * `HAYVEN_ALLOW_REMOTE_ACCESS=1`) is also given — the same two-step gate the
+ * daemon requires, for the same reason. See {@link DEFAULT_HOST} and
+ * {@link decideProxyBind}.
  */
 import type { ParsedArgs } from "../cli.ts";
+import { isLoopbackHost } from "./daemon.ts";
 import { createProxyHandler } from "../proxy/server.ts";
 import { providerById, type ProviderId } from "../proxy/providers.ts";
 import { openProjectDb, requireProject } from "./_shared.ts";
@@ -42,12 +46,65 @@ const DEFAULT_PROVIDER: ProviderId = "anthropic";
  */
 const DEFAULT_HOST = "127.0.0.1";
 
-/** Addresses that are NOT loopback — binding one exposes the proxy beyond this
- *  machine and earns a loud warning. `::1`/`127.x` are loopback; the wildcards
- *  and any real interface address are not. */
-function isLoopbackHost(host: string): boolean {
-  const h = host.replace(/^\[|\]$/g, "").toLowerCase();
-  return h === "localhost" || h === "::1" || /^127\./.test(h);
+/**
+ * The explicit second opt-in required to publish an unauthenticated listener.
+ *
+ * Deliberately the SAME flag and env var the daemon requires
+ * (`cli/daemon.ts::remoteAccessAllowed`, which is module-private there). A user
+ * who has learned the daemon's gate must not have to learn a second one for the
+ * proxy — that "two paths deciding the same question differently" shape is what
+ * produced the asymmetry this closes. If `remoteAccessAllowed` is ever exported
+ * from `cli/daemon.ts`, this should become an import of it.
+ */
+function remoteAccessAllowed(args: ParsedArgs): boolean {
+  const flag = args.flags["allow-remote-access"];
+  if (flag === true || flag === "true") return true;
+  const env = process.env["HAYVEN_ALLOW_REMOTE_ACCESS"];
+  return env === "1" || env === "true";
+}
+
+/** What {@link decideProxyBind} concluded: bind `host`, or refuse with a reason. */
+export type ProxyBindDecision =
+  | { ok: true; host: string; exposed: boolean }
+  | { ok: false; message: string };
+
+/**
+ * NETWORK EXPOSURE GATE — the proxy half of the daemon's gate.
+ *
+ * The daemon refuses a non-loopback bind outright unless a SECOND explicit
+ * opt-in is given, on the reasoning that a warning printed by a process which
+ * then keeps serving is not a decision point and there is no authentication
+ * behind it to fall back on. Every word of that applies here: `hayven proxy`
+ * has no authentication of its own, it RELAYS whatever upstream credentials a
+ * caller sends (so anyone who reaches the port can spend the user's LLM
+ * budget), and with `--compact-history` it reads the project's code graph and
+ * source to build the slices it substitutes. Before this it merely printed a
+ * warning and served anyway — we had hardened the daemon and left the adjacent,
+ * arguably more expensive exposure open.
+ *
+ * The loopback predicate is IMPORTED from `cli/daemon.ts` rather than copied.
+ * `cli.ts` already statically imports that module for the `daemon` subcommand,
+ * so every `hayven` process has it loaded regardless and the import is free —
+ * and one predicate cannot drift from itself.
+ */
+export function decideProxyBind(host: string, args: ParsedArgs): ProxyBindDecision {
+  if (isLoopbackHost(host)) return { ok: true, host, exposed: false };
+  if (!remoteAccessAllowed(args)) {
+    return {
+      ok: false,
+      message:
+        `error: refusing to bind ${host} — that is not a loopback address, and the hayven\n` +
+        "context proxy has NO authentication. Binding it publishes, to anyone who can reach\n" +
+        "this machine:\n" +
+        "  - an open LLM-API relay: it forwards whatever credentials a caller sends to the\n" +
+        "    upstream provider, so anyone who finds it can spend your API budget\n" +
+        "  - the served project's code graph and source, as slices substituted into requests\n" +
+        "If you genuinely intend that, re-run with --allow-remote-access (or set\n" +
+        "HAYVEN_ALLOW_REMOTE_ACCESS=1), and put it behind something that authenticates.\n" +
+        "Otherwise drop --host and it will bind 127.0.0.1.\n",
+    };
+  }
+  return { ok: true, host, exposed: true };
 }
 
 export async function runProxy(args: ParsedArgs): Promise<number> {
@@ -78,10 +135,20 @@ export async function runProxy(args: ParsedArgs): Promise<number> {
   }
   const hostFlag = args.flags["host"];
   if (hostFlag === true) {
-    process.stderr.write("error: --host requires a value, e.g. --host 0.0.0.0\n");
+    process.stderr.write("error: --host requires a value, e.g. --host 127.0.0.1\n");
     return 1;
   }
-  const host = typeof hostFlag === "string" && hostFlag.length > 0 ? hostFlag : DEFAULT_HOST;
+  const requestedHost =
+    typeof hostFlag === "string" && hostFlag.length > 0 ? hostFlag : DEFAULT_HOST;
+
+  // Decide BEFORE opening the read DB or binding anything: a refusal must cost
+  // nothing and leak no handle.
+  const bind = decideProxyBind(requestedHost, args);
+  if (!bind.ok) {
+    process.stderr.write(bind.message);
+    return 2;
+  }
+  const host = bind.host;
 
   const upFlag = args.flags["upstream"];
   const upstream =
@@ -137,7 +204,7 @@ export async function runProxy(args: ParsedArgs): Promise<number> {
   // Warn if EITHER the requested address or the one the runtime reports is
   // non-loopback, so a future runtime that silently ignores `hostname` again
   // cannot produce a quiet banner.
-  const exposed = !isLoopbackHost(host) || !isLoopbackHost(reported);
+  const exposed = bind.exposed || !isLoopbackHost(reported);
   process.stderr.write(
     `hayven context proxy [${provider.label}] on ${url} → ${upstream}\n` +
       `  serving ${ctx.paths.repoRoot}\n` +

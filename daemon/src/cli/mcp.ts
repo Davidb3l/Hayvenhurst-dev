@@ -22,7 +22,7 @@
  *   { "command": "hayven", "args": ["mcp"], "cwd": "<repo with .hayven/>" }
  */
 import type { ParsedArgs } from "../cli.ts";
-import { createContextMcpServer, runStdioLoop } from "../mcp/context_server.ts";
+import { createDrainAwareWriter, createContextMcpServer, runStdioLoop } from "../mcp/context_server.ts";
 import { openProjectDb, requireProject } from "./_shared.ts";
 
 export async function runMcp(_args: ParsedArgs): Promise<number> {
@@ -59,7 +59,16 @@ export async function runMcp(_args: ParsedArgs): Promise<number> {
   );
 
   try {
-    await runStdioLoop(server, Bun.stdin.stream(), (line) => process.stdout.write(line));
+    // `createDrainAwareWriter`, NOT a bare `process.stdout.write`. This is the
+    // ONLY production call site, so a plain writer makes the backpressure work
+    // in `runStdioLoop` completely inert: measured at 8k pipelined requests
+    // against a stalled reader, a bare writer grows to 207 MB, 30k to 1.4 GB,
+    // 60k to 2.7 GB — linear, unbounded, and silent. Bun's own signals do not
+    // help: `write()` returns `true` MORE often when the pipe is stalled than
+    // when it is draining, and `writableNeedDrain` stays false after 13 MB to a
+    // reader that never reads. Only the per-chunk completion callback, which
+    // this writer tracks, reflects reality.
+    await runStdioLoop(server, Bun.stdin.stream(), createDrainAwareWriter(process.stdout));
   } finally {
     shutdown();
   }

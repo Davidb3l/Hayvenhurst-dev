@@ -57,7 +57,10 @@ const ROLE_RANK: Record<ContextSlice["role"], number> = {
  *  valid fence — the determinism is what matters, not syntax highlighting). */
 export function deriveFenceLang(file: string): string {
   if (file.endsWith(".tsx")) return "tsx";
-  if (file.endsWith(".ts")) return "typescript";
+  // `.mts`/`.cts` are TypeScript to the parser (`language.rs::from_extension`)
+  // but do NOT end in `.ts`, so they fell through to "" — the same
+  // extension-list drift that made `isSourcePath` miss them.
+  if (file.endsWith(".ts") || file.endsWith(".mts") || file.endsWith(".cts")) return "typescript";
   if (file.endsWith(".py")) return "python";
   if (file.endsWith(".rs")) return "rust";
   if (file.endsWith(".go")) return "go";

@@ -4,6 +4,7 @@
 import { existsSync } from "node:fs";
 
 import { loadConfig } from "../config/load.ts";
+import { DETACH_HEALTH_TIMEOUT_MS, DETACH_PROBE_TIMEOUT_MS } from "../daemon/detach.ts";
 import { isRegistrableRoot } from "../daemon/registry.ts";
 import { resolveReadIndex } from "../db/branch_index.ts";
 import { Db } from "../db/queries.ts";
@@ -95,6 +96,17 @@ export type HotAddResult =
  * so a newly-registered repo appears in the switcher/routing WITHOUT a restart.
  * Never throws — an unreachable daemon or a route-missing (old) daemon both resolve
  * to `no-daemon`, and the caller falls back to "loads on next start".
+ *
+ * BOUNDED. Both fetches in this file used to carry no `AbortSignal`, so they
+ * inherited Bun's 5-minute idle default — the same class of bug that made the
+ * original incident invisible: a wedged daemon ACCEPTS the connection and never
+ * answers, and the CLI parks for five minutes while its own message promises
+ * ten seconds. Budget reused from `daemon/detach.ts` rather than invented here:
+ * `DETACH_HEALTH_TIMEOUT_MS` is already the "wait for the daemon to finish
+ * doing something" budget, and a live hot-add legitimately queues behind
+ * `serializeMutation` in `cli/daemon.ts` (a concurrent remove costs
+ * REMOVE_GRACE_MS plus a watcher teardown), so the shorter per-probe cap would
+ * time out on a perfectly healthy daemon.
  */
 export async function hotAddToRunningDaemon(root: string, base: string, alias?: string): Promise<HotAddResult> {
   // Guard CLIENT-side too, not just in the daemon's `addProjectLive`. This is
@@ -105,14 +117,32 @@ export async function hotAddToRunningDaemon(root: string, base: string, alias?: 
   if (!isRegistrableRoot(root)) {
     return { kind: "error", message: `refusing to serve ${root} as a project (see \`hayven daemon register --help\`)` };
   }
+  // ONE signal for the whole exchange, exactly as `probeDaemon` does: aborting
+  // tears down the response BODY stream too, so a daemon that sends headers and
+  // then stalls mid-body is bounded by the same budget as the connect phase —
+  // otherwise `res.json()` below just becomes the new place to hang forever.
+  const signal = AbortSignal.timeout(DETACH_HEALTH_TIMEOUT_MS);
   let res: Response;
   try {
     res = await fetch(`${base}/api/projects`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(alias ? { path: root, alias } : { path: root }),
+      signal,
     });
   } catch {
+    // A TIMEOUT is NOT "no daemon". Reporting a wedged daemon as absent makes
+    // `assertDaemonServesProject` fall through to "this daemon does not support
+    // live project registration — restart it from this repo", which sends the
+    // user chasing a version problem that does not exist. Name the hang.
+    if (signal.aborted) {
+      return {
+        kind: "error",
+        message:
+          `daemon at ${base} accepted the connection but did not answer POST /api/projects ` +
+          `within ${DETACH_HEALTH_TIMEOUT_MS}ms — it is wedged. Try \`hayven daemon stop\`.`,
+      };
+    }
     return { kind: "no-daemon" }; // unreachable
   }
   if (res.status === 404) return { kind: "no-daemon" }; // old daemon w/o the route
@@ -168,15 +198,35 @@ export async function assertDaemonServesProject(
   base: string,
   ctx: ProjectContext,
 ): Promise<DaemonIdentityResult> {
+  // Bounded with the SAME per-probe budget `probeDaemon` uses — this is the
+  // same one-shot `/api/health` call, and a healthy daemon answers it in
+  // single-digit ms. Unbounded, a daemon with a pegged event loop (a runaway
+  // ingest: precisely the incident) parked every `claim`/`release`/`sync` here
+  // for Bun's 5-minute idle default before the real request even started.
+  const signal = AbortSignal.timeout(DETACH_PROBE_TIMEOUT_MS);
   let health: { root?: unknown; projects?: unknown };
   try {
-    const res = await fetch(`${base}/api/health`);
+    const res = await fetch(`${base}/api/health`, { signal });
     if (!res.ok) {
       // Reachable but unhealthy — let the real request surface the failure.
       return { ok: true };
     }
     health = (await res.json()) as { root?: unknown; projects?: unknown };
   } catch {
+    // Distinguish "nothing is listening" (the overwhelmingly common case — an
+    // instant connection refusal, and staying silent about it is correct) from
+    // "something accepted and then went quiet". Only the second is worth a
+    // note: it means the identity check was SKIPPED, so the mutating request
+    // that follows is unverified and about to hang the same way.
+    if (signal.aborted) {
+      return {
+        ok: true,
+        warning:
+          `daemon at ${base} accepted the connection but did not answer /api/health within ` +
+          `${DETACH_PROBE_TIMEOUT_MS}ms — skipping the project-identity check. If the next ` +
+          "request hangs, the daemon is wedged (`hayven daemon stop`).",
+      };
+    }
     // Unreachable — the mutating request will report this clearly itself.
     return { ok: true };
   }

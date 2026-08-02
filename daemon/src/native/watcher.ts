@@ -14,7 +14,14 @@
 //     concurrent overflows down to at most one queued rescan.
 //   - On fatal/exit/heartbeat-stall: restart the child with exponential
 //     backoff (capped at 30 s) so a transient OS hiccup doesn't take down
-//     incremental ingest — reset after a sustained healthy run.
+//     incremental ingest — reset after a sustained healthy run. The
+//     heartbeat-stall half of that claim was documentation only until
+//     `heartbeatStallMs` was implemented: `lastHeartbeatMs` was recorded and
+//     compared against nothing, so a wedged backend read as an idle repo.
+//   - Spawn the child with the SAME `--include-vendored` / `--include-fixtures`
+//     scope the daemon ingests with. `hayven-native watch` consults the shared
+//     `ScopeFilter`, so a mismatch here makes the watch and ingest paths
+//     disagree about which files belong in the graph.
 //
 // The three bounds above exist because their absence is what turned a single
 // bad `daemon start` into a 6-hour, 98%-CPU, 195 GB-read runaway: the old fixed
@@ -103,6 +110,30 @@ export interface StartWatchOptions {
   /** A child that stayed up at least this long is not in a crash loop, so its
    *  next restart starts from the initial backoff again. Default 60 000 ms. */
   healthyRunMs?: number;
+  /**
+   * SCOPE PARITY with the ingest path. `hayven-native watch` applies the SAME
+   * `ScopeFilter` the walker and `--files-stdin` use, so if the daemon ingests
+   * with `--include-vendored` but the watcher is spawned without it, a change to
+   * `vendor/x.ts` is never reported and the file's rows silently rot: the full
+   * ingest puts them in, and nothing ever updates or removes them again. Worse,
+   * the reverse (watcher wide, ingest narrow) makes the incremental path ADD
+   * nodes the next full ingest deletes, so the graph oscillates with whichever
+   * path ran last. Must always be passed the project's `index.includeVendored`
+   * / `index.includeFixtures`, identical to every `startParse` call for the
+   * same project.
+   */
+  includeVendored?: boolean;
+  /** See {@link StartWatchOptions.includeVendored}. */
+  includeFixtures?: boolean;
+  /**
+   * Restart the child when NOTHING has arrived on its stdout for this long.
+   * `hayven-native watch` emits a `heartbeat` every 15 s, so silence past a few
+   * intervals means the backend wedged (a hung FSEvents/inotify thread) — which
+   * previously looked EXACTLY like an idle repo: no exit, no error, just an
+   * index that quietly stopped tracking the tree. Default
+   * {@link DEFAULT_HEARTBEAT_STALL_MS}. Set to 0 to disable.
+   */
+  heartbeatStallMs?: number;
 }
 
 export interface WatchSupervisor {
@@ -122,6 +153,19 @@ export interface WatchStats {
   overflowsSeen: number;
   /** Wall-clock ms of the last heartbeat received. */
   lastHeartbeatMs: number;
+  /**
+   * Wall-clock ms (OUR clock) of the last record of ANY kind read off the
+   * child's stdout. `lastHeartbeatMs` carries the CHILD's timestamp, so it is
+   * useless for liveness if the child's clock is off; this is the value the
+   * stall detector compares against.
+   */
+  lastRecordAtMs: number;
+  /** True iff a child process is currently alive AND we are not stopped. */
+  alive: boolean;
+  /** Exit code of the most recent child exit, or null while the first is up. */
+  lastExitCode: number | null;
+  /** Times the child was killed for going silent past `heartbeatStallMs`. */
+  heartbeatStalls: number;
   /** BACKLOG: events buffered right now, waiting for the quiet period or for
    *  the in-flight handler to finish. The incident had no way to see this. */
   pendingEvents: number;
@@ -159,6 +203,33 @@ const DEFAULT_HEALTHY_RUN_MS = 60_000;
  * below anything that threatens the heap.
  */
 const DEFAULT_MAX_PENDING_EVENTS = 20_000;
+/**
+ * Default silence budget before the child is presumed wedged and restarted.
+ *
+ * `hayven-native watch` heartbeats every 15 s (native/src/watch/mod.rs
+ * `HEARTBEAT_INTERVAL`), so this is four missed beats — loose enough that a
+ * loaded machine never trips it, tight enough that a wedged backend is
+ * recovered in a minute instead of never. The header of this module has claimed
+ * "heartbeat-stall restart" since the file was written; until now
+ * `lastHeartbeatMs` was recorded and compared against NOTHING, so a hung backend
+ * was indistinguishable from an idle repo — silent staleness, the exact shape of
+ * the incident.
+ */
+export const DEFAULT_HEARTBEAT_STALL_MS = 60_000;
+/** How often the stall detector wakes. Bounded fraction of the stall budget. */
+const STALL_CHECK_DIVISOR = 4;
+/** Grace between the stall SIGTERM and the SIGKILL that follows it. Matches the
+ *  escalation `stop()` already uses, so a wedged child cannot be immortal. */
+const STALL_KILL_GRACE_MS = 2_000;
+/** Child stderr lines retained for the exit diagnostic. */
+const STDERR_TAIL_LINES = 10;
+/**
+ * A child that emitted NOTHING and died within this long was almost certainly
+ * rejected at argv parsing (clap exits before any record). Past it, "emitted
+ * nothing" means the process came up and then hung, which is a different fault
+ * with a different remedy.
+ */
+const ARGV_REJECTION_WINDOW_MS = 5_000;
 
 export function startWatch(opts: StartWatchOptions): WatchSupervisor {
   const debounceMs = opts.debounceMs ?? DEFAULT_DEBOUNCE_MS;
@@ -166,6 +237,7 @@ export function startWatch(opts: StartWatchOptions): WatchSupervisor {
   const maxBackoffMs = opts.maxRestartBackoffMs ?? DEFAULT_MAX_BACKOFF_MS;
   const maxPendingEvents = opts.maxPendingEvents ?? DEFAULT_MAX_PENDING_EVENTS;
   const healthyRunMs = opts.healthyRunMs ?? DEFAULT_HEALTHY_RUN_MS;
+  const heartbeatStallMs = opts.heartbeatStallMs ?? DEFAULT_HEARTBEAT_STALL_MS;
   const spawnFn: SpawnFn = opts.spawn ?? (Bun.spawn as unknown as SpawnFn);
 
   const counters = {
@@ -175,6 +247,9 @@ export function startWatch(opts: StartWatchOptions): WatchSupervisor {
     batchesEmitted: 0,
     overflowsSeen: 0,
     lastHeartbeatMs: Date.now(),
+    lastRecordAtMs: Date.now(),
+    lastExitCode: null as number | null,
+    heartbeatStalls: 0,
     overflowsCoalesced: 0,
     batchesDeferred: 0,
     pendingOverflows: 0,
@@ -286,6 +361,11 @@ export function startWatch(opts: StartWatchOptions): WatchSupervisor {
   let versionSkewDetected = false;
 
   function handleRecord(rec: NativeRecord): void {
+    // LIVENESS on OUR clock, updated for every record type. A watcher streaming
+    // change events is obviously alive even if a heartbeat write was skipped, and
+    // `rec.ts_ms` is the CHILD's clock — comparing that to `Date.now()` would
+    // make a clock-skewed child look permanently stalled.
+    counters.lastRecordAtMs = Date.now();
     switch (rec.type) {
       case "version":
         try {
@@ -297,6 +377,10 @@ export function startWatch(opts: StartWatchOptions): WatchSupervisor {
             });
             versionSkewDetected = true;
             stopped = true;
+            // This path sets `stopped` directly instead of going through
+            // `stop()`, so the stall detector would otherwise outlive the
+            // supervisor for the life of the process.
+            stopStallDetector();
             const child = currentChild;
             if (child) {
               try {
@@ -390,20 +474,47 @@ export function startWatch(opts: StartWatchOptions): WatchSupervisor {
     }
   }
 
-  async function runOnce(): Promise<number> {
+  /**
+   * Outcome of one child's run: everything the supervisor loop needs to report
+   * WHY it ended. Returned rather than stashed in outer `let`s, because a
+   * previous child's still-draining stderr task would otherwise keep appending
+   * into the variable the NEXT child is using.
+   */
+  interface RunOutcome {
+    exitCode: number;
+    stderrTail: string[];
+    /** False when the child died without ever emitting a single NDJSON record —
+     *  the signature of a binary that rejected our argv before starting. */
+    sawAnyRecord: boolean;
+  }
+
+  async function runOnce(): Promise<RunOutcome> {
+    // SCOPE PARITY: the same `--include-*` flags the daemon ingests this project
+    // with. Omitting them here is not a missing optimization, it is a graph
+    // divergence — see StartWatchOptions.includeVendored.
+    const cmd = [opts.binary, ...cmdArgsFor(opts)];
     const child = spawnFn({
-      cmd: [opts.binary, "watch", "--root", opts.root],
+      cmd,
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
     });
     currentChild = child;
+    // A fresh child gets a fresh silence budget; otherwise the stall detector
+    // would immediately re-kill a child spawned after a long backoff sleep.
+    counters.lastRecordAtMs = Date.now();
+    // PER-CHILD, not shared: see RunOutcome.
+    const stderrTail: string[] = [];
+    let sawAnyRecord = false;
 
     const stdoutReader = new NdjsonLineReader();
     const stderrReader = new NdjsonLineReader();
 
-    // Drain stderr at debug level — we don't expect anything important here.
-    void (async () => {
+    // Drain stderr at debug level, but KEEP THE TAIL. Sending it all to
+    // `debug` (off by default) meant a child that died with a real diagnostic on
+    // stderr was reported as a bare `exitCode` — the operator saw "watcher child
+    // exited; restarting" forever with no way to learn why.
+    const stderrDrained = (async () => {
       try {
         const reader = (child.stderr as ReadableStream<Uint8Array>).getReader();
         while (true) {
@@ -412,6 +523,8 @@ export function startWatch(opts: StartWatchOptions): WatchSupervisor {
           if (value) {
             stderrReader.push(value);
             for (const line of stderrReader.drain()) {
+              stderrTail.push(line);
+              if (stderrTail.length > STDERR_TAIL_LINES) stderrTail.shift();
               opts.logger?.debug("watcher.stderr", { line });
             }
           }
@@ -433,6 +546,7 @@ export function startWatch(opts: StartWatchOptions): WatchSupervisor {
             if (versionSkewDetected) break;
             try {
               const rec = parseLine(line);
+              sawAnyRecord = true;
               handleRecord(rec);
             } catch (err) {
               opts.logger?.warn("invalid NDJSON from watcher", {
@@ -447,7 +561,77 @@ export function startWatch(opts: StartWatchOptions): WatchSupervisor {
       opts.logger?.warn("watcher stdout read failed", { error: (err as Error).message });
     }
 
-    return child.exited;
+    const exitCode = await child.exited;
+    // The child is GONE — stop advertising it as alive and stop the stall
+    // detector from SIGTERM-ing a corpse (which would log a phantom restart and
+    // inflate `heartbeatStalls`) during the drain await below.
+    if (currentChild === child) currentChild = null;
+    // AWAIT the stderr drain before reporting. `runOnce` used to return the
+    // moment STDOUT closed, so the exit log read a tail whose final `read()`
+    // had not resolved — empty in exactly the crash case it exists for. Bounded
+    // because the stream is closed once the child is gone.
+    await stderrDrained;
+    return { exitCode, stderrTail, sawAnyRecord };
+  }
+
+  /**
+   * HEARTBEAT-STALL RESTART. The module header promised this from day one and
+   * nothing implemented it: `lastHeartbeatMs` was written and never read, so a
+   * child whose backend thread wedged (no exit, no error, no events) left the
+   * index silently frozen and looked exactly like an idle repo. Killing the
+   * child hands it to the supervisor loop below, which restarts it with the
+   * normal backoff.
+   */
+  const stallTimer =
+    heartbeatStallMs > 0
+      ? setInterval(
+          () => {
+            if (stopped) return;
+            const child = currentChild;
+            if (child === null) return; // between children (backoff sleep)
+            if (Date.now() - counters.lastRecordAtMs < heartbeatStallMs) return;
+            counters.heartbeatStalls += 1;
+            opts.logger?.error("watcher went silent past the heartbeat budget — restarting it", {
+              silentForMs: Date.now() - counters.lastRecordAtMs,
+              budgetMs: heartbeatStallMs,
+              stalls: counters.heartbeatStalls,
+            });
+            // Reset the budget so a child that takes a moment to die is not
+            // re-killed (and re-counted) on the very next tick.
+            counters.lastRecordAtMs = Date.now();
+            try {
+              child.kill("SIGTERM");
+            } catch {
+              // Already gone; the supervisor loop will notice.
+            }
+            // ESCALATE. A child wedged hard enough to stop heart-beating is
+            // precisely the child most likely to ignore SIGTERM (blocked in an
+            // uninterruptible FSEvents/inotify call, or with its signal handler
+            // stuck). Without this the detector would re-fire every budget
+            // forever, sending futile SIGTERMs while `alive` stayed true,
+            // `restarts` never moved and incremental ingest stayed dead — the
+            // feature would only ever have recovered children that die politely.
+            const escalate = setTimeout(() => {
+              if (currentChild !== child) return; // it exited; nothing to kill
+              opts.logger?.error("watcher ignored SIGTERM after a stall — SIGKILL", {
+                graceMs: STALL_KILL_GRACE_MS,
+              });
+              try {
+                child.kill("SIGKILL");
+              } catch {
+                // Already gone.
+              }
+            }, STALL_KILL_GRACE_MS);
+            if (typeof escalate.unref === "function") escalate.unref();
+          },
+          Math.max(1_000, Math.floor(heartbeatStallMs / STALL_CHECK_DIVISOR)),
+        )
+      : null;
+  // Never hold the process open on the detector alone.
+  if (stallTimer && typeof stallTimer.unref === "function") stallTimer.unref();
+
+  function stopStallDetector(): void {
+    if (stallTimer !== null) clearInterval(stallTimer);
   }
 
   // Supervisor loop: keep restarting the child until `stopped` is set.
@@ -456,14 +640,44 @@ export function startWatch(opts: StartWatchOptions): WatchSupervisor {
     while (!stopped) {
       const childStartedAt = Date.now();
       try {
-        const code = await runOnce();
+        const outcome = await runOnce();
+        counters.lastExitCode = outcome.exitCode;
+        currentChild = null; // between children — the stall detector must idle
         if (stopped) return;
+        // A child that exited non-zero WITHOUT emitting a single record never
+        // got as far as the §16.4 `version` handshake, so the version-skew path
+        // (which stops cleanly with a clear message) cannot fire. The usual
+        // cause is an argv this binary does not understand — `watch
+        // --include-vendored` only exists from 0.0.7 — and the symptom is an
+        // invisible restart loop at the 30 s cap. Say so once per restart, at
+        // ERROR, naming the flags we passed.
+        // ...and only when it died FAST. A child that came up, hung, and was
+        // SIGKILLed by the stall detector 60 s later also has `sawAnyRecord:
+        // false` and a non-zero exit, but its problem is a wedged backend, not
+        // our argv — telling that operator to upgrade the binary or unset
+        // `index.includeVendored` sends them somewhere useless.
+        const livedMs = Date.now() - childStartedAt;
+        if (!outcome.sawAnyRecord && outcome.exitCode !== 0 && livedMs < ARGV_REJECTION_WINDOW_MS) {
+          opts.logger?.error(
+            "watcher child died before emitting anything — the native binary may not accept these flags",
+            {
+              exitCode: outcome.exitCode,
+              args: cmdArgsFor(opts),
+              stderrTail: outcome.stderrTail.join("\n"),
+              hint: "upgrade `hayven-native` (or unset index.includeVendored / index.includeFixtures)",
+            },
+          );
+        }
         opts.logger?.warn("watcher child exited; restarting", {
-          exitCode: code,
+          exitCode: outcome.exitCode,
           restart: counters.restarts + 1,
           backoffMs,
+          // The tail is the difference between a diagnosable crash loop and
+          // "exitCode: 1" repeated for six hours.
+          stderrTail: outcome.stderrTail.join("\n"),
         });
       } catch (err) {
+        currentChild = null;
         if (stopped) return;
         opts.logger?.warn("watcher child crashed; restarting", {
           error: (err as Error).message,
@@ -487,9 +701,11 @@ export function startWatch(opts: StartWatchOptions): WatchSupervisor {
       pendingEvents: pending.size,
       batchInFlight,
       overflowInFlight,
+      alive: currentChild !== null && !stopped,
     }),
     stop: async () => {
       stopped = true;
+      stopStallDetector();
       clearPending();
       overflowPending = null;
       const child = currentChild;
@@ -519,4 +735,18 @@ export function startWatch(opts: StartWatchOptions): WatchSupervisor {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * The argv (after the binary path) for one `watch` child. Factored out so the
+ * crash diagnostic can name the exact flags that may have been rejected — a
+ * `hayven-native` older than 0.0.7 has no `watch --include-vendored`, and clap
+ * rejects an unknown flag BEFORE any record is emitted, so the version handshake
+ * never runs and the failure otherwise looks like an anonymous restart loop.
+ */
+function cmdArgsFor(opts: StartWatchOptions): string[] {
+  const args = ["watch", "--root", opts.root];
+  if (opts.includeVendored) args.push("--include-vendored");
+  if (opts.includeFixtures) args.push("--include-fixtures");
+  return args;
 }

@@ -91,8 +91,8 @@ export interface FreshnessProbes {
    * in {@link SOURCE_EXTENSIONS}).
    *
    * Crucially this is SOURCE-SCOPED, not whole-tree-clean. The index is built
-   * ONLY from source files (the parse languages: `.ts .tsx .js .jsx .mjs .cjs
-   * .py .rs .go .astro`), so staleness must depend ONLY on whether a SOURCE
+   * ONLY from source files (the parse languages: `.ts .mts .cts .tsx .js .jsx
+   * .mjs .cjs .py .rs .go .astro`), so staleness must depend ONLY on whether a SOURCE
    * file's content changed since ingest. The normal `hayven init` → `ingest`
    * flow itself leaves the tree permanently "dirty" by `git status` standards:
    * it creates an UNTRACKED `AGENTS.md` and MODIFIES the tracked `.gitignore`
@@ -180,6 +180,13 @@ const SKIP_DIRS = new Set([
  */
 const SOURCE_EXTENSIONS = new Set([
   ".ts",
+  // `.mts`/`.cts` (ESM / CommonJS TypeScript) parse as plain TypeScript and are
+  // accepted by `language.rs::from_extension`, but were MISSING here. A changed
+  // `.mts` therefore read as a non-source edit: it was neither purged nor
+  // re-parsed on the incremental path, so its symbols went silently stale with
+  // no error anywhere. Any extension the parser accepts must appear here.
+  ".mts",
+  ".cts",
   ".tsx",
   ".js",
   ".jsx",

@@ -6,8 +6,18 @@
  *      REFUSED (404), never silently routed to the primary — the safety
  *      property behind `assertDaemonServesProject` (a stale alias must not
  *      write into the wrong project's op-log).
- *   3. Reads keep the legacy behavior: header selects, unknown falls back to
- *      the primary (multi_project.test.ts pins the `?project=` variant).
+ *   3. A mutation with NO selector at all is REFUSED (400) on a multi-project
+ *      daemon, rather than silently landing in whichever project happens to be
+ *      primary. This used to route to the primary with only a log line, which
+ *      is the same wrong-repo write as (2) with the evidence removed: a `claim`
+ *      or `node body` meant for repo B entered repo A's op-log, and neither
+ *      side ever saw an error. The refusal is lifted by any of: an
+ *      `x-hayven-project` alias, a `?project=` selector, a verified
+ *      `x-hayven-primary-root`, or the daemon serving exactly one project.
+ *   4. READS are deliberately UNCHANGED: header selects, unknown falls back to
+ *      the primary (multi_project.test.ts pins the `?project=` variant). A read
+ *      answered from the wrong index is a wrong answer the caller can see and
+ *      re-issue; a write is not recoverable, so only writes are refused.
  */
 import { describe, expect, it } from "bun:test";
 import { mkdtempSync } from "node:fs";
@@ -16,7 +26,11 @@ import { join } from "node:path";
 
 import { DEFAULT_CONFIG } from "../src/config/defaults.ts";
 import { Db } from "../src/db/queries.ts";
-import { buildMultiProjectApp, type ServerDependencies } from "../src/daemon/server.ts";
+import {
+  buildMultiProjectApp,
+  PRIMARY_ROOT_HEADER,
+  type ServerDependencies,
+} from "../src/daemon/server.ts";
 import { makeTestCrdtState } from "./_helpers.ts";
 import { hayvenPathsFor } from "../src/util/paths.ts";
 import { createLogger } from "../src/util/log.ts";
@@ -92,11 +106,52 @@ describe("x-hayven-project mutation routing", () => {
     expect(await listClaims(app, "alpha")).toEqual([]); // primary untouched
   });
 
-  it("routes an un-addressed POST to the primary (unchanged default)", async () => {
+  it("REFUSES (400) an un-addressed POST instead of writing it into the primary", async () => {
     const { app } = mkApp();
     const res = await postClaim(app, "claim_primary", {});
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toContain("?project=");
+    // THE REGRESSION GUARD. A revert to "route to the primary and warn" turns
+    // the status assertion red, but this is the assertion that states the actual
+    // safety property: the un-addressed write reached NO project's op-log. It
+    // fails whether the fall-through comes back as a 201, a 200, or silently.
+    expect(await listClaims(app, "alpha")).toEqual([]);
+    expect(await listClaims(app, "beta")).toEqual([]);
+  });
+
+  it("ACCEPTS an un-addressed POST when the daemon serves exactly ONE project", async () => {
+    // Nothing to disambiguate, so the refusal must not fire — this is the case
+    // `cli/_shared.ts` relies on when `/api/health` reports a bare `root` and
+    // `projectHeader()` therefore has no alias to send.
+    const app = buildMultiProjectApp({
+      primary: "solo",
+      projects: new Map<string, ServerDependencies>([["solo", depsFor()]]),
+      logger: createLogger({ toFile: false, toStderr: false }),
+      daemonVersion: "test",
+    });
+    const res = await postClaim(app, "claim_solo", {});
+    expect(res.status).toBe(201);
+    expect(await listClaims(app, "solo")).toEqual(["claim_solo"]);
+  });
+
+  it("ACCEPTS an un-addressed POST that proves the primary's root", async () => {
+    const { app, projects } = mkApp();
+    const res = await postClaim(app, "claim_primary", {
+      [PRIMARY_ROOT_HEADER]: projects.get("alpha")!.paths.repoRoot,
+    });
     expect(res.status).toBe(201);
     expect(await listClaims(app, "alpha")).toEqual(["claim_primary"]);
+    expect(await listClaims(app, "beta")).toEqual([]);
+  });
+
+  it("REFUSES an un-addressed POST whose primary-root claim is stale", async () => {
+    const { app, projects } = mkApp();
+    const res = await postClaim(app, "claim_primary", {
+      [PRIMARY_ROOT_HEADER]: projects.get("beta")!.paths.repoRoot, // not the primary
+    });
+    expect(res.status).toBe(400);
+    expect(await listClaims(app, "alpha")).toEqual([]);
     expect(await listClaims(app, "beta")).toEqual([]);
   });
 
@@ -123,7 +178,10 @@ describe("x-hayven-project mutation routing", () => {
 
   it("a READ with an unknown selector still falls back to the primary", async () => {
     const { app } = mkApp();
-    await postClaim(app, "claim_primary", {});
+    // Seed through the PRIMARY explicitly. The mutation half of this contract
+    // now requires a selector; the READ half deliberately does not, and that
+    // asymmetry is what this test pins.
+    await postClaim(app, "claim_primary", { "x-hayven-project": "alpha" });
     const res = await app.handle(
       new Request("http://localhost/api/claims", {
         headers: { "x-hayven-project": "gone" },

@@ -55,8 +55,34 @@ import { scopeForFile } from "./idScheme.ts";
 import type { GraphNode } from "./types.ts";
 import { WorkspaceMap } from "./workspace.ts";
 
-/** Extensions probed (in order) when a specifier omits one. */
-const EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".astro", ".py", ".rs", ".go"] as const;
+/**
+ * Extensions probed (in order) when a specifier omits one.
+ *
+ * Must cover every extension `native/src/parse/language.rs::from_extension`
+ * accepts, or an import of `./x` cannot resolve to an `x.mts`/`x.mjs` module
+ * that IS in the graph — the edge silently stays unresolved (`?:x`) with no
+ * error.
+ *
+ * The four additions are APPENDED, not interleaved. Probing short-circuits on
+ * the first candidate that exists in the graph, so appending makes this purely
+ * additive: a repo holding both `util.js` and `util.mts` resolves `./util`
+ * exactly as it did before, and the new entries only ever fire where every
+ * historical candidate missed.
+ */
+const EXTENSIONS = [
+  ".ts",
+  ".tsx",
+  ".js",
+  ".jsx",
+  ".astro",
+  ".py",
+  ".rs",
+  ".go",
+  ".mts",
+  ".cts",
+  ".mjs",
+  ".cjs",
+] as const;
 
 /** Posix-normalize a path: forward slashes, collapse `.`/`..`, strip leading `./`. */
 export function normalizePosix(p: string): string {

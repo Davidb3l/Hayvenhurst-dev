@@ -5,6 +5,25 @@ import { Elysia } from "elysia";
 
 import type { ServerDependencies } from "../server.ts";
 
+/**
+ * HLC skew rejections, or `null` when the CRDT clock is unavailable.
+ *
+ * `/api/health` is the LIVENESS endpoint — every probe, every `daemon start`
+ * readiness wait, and `assertDaemonServesProject` hit it — so it must not be
+ * able to 500 on the strength of a diagnostic field. A daemon whose `CrdtState`
+ * failed to construct (or a caller that wired a partial one) still needs to be
+ * able to answer "am I up?", so an unreadable counter degrades to `null` rather
+ * than taking the endpoint down.
+ */
+function skewRejections(deps: ServerDependencies): number | null {
+  try {
+    const n = deps.crdt?.clock?.rejectedSkewCount();
+    return typeof n === "number" ? n : null;
+  } catch {
+    return null;
+  }
+}
+
 export function healthRoutes(deps: ServerDependencies) {
   return new Elysia().get("/api/health", () => ({
     ok: true,
@@ -29,5 +48,12 @@ export function healthRoutes(deps: ServerDependencies) {
     // unaffected. Select one on any endpoint with `?project=<alias>`.
     primary: deps.primaryAlias,
     projects: deps.listProjects ? deps.listProjects() : undefined,
+    // HLC SKEW REJECTIONS for the selected project. `HlcGenerator` refuses a
+    // remote HLC whose wall clock is too far ahead of ours, and the running
+    // count lived ONLY in the daemon's in-memory `CrdtState` — unreachable from
+    // the CLI, so a peer with a badly wrong clock silently had its ops dropped
+    // with the evidence trapped in a process nobody could query. Nonzero means
+    // some clock (theirs or ours) is wrong and sync is losing writes.
+    hlc_skew_rejections: skewRejections(deps),
   }));
 }

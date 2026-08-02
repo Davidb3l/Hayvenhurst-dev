@@ -241,7 +241,12 @@ function inferRunner(file: string | null, language: string | null | undefined): 
 
   if (ext === "py" || lang === "python") return "pytest";
   if (
-    ext === "ts" || ext === "tsx" || ext === "js" || ext === "jsx" ||
+    // `.mts`/`.cts`/`.mjs`/`.cjs` are TS/JS to the parser
+    // (`language.rs::from_extension`) but were absent here, so a
+    // `foo.test.mts` classified as runner "unknown" and dropped out of the
+    // affected-tests wedge entirely. Keep this list in step with the parser's.
+    ext === "ts" || ext === "tsx" || ext === "mts" || ext === "cts" ||
+    ext === "js" || ext === "jsx" || ext === "mjs" || ext === "cjs" ||
     lang === "typescript" || lang === "javascript" || lang === "tsx"
   ) {
     // jest is naming/spec-file compatible with vitest; pick it only when the

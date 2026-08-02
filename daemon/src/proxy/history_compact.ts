@@ -28,11 +28,8 @@
  * compaction is deliberately lossy on OLD context (it trades recoverable detail
  * for tokens, the same trade a manual `/compact` makes — just graph-aware).
  */
-import { readFileSync } from "node:fs";
-import { isAbsolute, resolve, sep } from "node:path";
-
 import { contextForSymbols } from "../db/context_helper.ts";
-import { estimateTokens } from "../db/context_pack.ts";
+import { estimateTokens, resolveRepoPath } from "../db/context_pack.ts";
 import type { Db } from "../db/queries.ts";
 import { resolveTaskToSymbols } from "../db/task_resolve.ts";
 import type { ContentBlock, Message, MessagesRequest, RewriteOptions } from "./context_rewrite.ts";
@@ -113,13 +110,20 @@ function toolResultText(content: unknown): string {
   return "";
 }
 
-/** Resolve a path attribute to a repo-relative file, refusing repo escapes. */
+/**
+ * Resolve a path attribute to the CANONICAL repo-relative file, or null.
+ *
+ * Delegates to the packer's `resolveRepoPath` rather than keeping a third copy
+ * of containment. The copy that used to live here was byte-identical to the one
+ * in `context_rewrite.ts` and had the same two defects: it compared the LEXICAL
+ * path only, so an in-repo symlink pointing out of the tree was blessed, and a
+ * repo root spelled through a symlink refused every path (compaction then
+ * degraded to bare pointers and silently delivered no graph-aware slices).
+ * Canonicalising here also means the DB lookup below sees the spelling the index
+ * actually stores.
+ */
 function toRepoRelative(repoRoot: string, rawPath: string): string | null {
-  const rootAbs = resolve(repoRoot);
-  const abs = isAbsolute(rawPath) ? resolve(rawPath) : resolve(rootAbs, rawPath);
-  if (abs !== rootAbs && !abs.startsWith(rootAbs + sep)) return null;
-  const rel = abs.slice(rootAbs.length).replace(/^[\\/]+/, "");
-  return rel.length > 0 ? rel : null;
+  return resolveRepoPath(repoRoot, rawPath)?.rel ?? null;
 }
 
 /** Is the repo-relative file `rel` among the agent's EDITED files? The edited set

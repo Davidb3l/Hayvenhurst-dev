@@ -11,6 +11,17 @@ import {
   buildTraceResolver,
   type ResolvedTraceEdge,
 } from "../graph/traceResolve.ts";
+import {
+  INGEST_IN_PROGRESS_KEY,
+  inProgressSince,
+  isAdoptableToken,
+  isDeadOwnerToken,
+  LEGACY_TOKEN,
+  readInFlight,
+  readIndexIntegrity,
+  type IndexIntegrity,
+  type InFlightIngest,
+} from "./index_health.ts";
 import { assertSchemaCompatible, migrate, type MigrationResult } from "./migrations.ts";
 import { FTS_SQL, FTS_TRIGGERS_SQL } from "./schema.ts";
 
@@ -108,33 +119,14 @@ const CALL_SITE_COLUMNS = "dst, src, kind, file, line, col";
  * minutes and flushes in batches), so we do the equivalent: mark the index
  * unusable BEFORE the destructive step and unmark it only on success. A reader
  * that finds this marker knows the index is half-written, not fresh.
+ *
+ * The key itself, its VALUE GRAMMAR and the health decision built on it now live
+ * in `db/index_health.ts` — see that file for why (three implementations of
+ * "is this index usable?" disagreed on five of eight states). Re-exported here
+ * so existing `import { IndexIntegrity } from "./queries.ts"` call sites keep
+ * working; there is no second copy of the logic.
  */
-const INGEST_IN_PROGRESS_KEY = "ingest_in_progress";
-
-/** Why an index failed {@link Db.checkIndexIntegrity}. */
-export type IndexIntegrityReason =
-  /** Nothing wrong — the index is structurally usable. */
-  | "ok"
-  /** An ingest marked the index in-progress and never cleared the marker. */
-  | "ingest-interrupted"
-  /** The graph is EMPTY but a previous ingest recorded a non-zero node count. */
-  | "empty-but-claims-content"
-  /** The `stats` table is unreadable (pre-migration / corrupt handle). */
-  | "unreadable";
-
-export interface IndexIntegrity {
-  /** True iff the index is structurally usable for reads. */
-  ok: boolean;
-  reason: IndexIntegrityReason;
-  /** One human-readable sentence naming the failure, or "" when ok. */
-  detail: string;
-  /** Live `COUNT(*) FROM nodes`, or -1 when it could not be read. */
-  nodes: number;
-  /** `last_ingest_nodes` as recorded by the last SUCCESSFUL ingest, or -1. */
-  claimedNodes: number;
-  /** Epoch ms an unfinished ingest started, or null when none is marked. */
-  inProgressSince: number | null;
-}
+export type { IndexIntegrity, IndexIntegrityReason } from "./index_health.ts";
 
 /**
  * Default SQLite `busy_timeout`, in ms.
@@ -272,7 +264,24 @@ export class Db {
         this.ingestToken ??
         `${process.pid}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 10)}`;
       this.ingestToken = token;
-      const entries = this.readInFlight().filter((e) => e.t !== "legacy" && e.t !== token);
+      // Adoptable sentinels (a legacy scalar / an unparseable marker) are
+      // REPLACED by our token rather than kept: they belong to no live handle,
+      // so `endIngest` could never retract them and the index would stay flagged
+      // broken forever.
+      //
+      // Same reasoning, one step further: a REAL token whose owning process is
+      // provably gone (SIGKILL, OOM, a killed CI job) is retractable by nothing
+      // — `endIngest` only ever clears the calling handle's own token, and
+      // `reindex` deliberately PRESERVES this key — so it wedged the index as
+      // permanently broken with no recovery but deleting the file. `clearGraph`
+      // is the one safe place to reap it: we are wiping the very graph that dead
+      // ingest half-wrote, and we stamp our own token in this same transaction,
+      // so there is no instant at which the index is empty and unflagged. A
+      // token whose process is still ALIVE is untouched — a concurrent ingest
+      // keeps its protection, which is why this is not simply a clear-all.
+      const entries = this.readInFlight().filter(
+        (e) => !isAdoptableToken(e.t) && e.t !== token && !isDeadOwnerToken(e.t),
+      );
       entries.push({ t: token, at: Date.now() });
       this.writeInFlight(entries);
     });
@@ -296,34 +305,19 @@ export class Db {
    */
   private ingestToken: string | null = null;
 
-  /** One in-flight ingest: an opaque owner token plus when it started. */
-  private readInFlight(): Array<{ t: string; at: number }> {
-    const raw = GET_STAT_STMT(this.handle).get(INGEST_IN_PROGRESS_KEY)?.value;
-    if (raw === undefined || raw === null || raw === "") return [];
-    try {
-      const parsed: unknown = JSON.parse(raw);
-      if (Array.isArray(parsed)) {
-        return parsed.filter(
-          (e): e is { t: string; at: number } =>
-            typeof e === "object" &&
-            e !== null &&
-            typeof (e as { t?: unknown }).t === "string" &&
-            typeof (e as { at?: unknown }).at === "number",
-        );
-      }
-    } catch {
-      /* fall through to the legacy scalar form */
-    }
-    // LEGACY: an older build wrote a bare epoch-ms scalar. Treat it as one
-    // anonymous in-flight entry so it still reads as in-progress. `beginIngest`
-    // ADOPTS it (re-keys it to our token) rather than leaving it unclearable —
-    // otherwise a marker left by a dead old-build process would wedge the index
-    // as permanently broken with no way back.
-    const n = Number(raw);
-    return Number.isFinite(n) && n > 0 ? [{ t: "legacy", at: n }] : [];
+  /**
+   * The in-flight ingest entries, parsed by the ONE shared grammar in
+   * `db/index_health.ts`. A marker written by an older build (bare epoch-ms
+   * scalar) or one this build cannot parse at all still reads as IN PROGRESS,
+   * under an adoptable sentinel token — `beginIngest` re-keys it to our own
+   * token rather than leaving it unclearable, so a foreign marker can never
+   * wedge the index as permanently broken with no way back.
+   */
+  private readInFlight(): InFlightIngest[] {
+    return readInFlight(this.handle);
   }
 
-  private writeInFlight(entries: Array<{ t: string; at: number }>): void {
+  private writeInFlight(entries: InFlightIngest[]): void {
     if (entries.length === 0) {
       this.handle.query("DELETE FROM stats WHERE key = ?").run(INGEST_IN_PROGRESS_KEY);
       return;
@@ -346,10 +340,13 @@ export class Db {
       `${process.pid}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 10)}`;
     this.ingestToken = token;
     this.transaction(() => {
-      const entries = this.readInFlight().filter((e) => e.t !== "legacy" && e.t !== token);
+      const existing = this.readInFlight();
+      const entries = existing.filter((e) => !isAdoptableToken(e.t) && e.t !== token);
       // Adopt any legacy scalar's start time so "how long has this been stuck"
-      // still answers honestly after the format change.
-      const legacyAt = this.readInFlight().find((e) => e.t === "legacy")?.at;
+      // still answers honestly after the format change. A MALFORMED marker has
+      // no knowable start time (`at === 0`), so it adopts ours instead of
+      // claiming 1970.
+      const legacyAt = existing.find((e) => e.t === LEGACY_TOKEN)?.at;
       entries.push({ t: token, at: legacyAt ?? startedAtMs });
       this.writeInFlight(entries);
     });
@@ -381,11 +378,28 @@ export class Db {
   }
 
   /** Epoch ms the EARLIEST still-unfinished ingest started, or `null` when
-   *  none is in flight. Any token present means in-progress. */
+   *  none is in flight. Any token present means in-progress; `0` means "in
+   *  flight, start time unknowable" (an unparseable marker), so callers MUST
+   *  test against `null` and never against falsiness. */
   ingestInProgressSince(): number | null {
-    const entries = this.readInFlight();
-    if (entries.length === 0) return null;
-    return entries.reduce((min, e) => (e.at < min ? e.at : min), entries[0]!.at);
+    return inProgressSince(this.readInFlight());
+  }
+
+  /**
+   * True when THIS handle has an ingest declaration outstanding (it called
+   * {@link beginIngest} or {@link clearGraph} and has not yet
+   * {@link endIngest}).
+   *
+   * Exists for `runIngest`'s abort path: a refused run may only retract the
+   * in-progress marker when it can prove the index is UNTOUCHED. Callers that
+   * clear the graph themselves (`cli/daemon.ts` does, before `runIngest`) stamp
+   * the marker on this same handle, and retracting it would un-flag an index
+   * that is genuinely empty. Concurrent tokens from OTHER processes are
+   * deliberately not visible here — they are neither ours to keep nor ours to
+   * clear.
+   */
+  hasDeclaredIngest(): boolean {
+    return this.ingestToken !== null;
   }
 
   /**
@@ -413,72 +427,14 @@ export class Db {
   /**
    * Structural usability of this index, for READERS.
    *
-   * Two independent failure modes, both of which previously read as "fresh":
-   *   1. `empty-but-claims-content` — the graph holds ZERO nodes while
-   *      `last_ingest_nodes` (recorded by the last SUCCESSFUL ingest) says it
-   *      held some. Nothing anywhere compared those two numbers, which is how a
-   *      wiped index kept certifying itself. Unambiguous corruption; does NOT
-   *      depend on the in-progress marker having survived.
-   *   2. `ingest-interrupted` — the {@link INGEST_IN_PROGRESS_KEY} marker is
-   *      still set, so an ingest cleared and/or partially rewrote the graph and
-   *      never finished. Node rows flush in 1000-row batches BEFORE the native
-   *      exit-code gate, while ALL edges, call sites and stats are written
-   *      AFTER it, so a SIGTERM mid-run yields a structurally wrong graph
-   *      (nodes with zero edges) that still looks populated.
-   *
-   * NEVER throws: a `stats`/`nodes` read failure (pre-migration handle, corrupt
-   * file) yields `unreadable` so callers degrade instead of crashing on what is
-   * a best-effort health check.
+   * A thin adapter over {@link readIndexIntegrity} — the ONE implementation of
+   * this decision, shared with `branch_index.ts`'s seed check and
+   * `migrations.ts`'s reindex precondition. It used to be reimplemented in each
+   * of those three places, and the copies disagreed about an empty graph and
+   * about every degenerate marker value; see `db/index_health.ts`.
    */
   checkIndexIntegrity(): IndexIntegrity {
-    let nodes = -1;
-    let claimedNodes = -1;
-    let inProgressSince: number | null = null;
-    try {
-      nodes =
-        this.handle.query<{ c: number }, []>("SELECT COUNT(*) AS c FROM nodes").get()?.c ?? -1;
-      const claimedRaw = this.getStat("last_ingest_nodes");
-      if (claimedRaw !== null) {
-        const n = Number(claimedRaw);
-        if (Number.isFinite(n) && n >= 0) claimedNodes = n;
-      }
-      inProgressSince = this.ingestInProgressSince();
-    } catch {
-      return {
-        ok: false,
-        reason: "unreadable",
-        detail: "the index's `stats`/`nodes` tables could not be read",
-        nodes,
-        claimedNodes,
-        inProgressSince,
-      };
-    }
-
-    if (nodes === 0 && claimedNodes > 0) {
-      return {
-        ok: false,
-        reason: "empty-but-claims-content",
-        detail:
-          "the graph holds 0 nodes but the last successful ingest recorded " +
-          `${claimedNodes} — the index was wiped by an interrupted rebuild`,
-        nodes,
-        claimedNodes,
-        inProgressSince,
-      };
-    }
-    if (inProgressSince !== null) {
-      return {
-        ok: false,
-        reason: "ingest-interrupted",
-        detail:
-          `an ingest started at ${new Date(inProgressSince).toISOString()} and ` +
-          "never finished — the graph is half-written",
-        nodes,
-        claimedNodes,
-        inProgressSince,
-      };
-    }
-    return { ok: true, reason: "ok", detail: "", nodes, claimedNodes, inProgressSince };
+    return readIndexIntegrity(this.handle);
   }
 
   /* ---------- node CRUD ---------- */

@@ -6,6 +6,21 @@
 >
 > Treat this as a checklist when designing or reviewing distributed-systems
 > code. Add to it when a future review surfaces a new class of mistake.
+>
+> **A note on how well that has worked.** Lessons 16-21 came from one audit,
+> and two of them are recurrences of lessons already in this file. Lesson 15
+> (an upward marker walk must stop at a boundary) was written after `$HOME`
+> was mistaken for a project root; it happened again through a symlinked-home
+> spelling the original fix never compared. Lesson 1 (a test that cannot fail
+> is not a test) was already here, and that same audit found **eleven** new
+> tests that passed with their own fix deleted, written by several different
+> authors who had this document available.
+>
+> Prose does not enforce anything. Where a lesson can be turned into a
+> mechanism, turn it into one: mutation-test every regression test by
+> reverting the fix and confirming it goes red, and prefer one shared function
+> over two implementations plus a comment promising they match. Read this file
+> for the classes of mistake; do not rely on having read it.
 
 ---
 
@@ -327,6 +342,112 @@ place. One dir name meant both "global config" and "project root."
 at a `.git`, at the filesystem root) and must not treat a *global* location
 as a *project* one. When two roles share a name, disambiguate by position —
 don't hope they never collide.
+
+---
+
+## 16. A guard at the record does not stop the work
+
+`$HOME` got registered as a project and its whole tree was indexed for six
+hours. The first fix guarded the *registry* — the one place a root becomes
+persistent — reasoning that a root which cannot be stored cannot be served.
+It could not survive a restart, and it also did not stop anything: `ingest`,
+`reindex`, `view`, `mcp` and `proxy` all resolve a root and walk it without
+consulting the registry. The CPU and the 195 GB never touched the guarded
+code.
+
+**Rule:** guard the operation that spends the resource, not the bookkeeping
+that remembers it. When you add a check, name the exact line that does the
+expensive or destructive thing and confirm your check is upstream of *that*.
+If several entry points reach it, they all need the guard, or the guard
+belongs where they converge.
+
+---
+
+## 17. One spelling per boundary, or the comparison is decorative
+
+Four separate bugs in one audit, all the same: `homedir()` returns the passwd
+string with symlinks intact, `process.cwd()` and `realpathSync` return
+physical paths. Every `===` between them silently compares unequal on any
+host where `$HOME` has a symlinked component — `/home/x` → `/mnt/…`, autofs,
+NFS, a relocated macOS home. The `$HOME` guard passed its tests and let the
+original bug straight through on exactly those machines. A registry that
+stored one spelling and deduped on another opened the same repo twice: two
+`Db` handles and two watchers on one WAL.
+
+**Rule:** decide a canonical form at each boundary, convert on the way in,
+and compare only canonical to canonical. A path that has been through
+`realpath` and one that has not are different types wearing the same
+`string`. Test with a symlinked fixture — a test on a non-symlinked tmpdir
+cannot see this class at all.
+
+---
+
+## 18. A breaker must measure the quantity that actually hurt you
+
+The runaway was 11,600 ingest cycles in six hours with **10** failures — a
+0.09% failure rate, never five in a row. The circuit breaker built in
+response tripped on five *consecutive failures*. It would have watched its
+own incident happen and never fired. The damage was successful work at an
+absurd rate; nothing anywhere bounded rate.
+
+**Rule:** write down the quantity that was actually pathological before
+choosing what to threshold. "It kept failing" and "it kept succeeding far too
+often" need different instruments, and the second is the one nobody
+instruments. A bound on concurrency is not a bound on frequency: serializing
+an unbounded loop just makes it tidy.
+
+---
+
+## 19. Two code paths answering the same question will diverge
+
+Found five times in one audit. The full walk honoured `.gitignore` and the
+vendor/fixture prunes; the watcher's incremental path applied neither, so the
+same repo had two different graphs depending on which path ran last.
+`checkIndexIntegrity` and `hasSeedableContent` disagreed on five of eight
+index states. Two file-count ceilings used incompatible units (401 vs 1 on
+one tree). Two containment helpers, one hardened and one lexical, so a
+symlink refused by the packer was blessed by the proxy and read into a
+prompt.
+
+**Rule:** when two places decide the same thing, that is one function with
+two callers, not two implementations to keep in sync. A comment saying
+"mirrors X" is an admission that it will drift — and it always drifts in the
+direction where one side is a security check.
+
+---
+
+## 20. A fix that destroys evidence is worse than the bug
+
+Log deduplication was added to stop a runaway loop filling the disk. Its
+dedup key included the whole fields object — and every line the loop emits
+carries a counter or a timestamp (`{dropped, sinceMs}`, `{changed, deleted}`),
+so suppression matched nothing and 10,000 of 10,000 lines were written.
+Rotation then capped the disk, which converted an unbounded-disk bug into an
+evidence-destruction bug: the loop's own churn rotated its diagnostic history
+away within minutes. The next person debugging it would find a bounded log
+containing only the last few seconds of a six-hour fault.
+
+**Rule:** when bounding a diagnostic surface, ask what a responder needs to
+still be there afterwards. Dedup on the stable part of a message, never on
+the varying part. Bounding output is not the same as preserving signal, and
+the loudest possible failure is the one that leaves nothing behind.
+
+---
+
+## 21. Parallel fixes collide where neither author is looking
+
+Six agents fixed six disjoint file sets in one pass. One added an
+`ingest_in_progress` marker to the `stats` table so a half-written index
+could not claim to be fresh. Another, fixing an unrelated bug in a different
+file, made `reindex` drop the `stats` table. Both fixes are correct alone;
+together they reopened the exact bug the first existed to close, and both
+lanes' tests passed.
+
+**Rule:** file-disjoint is not change-disjoint. After any parallel pass,
+review the *seams* specifically: enumerate every caller of a changed
+function, every reader of a changed table, every consumer of a changed
+return type. Budget a review pass whose only job is integration, and give it
+the list of what each lane touched — nobody inside a lane can see this.
 
 ---
 

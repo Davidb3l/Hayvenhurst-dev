@@ -49,6 +49,11 @@ function health(over: Partial<IngestHealth> = {}): IngestHealth {
     watchBatchInFlight: false,
     watchOverflowInFlight: false,
     watchOverflowsCoalesced: 0,
+    watcherAlive: true,
+    watcherRestarts: 0,
+    watcherSilentForMs: 0,
+    watcherHeartbeatStalls: 0,
+    watcherLastExitCode: null,
     ...over,
   };
 }

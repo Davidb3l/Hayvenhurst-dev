@@ -214,11 +214,11 @@ function buildModuleCluster(
     const a = memberOf.get(src)!;
     const b = memberOf.get(dst)!;
     if (a === b) continue;
-    const k = a + " " + b;
+    const k = a + "\u0000" + b;
     edgeWeights.set(k, (edgeWeights.get(k) ?? 0) + w);
   }
   const edges: GraphEdge[] = [...edgeWeights.entries()].map(([k, weight]) => {
-    const [src, dst] = k.split(" ") as [string, string];
+    const [src, dst] = k.split("\u0000") as [string, string];
     return { src, dst, kind: "cluster", weight };
   });
   return {

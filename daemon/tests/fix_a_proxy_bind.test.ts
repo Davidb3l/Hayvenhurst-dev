@@ -62,7 +62,9 @@ function makeSandbox(): { home: string; proj: string; runner: string } {
     `import { runProxy } from ${JSON.stringify(PROXY_MODULE)};\n` +
       "const flags: Record<string, string | boolean> = { port: process.argv[2]! };\n" +
       'if (process.argv[3]) flags["host"] = process.argv[3];\n' +
-      'await runProxy({ command: "proxy", positionals: [], flags } as never);\n',
+      'if (process.argv[4] === "allow") flags["allow-remote-access"] = true;\n' +
+      'const code = await runProxy({ command: "proxy", positionals: [], flags } as never);\n' +
+      "process.exit(code);\n",
   );
   return { home, proj, runner };
 }
@@ -81,11 +83,12 @@ interface Running {
 }
 
 /** Start the proxy in a subprocess and wait for its startup banner. */
-async function startProxy(host?: string): Promise<Running> {
+async function startProxy(host?: string, allowRemote = false): Promise<Running> {
   const { home, proj, runner } = makeSandbox();
   const port = randomPort();
   const args = ["bun", runner, String(port)];
   if (host) args.push(host);
+  if (allowRemote) args.push("allow");
   const child = Bun.spawn(args, {
     cwd: proj,
     env: { ...process.env, HAYVEN_HOME: home },
@@ -163,13 +166,15 @@ describe("A4 — hayven proxy binds loopback only", () => {
     }
   }, 40_000);
 
-  it("an explicit non-loopback --host is honoured AND warned about", async () => {
+  it("an explicit non-loopback --host is honoured AND warned about (with the opt-in)", async () => {
     const lan = lanAddress();
     if (lan === null) {
       console.warn("SKIP: no non-loopback IPv4 interface on this machine");
       return;
     }
-    const proxy = await startProxy("0.0.0.0");
+    // `--host 0.0.0.0` ALONE is now refused (asserted below); the opt-in is what
+    // makes this reachable, which is what gives the refusal its meaning.
+    const proxy = await startProxy("0.0.0.0", true);
     try {
       expect(proxy.banner).toMatch(/WARNING: bound to 0\.0\.0\.0/);
       expect(proxy.banner).toMatch(/reachable from the NETWORK/);
@@ -177,6 +182,61 @@ describe("A4 — hayven proxy binds loopback only", () => {
       // closure meaningful rather than an accident of the environment
       // (a firewall silently eating the LAN probe above would show up here).
       expect(await reachable(lan, proxy.port)).toBe(true);
+    } finally {
+      proxy.stop();
+    }
+  }, 40_000);
+});
+
+describe("S5 — a non-loopback proxy bind is REFUSED without --allow-remote-access", () => {
+  /** Run the proxy to COMPLETION (it exits instead of serving when refused). */
+  async function runRefused(host: string): Promise<{ code: number; stderr: string; port: number }> {
+    const { home, proj, runner } = makeSandbox();
+    const port = randomPort();
+    const child = Bun.spawn(["bun", runner, String(port), host], {
+      cwd: proj,
+      env: { ...process.env, HAYVEN_HOME: home },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stderr = await new Response(child.stderr).text();
+    const code = await child.exited;
+    return { code, stderr, port };
+  }
+
+  it("exits non-zero with an actionable error, and binds NOTHING", async () => {
+    // The end-to-end pin, through the real CLI entry point in a real subprocess:
+    // a unit test over `decideProxyBind` alone would pass even if `runProxy`
+    // ignored its verdict and served anyway.
+    const { code, stderr, port } = await runRefused("0.0.0.0");
+    expect(code).not.toBe(0);
+    expect(stderr).toContain("refusing to bind 0.0.0.0");
+    expect(stderr).toContain("--allow-remote-access");
+    // It must not have printed the ready banner…
+    expect(stderr).not.toContain("point your client's base URL");
+    // …and nothing may be listening on the port it would have used. Probed on
+    // loopback: if it had served at all, the wildcard bind would answer here.
+    expect(await reachable("127.0.0.1", port)).toBe(false);
+  }, 40_000);
+
+  it("refuses a LAN interface address too, not just the wildcard", async () => {
+    const lan = lanAddress();
+    if (lan === null) {
+      console.warn("SKIP: no non-loopback IPv4 interface on this machine");
+      return;
+    }
+    const { code, stderr } = await runRefused(lan);
+    expect(code).not.toBe(0);
+    expect(stderr).toContain(`refusing to bind ${lan}`);
+  }, 40_000);
+
+  it("still starts normally on the loopback default", async () => {
+    // The negative control: the gate must not have broken the ordinary path.
+    const proxy = await startProxy();
+    try {
+      expect(proxy.banner).toContain("point your client's base URL");
+      expect(proxy.banner).not.toContain("refusing to bind");
+      expect(await reachable("127.0.0.1", proxy.port)).toBe(true);
     } finally {
       proxy.stop();
     }

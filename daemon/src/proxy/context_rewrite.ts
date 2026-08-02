@@ -38,10 +38,9 @@
  * `server.ts`; this module is what the tests drive directly.
  */
 import { readFileSync } from "node:fs";
-import { isAbsolute, resolve, sep } from "node:path";
 
 import { contextForSymbols } from "../db/context_helper.ts";
-import { estimateTokens } from "../db/context_pack.ts";
+import { estimateTokens, isPackableFile, resolveRepoPath } from "../db/context_pack.ts";
 import type { Db } from "../db/queries.ts";
 import { resolveTaskToSymbols } from "../db/task_resolve.ts";
 
@@ -230,17 +229,6 @@ function fileSymbolIds(db: Db, file: string): Set<string> {
   return new Set(rows.map((r) => r.id));
 }
 
-/** Resolve a path attribute to a repo-relative file, refusing anything that
- *  escapes the repo root (path-traversal / absolute-path hygiene). Returns the
- *  repo-relative path (the form the index stores) or null. */
-function toRepoRelative(repoRoot: string, rawPath: string): string | null {
-  const rootAbs = resolve(repoRoot);
-  const abs = isAbsolute(rawPath) ? resolve(rawPath) : resolve(rootAbs, rawPath);
-  if (abs !== rootAbs && !abs.startsWith(rootAbs + sep)) return null; // escaped repo
-  const rel = abs.slice(rootAbs.length).replace(/^[\\/]+/, "");
-  return rel.length > 0 ? rel : null;
-}
-
 /** Decide + (if worth it) build the replacement for one `<file>` marker. Pure
  *  apart from the read-only file read + DB query. Returns the new block text and
  *  the stat; `null` newText means "leave the marker untouched". */
@@ -260,12 +248,34 @@ function rewriteOneMarker(
     savedTokens: 0,
   });
 
-  const rel = toRepoRelative(repoRoot, marker.path);
-  if (!rel) return { newText: null, stat: base("unreadable") };
+  // SECURITY — the SAME gate the packer uses (`resolveRepoPath`), not a private
+  // lexical copy. The copy that used to live here compared only the LEXICAL
+  // path against the root, which meant:
+  //   - an in-repo `env.ts` SYMLINKED to an out-of-tree secret was BLESSED (the
+  //     packer's `resolveWithinRepo` already refused it), and the `readFileSync`
+  //     below put that file's contents into a prompt sent to a third-party LLM
+  //     API — the worst possible destination for a credential;
+  //   - the mirror case, a repo root spelled through a symlink, refused EVERY
+  //     rewrite, so the proxy quietly delivered zero token savings while its
+  //     stats reported healthy "unreadable" outcomes.
+  // Deliberate on the two behaviours this inherits: the returned path is the
+  // CANONICAL one (so the read cannot be swapped between check and use), and the
+  // credential denylist + indexer-parity rule apply here too — the proxy has no
+  // business pasting a `.env` or a `dump.sql` upstream either, and any file the
+  // rewrite could actually beat has to be indexed source anyway.
+  const gated = resolveRepoPath(repoRoot, marker.path);
+  if (!gated) return { newText: null, stat: base("unreadable") };
+  const rel = gated.rel;
 
+  // Same file-type/size gate as the packer: a FIFO inside the repo would block
+  // this synchronous read forever, and an oversized file would be slurped whole
+  // just to be compared against the pasted body.
+  if (!isPackableFile(gated.abs)) {
+    return { newText: null, stat: base("unreadable") };
+  }
   let onDisk: string;
   try {
-    onDisk = readFileSync(resolve(repoRoot, rel), "utf8");
+    onDisk = readFileSync(gated.abs, "utf8");
   } catch {
     return { newText: null, stat: base("unreadable") };
   }

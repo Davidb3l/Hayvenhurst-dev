@@ -39,13 +39,13 @@ import {
 } from "../conflict/verify.ts";
 import { startWatch, type WatchEvent, type WatchStats, type WatchSupervisor } from "../native/watcher.ts";
 import { emitCodeChanged } from "../spine.ts";
-import { rootLogger, rotateLogFile } from "../util/log.ts";
+import { LOG_MAX_BYTES, rootLogger, rotateLogFile } from "../util/log.ts";
 import type { ParsedArgs } from "../cli.ts";
 import { Db } from "../db/queries.ts";
 import { SchemaTooNewError } from "../db/migrations.ts";
 import { activeBranchKey, resolveWriteIndex, resolveWriteIndexForKey } from "../db/branch_index.ts";
 import type { HayvenConfig } from "../config/defaults.ts";
-import { closeSync, existsSync, mkdirSync, openSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, ftruncateSync, mkdirSync, openSync, statSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import {
@@ -63,9 +63,10 @@ import {
   pruneStaleProjects,
   registerProject,
   sameProjectRoot,
-  unregisterProject,
+  unregisterProjectDetailed,
   type ProjectEntry,
 } from "../daemon/registry.ts";
+import { parseMaxFiles, refuseIfOverCeiling } from "./init.ts";
 import { hotAddToRunningDaemon, requireProject } from "./_shared.ts";
 import { VERSION } from "../version.ts";
 
@@ -546,6 +547,18 @@ export function createIngestGuard(deps: IngestGuardDeps): IngestGuard {
         watchBatchInFlight: w?.batchInFlight ?? false,
         watchOverflowInFlight: w?.overflowInFlight ?? false,
         watchOverflowsCoalesced: w?.overflowsCoalesced ?? 0,
+        // `null` (not `false`/`0`) when there is NO watcher at all, so "the
+        // native binary is missing" is distinguishable from "the watcher is up
+        // and quiet". Previously neither was visible over HTTP, and a dead
+        // watcher read exactly like an idle repo.
+        watcherAlive: w === undefined ? null : w.alive,
+        watcherRestarts: w === undefined ? null : w.restarts,
+        // Real `Date.now()`, NOT the injectable `now()`: `lastRecordAtMs` is
+        // stamped by the watcher against the real clock, so a test's virtual
+        // clock would produce a nonsense age.
+        watcherSilentForMs: w === undefined ? null : Math.max(0, Date.now() - w.lastRecordAtMs),
+        watcherHeartbeatStalls: w === undefined ? null : w.heartbeatStalls,
+        watcherLastExitCode: w === undefined ? null : w.lastExitCode,
       };
     },
   };
@@ -756,9 +769,13 @@ const DAEMON_USAGE = `hayven daemon <subcommand>
   restart                  Alias for stop + start.
   logs                     Tail the daemon logs.
   register [<path>]        Register a project so the daemon serves it. Defaults
-                           to the cwd project. --alias <x> names it.
+                           to the cwd project. --alias <x> names it. Refuses a
+                           tree above --max-files (default 50000; "off" to
+                           disable) so a home dir cannot be enrolled.
   projects                 List registered projects (alias → root). --json for JSON.
-  unregister <alias|path>  Remove a project from the registry.
+  unregister <alias|path>  Remove a project from the registry. A BARE NAME is an
+                           alias, never a path — pass ./name or an absolute path
+                           to remove by location.
 `;
 
 export async function runDaemon(args: ParsedArgs): Promise<number> {
@@ -800,6 +817,30 @@ async function registerDaemonProject(args: ParsedArgs): Promise<number> {
   if (aliasFlag === true) {
     process.stderr.write("error: --alias requires a value, e.g. --alias myrepo\n");
     return 2;
+  }
+  // FILE-COUNT CEILING, before anything is persisted. `register` was the last
+  // entry point that could enroll an enormous tree with no pre-walk refusal:
+  // `graph/ingest.ts` does cap `files_total`, but only off the native `start`
+  // record — i.e. AFTER the walker has already walked the whole tree — so a
+  // `$HOME`-sized registration still cost a full traversal and then sat in the
+  // registry to be re-opened, re-watched and re-walked on every daemon start.
+  // `refuseIfOverCeiling` counts the same population the native walker feeds the
+  // parser and stops short once the ceiling is exceeded.
+  //
+  // `--max-files` is honored here for the same reason `hayven init` honors it:
+  // the refusal text ends with "re-run with `<command> --max-files=…`", and a
+  // command that printed that while ignoring the flag would send the user in a
+  // loop. `parseMaxFiles` refuses a typo rather than falling back to the default,
+  // so `--max-files=5O000` cannot silently re-arm the unbounded walk.
+  const ceiling = parseMaxFiles(args.flags["max-files"]);
+  if (ceiling instanceof Error) {
+    process.stderr.write(`error: ${ceiling.message}\n`);
+    return 2;
+  }
+  const verdict = refuseIfOverCeiling(root, ceiling, "hayven daemon register");
+  if (verdict !== null) {
+    process.stderr.write(verdict);
+    return 1;
   }
   let entry: ProjectEntry;
   try {
@@ -855,6 +896,14 @@ function listDaemonProjects(args: ParsedArgs): number {
 
 /**
  * `hayven daemon unregister <alias|path>` — remove a project from the registry.
+ *
+ * Uses the DETAILED form deliberately. An argument is an ALIAS xor a PATH, never
+ * both, and a bare name is never resolved against the cwd — but that rule is
+ * invisible to a user who only ever sees `not found: repo`, which reads as "no
+ * such project" when the real answer is "that is a path, and I only matched
+ * aliases". `unregisterProjectDetailed` returns a message that names which
+ * interpretation it used and what exists instead; printing anything else throws
+ * that diagnostic away.
  */
 function unregisterDaemonProject(args: ParsedArgs): number {
   const arg = args.positionals[1];
@@ -862,8 +911,8 @@ function unregisterDaemonProject(args: ParsedArgs): number {
     process.stderr.write("error: unregister requires an alias or path\n");
     return 2;
   }
-  const removed = unregisterProject(arg);
-  process.stdout.write(removed ? `unregistered ${arg}\n` : `not found: ${arg}\n`);
+  const outcome = unregisterProjectDetailed(arg);
+  process.stdout.write(`${outcome.message}\n`);
   return 0;
 }
 
@@ -1088,6 +1137,17 @@ async function startDetachedDaemon(args: ParsedArgs): Promise<number> {
     // time is therefore the only place the size can be bounded — the incident
     // left a 576 MB `daemon.out.log` that nothing would ever have truncated.
     rotateLogFile(logPath);
+    // `~/.hayven/logs/autostart.log` is APPENDED TO by `plugin/scripts/
+    // ensure-daemon.sh` on every hook-driven session start (`>>autostart.log`)
+    // and had NOTHING that ever rotated it — an append-only file growing for the
+    // life of the install, the same unbounded-log shape as daemon.out.log. The
+    // shell script cannot rotate it (it holds the append fd for its own
+    // lifetime), but the `hayven daemon start` it invokes runs right here, so
+    // this is the natural rotation point. The redirect is O_APPEND onto an
+    // inode: after a rotation THIS invocation's remaining output follows the
+    // inode into `autostart.log.1` and the next session starts a fresh file,
+    // which is correct — nothing is lost, it is just split at the boundary.
+    rotateLogFile(join(globalLogsDir(), "autostart.log"));
     const fd = openSync(logPath, "a");
     try {
       child = spawn(cmd[0]!, cmd.slice(1), {
@@ -1310,6 +1370,28 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
       return next;
     }
 
+    /**
+     * The scope flags EVERY native invocation for this project must agree on:
+     * the full walk, the watcher, the watcher's incremental `--files-stdin`
+     * re-parse and the Layer B verify gate.
+     *
+     * ONE object, spread into all four call sites, because they diverged the
+     * moment they were written out longhand. `--include-vendored` /
+     * `--include-fixtures` used to be a genuine no-op on the incremental path,
+     * so nothing could disagree; once the native side started applying the
+     * shared `ScopeFilter` everywhere, a project with `index.includeVendored:
+     * true` got its vendored files on a full ingest and SILENTLY LOST them on
+     * every watcher re-ingest — the graph then oscillated with whichever path
+     * ran last. Adding the flags to only some of these sites is worse than
+     * adding them to none: the watcher's per-file `deleteNodesByFile` purge runs
+     * BEFORE the parse, so a narrow re-parse of a `vendor/` change deletes the
+     * rows and never restores them.
+     */
+    const scope = {
+      includeVendored: config.index?.includeVendored ?? false,
+      includeFixtures: config.index?.includeFixtures ?? false,
+    } as const;
+
     async function fullIngest(): Promise<IngestResult> {
       const binary = locateNativeBinary({ repoRoot: paths.repoRoot });
       const run = startParse({
@@ -1319,8 +1401,7 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
         jobs: config.parse_jobs,
         timeoutMs: config.ingest_timeout_seconds * 1000,
         logger: plog,
-        includeVendored: config.index?.includeVendored ?? false,
-        includeFixtures: config.index?.includeFixtures ?? false,
+        ...scope,
       });
       // Read the CURRENT served db so a post-swap ingest writes the new branch's
       // index, not the one captured at startup.
@@ -1399,6 +1480,8 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
         root: paths.repoRoot,
         debounceMs: 200,
         logger: plog.child("watch"),
+        // Same scope as every parse below — see `scope`.
+        ...scope,
         onBatch: async (events: WatchEvent[]) => {
           // Classify by kind so we reconcile deletes + renames, not just
           // re-parse (review HIGH H3: deleted files used to linger in the index
@@ -1501,6 +1584,11 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
                 jobs: config.parse_jobs,
                 timeoutMs: config.ingest_timeout_seconds * 1000,
                 logger: plog.child("watch.parse"),
+                // MUST match the full-ingest scope. The rows for every file in
+                // `changed` were purged above; a narrower scope here means the
+                // native side filters the file out, emits nothing for it, and
+                // the purge is never undone.
+                ...scope,
                 files: [...changed],
               });
               await drainIngest({ db, nodesDir: paths.nodesDir, run, logger: plog.child("watch.ingest"), repoRoot: paths.repoRoot });
@@ -1542,6 +1630,10 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
                     jobs: config.parse_jobs,
                     timeoutMs: config.ingest_timeout_seconds * 1000,
                     logger: plog.child("verify.parse"),
+                    // Same scope again: the gate compares its own re-parse
+                    // against the rows the ingest just wrote, so a mismatch
+                    // reads as "the merge dropped every entity in this file".
+                    ...scope,
                   }),
                   typecheck: defaultTypecheck({
                     root: paths.repoRoot,
@@ -1638,8 +1730,7 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
           jobs: config.parse_jobs,
           timeoutMs: config.ingest_timeout_seconds * 1000,
           logger: plog.child("watch.repoint"),
-          includeVendored: config.index?.includeVendored ?? false,
-          includeFixtures: config.index?.includeFixtures ?? false,
+          ...scope,
         });
         // Same idempotence requirement as `fullIngest`: this is a whole-repo
         // re-parse, and the target index was very likely SEEDED by copying a
@@ -1860,6 +1951,24 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
       overCap.push(`${p.alias} -> ${p.paths.repoRoot}`);
       continue;
     }
+    // Same corruption guard as `addProjectLive`, for the STARTUP loader: two
+    // registry entries sharing an alias (a hand-edited projects.json, or a file
+    // that lost a write) would otherwise open a second Db and a second
+    // `hayven-native watch` child on the first project's WAL, with the first
+    // runtime orphaned in the map and never shut down.
+    if (runtimes.has(p.alias)) {
+      logger.warn("skipping project — its alias is already served", {
+        alias: p.alias,
+        root: p.paths.repoRoot,
+        servedRoot: runtimes.get(p.alias)!.deps.paths.repoRoot,
+      });
+      process.stderr.write(
+        `warning: registry alias '${p.alias}' names two different repos — serving ` +
+          `${runtimes.get(p.alias)!.deps.paths.repoRoot} and SKIPPING ${p.paths.repoRoot}.\n` +
+          "Fix it with `hayven daemon unregister` + `hayven daemon register --alias <new>`.\n",
+      );
+      continue;
+    }
     try {
       // The primary's config already carries the loaded config (+ --port/--host);
       // others got theirs from loadConfig when the list was built above.
@@ -1992,10 +2101,50 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
       if (!existsSync(paths.hayvenDir)) {
         throw new Error(`no .hayven/ directory at ${root} — run \`hayven init\` there first`);
       }
-      // Persist (derives a unique alias), then build + wire the runtime and add it
-      // to the live map. `initProject` throws on a broken index — let it propagate
-      // to the caller (the route returns 400) WITHOUT mutating any map.
+      // NO FILE-COUNT CEILING HERE, deliberately. `hayven daemon register` has
+      // one, but this door must not: `countIndexableFiles` is fully SYNCHRONOUS
+      // with a 10 s budget, so calling it here stalls the entire daemon — every
+      // HTTP request, the watcher stdout drain, both branch pollers, every timer
+      // — for up to ten seconds, reachable from an unauthenticated local `POST
+      // /api/projects`. It also fails CLOSED when the scan does not finish, and
+      // this route has no way to accept a `--max-files` override, so a large or
+      // network-mounted repo would be refused here forever; `_shared.ts` turns a
+      // hot-add failure into a hard `ok:false`, which would then abort
+      // `claim`/`release`/`node body`/`sync` in that repo with a message naming
+      // a flag this route cannot take. The pre-walk refusal belongs on the
+      // user-driven command, where a stall costs one CLI process and the flag
+      // exists.
+      //
+      // Persist first (this is what derives the alias), then check it against
+      // the LIVE map before opening anything.
       const entry = registerProject(root, aliasHint);
+      // ALIAS COLLISION. `deriveAlias` only guarantees uniqueness against the
+      // REGISTRY on disk, and the live `runtimes` map drifts from it: `hayven
+      // daemon unregister` removes a registry entry without touching a running
+      // daemon, so the next `registerProject` is free to hand back an alias this
+      // process is already serving. A bare `runtimes.set` would then orphan the
+      // first runtime — its Db handle and its `hayven-native watch` child stay
+      // alive with nothing referencing them, so TWO watchers and TWO writers end
+      // up on ONE `.hayven/index.sqlite` WAL, which util/paths.ts states is
+      // corruption. The canonical-root idempotence check above only catches the
+      // SAME repo; this catches a DIFFERENT repo arriving under a taken name.
+      //
+      // Checked on `entry.alias` — the alias `registerProject` ACTUALLY chose —
+      // rather than on a prediction. Re-deriving it here would be wrong in three
+      // ways: `registerProject` reads the RAW registry (which holds rows the
+      // filtered read hides, so the `-N` suffix can differ), it prefers an
+      // existing entry's alias over the hint, and it returns an already-present
+      // entry verbatim without consulting `deriveAlias` at all. A prediction that
+      // disagrees would both let real collisions through and refuse legitimate
+      // adds. The registry write above is idempotent by root, so a refusal here
+      // leaves behind at worst a re-assertion of an entry that already existed.
+      if (runtimes.has(entry.alias)) {
+        const held = runtimes.get(entry.alias)!;
+        throw new Error(
+          `alias '${entry.alias}' is already served by this daemon (${held.deps.paths.repoRoot}) — ` +
+            `refusing to serve ${root} under it. Retry with an explicit \`--alias\`, or restart the daemon.`,
+        );
+      }
       const cfg = loadConfig(root).config;
       const runtime = initProject(entry.alias, paths, cfg);
       runtimes.set(entry.alias, runtime);
@@ -2078,6 +2227,7 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
 
   const config = primaryConfig;
   const shutdownAll = async (): Promise<void> => {
+    clearInterval(outLogTimer);
     // Let any in-flight add/remove settle first so we snapshot a quiescent map and
     // don't race a mutation that's mid-`initProject`/`shutdown`.
     await mutationChain.catch(() => undefined);
@@ -2111,6 +2261,19 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
       });
     }
   };
+
+  // Bound `daemon.out.log` WITHIN this process's lifetime. The launcher rotates
+  // it at spawn time, but the fd is then held for the daemon's whole life — so
+  // between two `daemon start`s (a daemon that runs for weeks) nothing capped it
+  // at all, and a chatty uncaught write could grow it without limit. Renaming is
+  // not an option here: the writer holds the inode, so a rename just carries the
+  // growth along under a new name. Truncating IN PLACE is, because the fd is
+  // O_APPEND — the next write resumes at offset 0 instead of leaving a
+  // sparse-file hole.
+  const outLogTimer = setInterval(() => {
+    void truncateOwnOutLog(logger);
+  }, OUT_LOG_CHECK_INTERVAL_MS);
+  if (typeof outLogTimer.unref === "function") outLogTimer.unref();
 
   // Claim a pidfile for EVERY served project (see `claimPidFile`), not just the
   // primary — that asymmetry is why `stop`/`status` were no-ops in non-primary
@@ -2172,6 +2335,54 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
     // Intentionally never resolves; signal handlers will exit.
   });
   return 0;
+}
+
+/** How often the running daemon checks its own inherited out-log size. */
+export const OUT_LOG_CHECK_INTERVAL_MS = 5 * 60 * 1000;
+
+/**
+ * Truncate `~/.hayven/logs/daemon.out.log` in place when it has grown past
+ * {@link LOG_MAX_BYTES} **and** it is genuinely the file this process's stdout
+ * is attached to.
+ *
+ * The inode comparison is the whole safety argument. A `--foreground` daemon
+ * started by hand has stdout on a terminal and must not touch the file; a
+ * DETACHED daemon inherited an append-mode fd on exactly this inode and is the
+ * only process that can bound it (rename-based rotation cannot — the writer
+ * keeps the inode, so the growth just follows it to the new name).
+ *
+ * Never throws: a bounded log is hygiene, never a reason to disturb the daemon.
+ */
+export function truncateOwnOutLog(
+  logger: Logger,
+  opts: { maxBytes?: number; logPath?: string; stdoutFd?: number } = {},
+): boolean {
+  const maxBytes = opts.maxBytes ?? LOG_MAX_BYTES;
+  const logPath = opts.logPath ?? join(globalLogsDir(), "daemon.out.log");
+  // fd 1 is stdout in production; injectable so a test can stand in a real file
+  // descriptor instead of the runner's pipe.
+  const stdoutFd = opts.stdoutFd ?? 1;
+  try {
+    const onDisk = statSync(logPath);
+    if (onDisk.size < maxBytes) return false;
+    // If stdout is not this exact file (a TTY, a pipe, some other redirect), we
+    // are not the writer and must leave the file alone.
+    const mine = fstatSync(stdoutFd);
+    if (mine.ino !== onDisk.ino || mine.dev !== onDisk.dev) return false;
+    // Truncate the FD, not the path. The inode identity was proven on the fd, so
+    // truncating by name would hit whatever `daemon.out.log` refers to NOW — and
+    // a concurrent `daemon start` rotates the old inode to `.1` and creates a
+    // fresh file under that name. Narrow, but `ftruncateSync` closes it outright.
+    ftruncateSync(stdoutFd, 0);
+    logger.warn("daemon.out.log exceeded its cap and was truncated in place", {
+      path: logPath,
+      wasBytes: onDisk.size,
+      maxBytes,
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** How long `daemon stop` waits for the signaled pid to actually exit. The

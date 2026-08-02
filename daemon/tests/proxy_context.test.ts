@@ -103,13 +103,16 @@ const FN_SUMMARY: Record<string, string> = {
 };
 
 /** Seed the fixture: a real on-disk app.ts + its indexed nodes, plus an
- *  un-indexed notes.md on disk. Returns the db, repo root, and the file body. */
+ *  un-indexed notes.md AND an un-indexed (but source-shaped) stray.ts on disk.
+ *  Returns the db, repo root, and the file body. */
 function makeFixture(): { db: Db; root: string; appBody: string } {
   const { content, ranges } = buildAppFile(FN_NAMES);
   const notes = "# Notes\n\nThis markdown file is on disk but is NOT indexed as code.\n";
+  const stray = "export const alphaNotes = 1; // real source, simply not in the index\n";
   const root = writeRepo([
     ["app.ts", content],
     ["notes.md", notes],
+    ["stray.ts", stray],
   ]);
   const db = new Db(":memory:");
   db.migrate();
@@ -181,12 +184,32 @@ describe("context proxy — pure core rewrite (packs a whole-file paste)", () =>
 describe("context proxy — never-worse fallbacks (block left intact)", () => {
   it("an un-indexed file is passed through unchanged", () => {
     const { db, root } = makeFixture();
-    const notes = "# Notes\n\nThis markdown file is on disk but is NOT indexed as code.\n";
-    const body = bodyWith("summarize the notes about alpha", "notes.md", notes);
+    // Real source (a `.ts` the indexer WOULD open) that simply has no nodes —
+    // this is the case `not-indexed` names.
+    const stray = "export const alphaNotes = 1; // real source, simply not in the index\n";
+    const body = bodyWith("summarize the notes about alpha", "stray.ts", stray);
     const { stats, changed } = rewriteMessagesForContext(db, root, body);
     expect(changed).toBe(false);
     expect(stats.perFile[0]!.action).toBe("not-indexed");
     expect(stats.savedTokens).toBe(0);
+    db.close();
+  });
+
+  it("a NON-SOURCE file is refused before it is ever read", () => {
+    // S2 — the proxy is no longer more permissive than the indexer. A `.md` (or
+    // a `dump.sql`, or a `backup.json`) is not a language the walker parses, so
+    // it never enters the graph; the proxy must not open it either, since the
+    // only thing it could do with the bytes is forward them upstream. The
+    // outcome is still never-worse (block left byte-for-byte intact), only the
+    // reported reason changes from "not-indexed" to "unreadable".
+    const { db, root } = makeFixture();
+    const notes = "# Notes\n\nThis markdown file is on disk but is NOT indexed as code.\n";
+    const body = bodyWith("summarize the notes about alpha", "notes.md", notes);
+    const { body: out, stats, changed } = rewriteMessagesForContext(db, root, body);
+    expect(changed).toBe(false);
+    expect(stats.perFile[0]!.action).toBe("unreadable");
+    expect(stats.savedTokens).toBe(0);
+    expect(userText(out)).toContain(notes.trim());
     db.close();
   });
 

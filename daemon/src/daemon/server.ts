@@ -5,13 +5,14 @@
  * the `routes/` subdirectory.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
+import { homedir } from "node:os";
 
 import { Elysia } from "elysia";
 
 import type { HayvenConfig } from "../config/defaults.ts";
 import type { CrdtState } from "../crdt/state.ts";
 import type { Db } from "../db/queries.ts";
-import type { HayvenPaths } from "../util/paths.ts";
+import { canonicalRoot, hayvenHomeDir, type HayvenPaths } from "../util/paths.ts";
 import type { Logger } from "../util/log.ts";
 import { affectedTestsRoutes } from "./routes/affected_tests.ts";
 import { claimsRoutes } from "./routes/claims.ts";
@@ -160,6 +161,26 @@ export interface IngestHealth {
   watchOverflowInFlight: boolean;
   /** Overflow records that collapsed into a running/queued rescan. */
   watchOverflowsCoalesced: number;
+  /**
+   * WATCHER LIVENESS. Without these, a dead watcher and an idle one look
+   * identical over HTTP: incremental ingest silently stops, the index quietly
+   * goes stale, and nothing anywhere says so — the same "no signal" shape as the
+   * original incident, just in the opposite direction.
+   *
+   * `null` when this daemon has no watcher at all (the `hayven-native` binary
+   * was not found at startup), which is itself the answer to "why is nothing
+   * re-ingesting?".
+   */
+  watcherAlive: boolean | null;
+  /** Times the watcher child has been restarted since the daemon started. */
+  watcherRestarts: number | null;
+  /** Milliseconds since ANY record was read off the watcher child's stdout.
+   *  Past the stall budget the supervisor kills and restarts the child. */
+  watcherSilentForMs: number | null;
+  /** Times the child was restarted for going silent past the stall budget. */
+  watcherHeartbeatStalls: number | null;
+  /** Exit code of the most recent watcher child exit, or null if none yet. */
+  watcherLastExitCode: number | null;
 }
 
 /** One row of the multi-project `/api/health` listing. */
@@ -219,16 +240,64 @@ export function wireBranchAwareDb(deps: ServerDependencies): void {
 }
 
 /**
+ * Every directory prefix that must be stripped out of an outbound error message.
+ *
+ * `process.env.HOME` ALONE was the bug. `plugin/scripts/ensure-daemon.sh`
+ * documents HOME being unset or empty under launchd, systemd, several CI
+ * runners and slim containers — and starts the daemon anyway. In exactly those
+ * environments the redaction silently no-opped and `onError`'s raw
+ * `error.message` (which routinely embeds absolute paths) leaked the account
+ * name and the on-disk layout to anything that could reach the port. So we take
+ * the union of the three notions of "home" this codebase actually has:
+ *
+ *   - `$HOME`          — what the shell/hook environment says.
+ *   - `os.homedir()`   — resolved from `getpwuid` when `$HOME` is absent, which
+ *                        is the whole point: it still works under launchd.
+ *   - `hayvenHomeDir()` — the `$HAYVEN_HOME` override, which may live entirely
+ *                        outside either of the above.
+ *
+ * Sorted LONGEST FIRST so a nested root (`$HAYVEN_HOME` under `$HOME`) is
+ * replaced before its own parent turns it into a half-redacted string.
+ *
+ * `env` is injectable so tests can exercise the empty-HOME environments without
+ * mutating the process (Bun resolves `os.homedir()` once per process).
+ */
+export function homeRedactionRoots(env: Record<string, string | undefined> = process.env): string[] {
+  const candidates: Array<string | undefined> = [env["HOME"]];
+  // Both of these read real state and must never take a request down.
+  try {
+    candidates.push(homedir());
+  } catch {
+    /* no passwd entry — nothing to add */
+  }
+  try {
+    candidates.push(hayvenHomeDir());
+  } catch {
+    /* unresolvable — nothing to add */
+  }
+  const roots = new Set<string>();
+  for (const c of candidates) {
+    // `length < 2` drops "" and "/": redacting "/" would replace every slash in
+    // the message with "~" and destroy it.
+    if (typeof c === "string" && c.length >= 2) roots.add(c);
+  }
+  return [...roots].sort((a, b) => b.length - a.length);
+}
+
+/**
  * Strip the user's home directory out of an error message before it leaves the
  * process. `onError` echoes `error.message` straight back to the caller, and
  * those messages routinely embed absolute paths — which leaks the account name
  * and the on-disk layout to anything that can reach the port. The message stays
  * readable (`~/code/repo/...`); the full text still goes to the daemon log.
  */
-export function redactHomePaths(message: string): string {
-  const home = process.env["HOME"];
-  if (typeof home !== "string" || home.length < 2) return message;
-  return message.split(home).join("~");
+export function redactHomePaths(
+  message: string,
+  roots: readonly string[] = homeRedactionRoots(),
+): string {
+  let out = message;
+  for (const root of roots) out = out.split(root).join("~");
+  return out;
 }
 
 /**
@@ -350,6 +419,62 @@ const projectContext = new AsyncLocalStorage<ServerDependencies>();
 /** HTTP methods that mutate state — the ones an unknown-project selector must
  *  hard-refuse (404) rather than fall back to the primary project. */
 const MUTATING_METHODS: ReadonlySet<string> = new Set(["POST", "PUT", "DELETE", "PATCH"]);
+
+/**
+ * Mutations whose TARGET is spelled out in the request itself rather than taken
+ * from the ambient project selector, so requiring a `?project=` on them would be
+ * meaningless (there is no project to name yet) or contradictory (the alias is
+ * already in the path).
+ *
+ *   - `POST /api/projects`          — body carries the repo path being ADDED.
+ *   - `DELETE /api/projects/<alias>` — the alias is the path segment.
+ *
+ * Everything else that mutates writes into whichever project the request
+ * resolves to, and must therefore say which one.
+ */
+function isDaemonLevelMutation(method: string, pathname: string): boolean {
+  if (pathname === "/api/projects") return method === "POST";
+  return pathname.startsWith("/api/projects/") && method === "DELETE";
+}
+
+/**
+ * Project-scoped mutating routes that CANNOT be required to carry a selector,
+ * because no client that reaches them is able to supply one.
+ *
+ * `POST /api/traces/observations` is the whole list. Its only callers are the
+ * three language collectors (`trace/go/flusher.go`, `trace/python/.../flusher.py`,
+ * `trace/rust/src/flusher.rs`); each is configured with nothing but a daemon
+ * base URL, sends only Content-Type/User-Agent, and has no way to learn an
+ * alias — the payload does not even carry a repo root to infer one from.
+ * Refusing these would silently drop every runtime trace the moment a daemon
+ * picked up a second project, which is the steady state (the registry
+ * accumulates every repo a `daemon start` was ever run in).
+ *
+ * So they keep the legacy fall-through to the primary, and it is LOGGED rather
+ * than refused. That is a known, stated gap — routing traces correctly needs a
+ * selector in the collector wire format, which is a cross-repo change.
+ *
+ * Everything else that mutates has a client that already sends one: `claim` /
+ * `release` / `node body` / `summarize` attach `projectHeader()`, and `sync`
+ * attaches both `localHeaders` and `peerHeaders` (`resolvePeerProject` makes
+ * `--peer-project` mandatory against a multi-project peer).
+ */
+function hasNoSelectorCapableClient(pathname: string): boolean {
+  return pathname.startsWith("/api/traces/");
+}
+
+/**
+ * Header a client sends to say "I checked, and this daemon's PRIMARY project is
+ * the repo I mean" — the case where there is no alias to send because
+ * `/api/health` answered with a bare `root` and no `projects` list (a
+ * single-project or pre-multi-project daemon).
+ *
+ * It carries the ABSOLUTE ROOT the client verified, not a bare "trust me" flag,
+ * so the daemon re-checks it against the primary's own root and refuses if the
+ * primary has since changed. See {@link buildMultiProjectApp} for why an
+ * un-addressed mutation cannot simply be allowed.
+ */
+export const PRIMARY_ROOT_HEADER = "x-hayven-primary-root";
 
 
 /**
@@ -502,9 +627,10 @@ export function buildMultiProjectApp(multi: MultiProjectDeps) {
       );
     }
 
-    // Two SILENT fall-throughs remain below. Neither can be closed unilaterally
-    // (see the notes), so at minimum they must stop being invisible — the
-    // logger dedups identical lines, so a chatty client cannot flood the log.
+    // ONE silent fall-through remains below (an unknown selector on a READ,
+    // which is deliberate). The un-addressed MUTATION case underneath it is no
+    // longer a fall-through — it is refused. The logger dedups identical lines,
+    // so a chatty client cannot flood the log either way.
     if (alias && !selected) {
       // A READ with an unknown selector answers from the PRIMARY project's
       // index — a DIFFERENT repo. Kept (a viewer holding a stale alias degrades
@@ -515,19 +641,75 @@ export function buildMultiProjectApp(multi: MultiProjectDeps) {
         method: request.method,
         path: pathname,
       });
-    } else if (!alias && MUTATING_METHODS.has(request.method) && multi.projects.size > 1) {
-      // A MUTATION with no selector writes into whichever project happens to be
-      // primary. Refusing it outright is the real fix, but `cli/_shared.ts`
-      // deliberately omits the header when the daemon's primary IS this project
-      // (`projectHeader()` returns {} in that case), so refusing here would
-      // break every correct CLI mutation from the primary repo. Making the
-      // client always send its alias is a cross-lane change; until then, log it.
-      multi.logger.warn("request: un-addressed MUTATION routed to the primary project", {
-        primary: multi.primary,
-        projectsServed: multi.projects.size,
-        method: request.method,
-        path: pathname,
-      });
+    } else if (
+      !alias &&
+      MUTATING_METHODS.has(request.method) &&
+      multi.projects.size > 1 &&
+      !isDaemonLevelMutation(request.method, pathname)
+    ) {
+      // A MUTATION with no selector used to fall through to whichever project
+      // happened to be primary — writing into a DIFFERENT repo's CRDT op-log
+      // with no error anywhere. It is now REFUSED, with two escape hatches that
+      // between them cover every correct client:
+      //
+      //   1. `x-hayven-project: <alias>` — what `cli/_shared.ts` already sends
+      //      whenever `/api/health` listed this repo in `projects`, which a
+      //      multi-project daemon always does (including for its own primary).
+      //      That is the normal path and is unaffected by this refusal.
+      //   2. `x-hayven-primary-root: <abs root>` — for the one case where the
+      //      client legitimately has no alias: `/api/health` answered with a
+      //      bare `root` and no `projects` list, so the client verified identity
+      //      against the PRIMARY. We re-check the claim here rather than trust
+      //      it, so a client holding a stale idea of the primary is refused
+      //      instead of silently writing to the wrong repo.
+      //
+      // Daemon-level mutations (add/remove a project) are exempt — their target
+      // is in the request itself, not in the selector.
+      if (hasNoSelectorCapableClient(pathname)) {
+        // Cannot be refused (see `hasNoSelectorCapableClient`) — but it must not
+        // be invisible either: this IS a write landing in a possibly-wrong
+        // project's op-log.
+        multi.logger.warn(
+          "request: un-addressed MUTATION routed to the primary project (no selector-capable client for this route)",
+          {
+            primary: multi.primary,
+            projectsServed: multi.projects.size,
+            method: request.method,
+            path: pathname,
+          },
+        );
+        projectContext.enterWith(primaryDeps);
+        return undefined;
+      }
+      const claimedRoot = request.headers.get(PRIMARY_ROOT_HEADER);
+      const primaryRoot = primaryDeps.paths.repoRoot;
+      // Length-capped before `canonicalRoot`, which does a `realpathSync`: this
+      // is the one place a raw header value reaches the filesystem, and PATH_MAX
+      // is 4096 on Linux / 1024 on macOS, so anything longer cannot name a real
+      // directory and is not worth a syscall.
+      const claimOk =
+        claimedRoot !== null &&
+        claimedRoot.length > 0 &&
+        claimedRoot.length <= 4096 &&
+        canonicalRoot(claimedRoot) === canonicalRoot(primaryRoot);
+      if (!claimOk) {
+        multi.logger.warn("request: REFUSED un-addressed MUTATION", {
+          primary: multi.primary,
+          projectsServed: multi.projects.size,
+          method: request.method,
+          path: pathname,
+          claimedRoot: claimedRoot ?? "(none)",
+        });
+        return new Response(
+          JSON.stringify({
+            error:
+              `this daemon serves ${multi.projects.size} projects, so a mutating request must say ` +
+              "which one: add `?project=<alias>` (or the `x-hayven-project` header). " +
+              "Run `hayven daemon projects` to list the aliases.",
+          }),
+          { status: 400, headers: { "content-type": "application/json" } },
+        );
+      }
     }
 
     projectContext.enterWith(selected ?? primaryDeps);

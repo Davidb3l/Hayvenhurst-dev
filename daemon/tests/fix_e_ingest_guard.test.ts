@@ -249,6 +249,10 @@ describe("E1: consecutive-failure circuit breaker", () => {
         batchesEmitted: 2,
         overflowsSeen: 7,
         lastHeartbeatMs: 0,
+        lastRecordAtMs: Date.now(),
+        alive: true,
+        lastExitCode: null,
+        heartbeatStalls: 0,
         pendingEvents: 4453, // the incident's real batch size
         batchInFlight: true,
         overflowInFlight: false,

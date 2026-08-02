@@ -6,6 +6,12 @@
 // round-trip per divergent segment plus the initial root + leaves exchange.
 import { computeMerkle, diffSnapshots, type MerkleSnapshot } from "../crdt/merkle.ts";
 import { OpLog, splitSegmentBatches, type CrdtType } from "../crdt/oplog.ts";
+import {
+  CLI_PROBE_TIMEOUT_MS,
+  CLI_REQUEST_TIMEOUT_MS,
+  fetchWithTimeout,
+  isTimeoutError,
+} from "./_fetch.ts";
 import { assertDaemonServesProject, projectHeader, reportIdentity, requireProject } from "./_shared.ts";
 import type { ParsedArgs } from "../cli.ts";
 
@@ -113,9 +119,18 @@ export async function runSync(args: ParsedArgs): Promise<number> {
     // mutating commands do instead of letting it bubble as an unhandled
     // rejection. HTTP-status errors carry their own message and re-throw.
     if (err instanceof UnreachableDaemonError) {
+      // A TIMEOUT is a different failure from "nothing is listening", and the
+      // old blanket "start it" advice was actively harmful for it: the daemon
+      // IS up, it just isn't answering, and starting another is how the
+      // incident collected five stacked processes.
       process.stderr.write(
-        `error: could not reach daemon at ${err.base} (${err.reason.message}).\n` +
-          "Start it with `hayven daemon start`.\n",
+        err.timedOut
+          ? `error: daemon at ${err.base} did not answer within ${CLI_REQUEST_TIMEOUT_MS} ms ` +
+            `(${err.reason.message}).\n` +
+            "It is RUNNING but not responding — busy with a long ingest, or wedged.\n" +
+            "Do NOT start a second one; check `hayven daemon status` and `hayven daemon logs`.\n"
+          : `error: could not reach daemon at ${err.base} (${err.reason.message}).\n` +
+            "Start it with `hayven daemon start`.\n",
       );
       return 1;
     }
@@ -188,7 +203,15 @@ export async function resolvePeerProject(
 
   let health: { root?: unknown; projects?: unknown };
   try {
-    const res = await fetch(`${peerUrl}/api/health`);
+    // BOUNDED (T1). Un-bounded this probe inherited Bun's 5-minute idle
+    // default, so `hayven sync` against a peer that accepts and then hangs sat
+    // silent for 300 s before it had exchanged a single Merkle root. One signal
+    // covers the body read too — otherwise `res.json()` becomes the new hang.
+    const res = await fetchWithTimeout(
+      `${peerUrl}/api/health`,
+      undefined,
+      CLI_PROBE_TIMEOUT_MS,
+    );
     if (!res.ok) {
       // Reachable but unhealthy — let the real requests surface the failure.
       return probeFailed(`health returned ${res.status}`);
@@ -285,22 +308,49 @@ function basenameOf(p: string): string {
 }
 
 /** Thrown when a `fetch` to a daemon (local or peer) fails at the transport
- *  layer — connection refused, DNS, reset — as opposed to an HTTP error status. */
+ *  layer — connection refused, DNS, reset, or OUR OWN deadline — as opposed to
+ *  an HTTP error status. `timedOut` separates "nothing is listening" from "it
+ *  answered the SYN and then went quiet", which need opposite advice. */
 class UnreachableDaemonError extends Error {
+  readonly timedOut: boolean;
   constructor(readonly base: string, readonly reason: Error) {
     super(`could not reach daemon at ${base}: ${reason.message}`);
     this.name = "UnreachableDaemonError";
+    this.timedOut = isTimeoutError(reason);
   }
 }
 
-/** Run a `fetch`, re-tagging a transport-layer failure with the base URL so the
- *  top-level handler can print the consistent unreachable-daemon message. */
+/**
+ * Run a `fetch`, re-tagging a transport-layer failure with the base URL so the
+ * top-level handler can print the consistent unreachable-daemon message.
+ *
+ * BOUNDED (T1). This is the single cheapest place to bound the sync path: every
+ * merkle/leaves/batch/push call funnels through here, and each one used to
+ * inherit Bun's 5-minute idle default. A peer (or our own local daemon) that
+ * accepts and stalls therefore froze `hayven sync` for 300 s PER REQUEST, and a
+ * sync that touches twenty segments could sit there for an hour looking alive.
+ */
 async function reachableFetch(url: string, init?: RequestInit): Promise<Response> {
   const base = new URL(url).origin;
   try {
-    return await fetch(url, init);
+    return await fetchWithTimeout(url, init, CLI_REQUEST_TIMEOUT_MS);
   } catch (err) {
     throw new UnreachableDaemonError(base, err as Error);
+  }
+}
+
+/**
+ * Read a response body under the SAME deadline the request was issued with
+ * (the signal from {@link reachableFetch} is still armed), tagging a stall the
+ * same way a connect failure is tagged. Without this the bound would be a
+ * half-bound: headers arrive, `res.json()` hangs, and the deadline fires as an
+ * untagged `TimeoutError` that escapes `runSync`'s handler as a raw stack.
+ */
+async function readBody<T>(url: string, read: () => Promise<T>): Promise<T> {
+  try {
+    return await read();
+  } catch (err) {
+    throw new UnreachableDaemonError(new URL(url).origin, err as Error);
   }
 }
 
@@ -433,7 +483,7 @@ async function fetchJson<T>(url: string, headers: Record<string, string> = {}): 
     const text = await res.text().catch(() => "");
     throw new Error(`GET ${url} → ${res.status}${text ? `: ${text}` : ""}`);
   }
-  return (await res.json()) as T;
+  return await readBody(url, () => res.json() as Promise<T>);
 }
 
 async function postJson<T>(
@@ -447,10 +497,10 @@ async function postJson<T>(
     body: JSON.stringify(body),
   });
   if (!res.ok) {
-    const text = await res.text();
+    const text = await readBody(url, () => res.text());
     throw new Error(`POST ${url} → ${res.status}: ${text}`);
   }
-  return (await res.json()) as T;
+  return await readBody(url, () => res.json() as Promise<T>);
 }
 
 async function pullSegment(
@@ -470,7 +520,8 @@ async function pullSegment(
       body: JSON.stringify({ type, path, offset }),
     });
     if (!res.ok) throw new Error(`POST /api/sync/batch → ${res.status}`);
-    const buf = new Uint8Array(await res.arrayBuffer());
+    const url = `${peerUrl}/api/sync/batch`;
+    const buf = new Uint8Array(await readBody(url, () => res.arrayBuffer()));
     chunks.push(buf);
     if (res.headers.get("x-segment-eof") === "1") break;
     offset += buf.length;

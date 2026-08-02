@@ -15,7 +15,16 @@
  *     was the SAME handful of `native parse warning` lines for vendored files
  *     that will never parse cleanly, so this is worth more than rotation alone.
  */
-import { appendFileSync, existsSync, mkdirSync, renameSync, rmSync, statSync } from "node:fs";
+import {
+  appendFileSync,
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  renameSync,
+  rmSync,
+  statSync,
+} from "node:fs";
 import { join } from "node:path";
 
 import { globalLogsDir } from "./paths.ts";
@@ -153,9 +162,26 @@ export function rotateLogFile(
   maxBytes: number = LOG_MAX_BYTES,
   keep: number = LOG_KEEP_FILES,
 ): boolean {
+  let lock: number | null = null;
   try {
     if (!existsSync(filePath)) return false;
     if (statSync(filePath).size < maxBytes) return false;
+    // CROSS-PROCESS EXCLUSION. Several hayven processes share `~/.hayven/logs`
+    // (the daemon, every CLI invocation, each hook-driven autostart), so two of
+    // them can pass the size check on the SAME file at the same time and
+    // interleave their `.N → .N+1` shifts: process A renames `x.log` → `x.log.1`
+    // and starts writing a fresh `x.log`; process B, still mid-sequence, renames
+    // that brand-new `x.log.1` to `x.log.2` and then renames A's fresh `x.log`
+    // on top of `.1` — one generation is silently destroyed and a live log is
+    // moved out from under its writer. `wx` is an atomic O_CREAT|O_EXCL, so
+    // exactly one process wins; the loser skips this round and rotates on its
+    // next check.
+    lock = acquireRotateLock(filePath);
+    if (lock === null) return false;
+    // Re-check under the lock: the winner of a concurrent race may have already
+    // rotated this file between our size check and our lock acquisition, and
+    // rotating again would discard a generation for nothing.
+    if (!existsSync(filePath) || statSync(filePath).size < maxBytes) return false;
     // Drop the generation that is about to fall off the end, then shift the
     // rest up. Descending order so nothing is overwritten before it moves.
     rmSync(`${filePath}.${keep}`, { force: true });
@@ -168,6 +194,72 @@ export function rotateLogFile(
   } catch {
     // Rotation is hygiene, never a reason to fail a write or a start.
     return false;
+  } finally {
+    if (lock !== null) releaseRotateLock(filePath, lock);
+  }
+}
+
+/** A rotate lock older than this is presumed abandoned (the holder was killed
+ *  mid-rotation) and is stolen. Rotation is a handful of renames, so a live
+ *  holder never comes close to this. */
+const ROTATE_LOCK_STALE_MS = 30_000;
+
+/**
+ * Take the exclusive rotate lock for `filePath`, or return `null` if another
+ * process holds it. Returns the open fd on success (the caller must release).
+ */
+function acquireRotateLock(filePath: string): number | null {
+  const lockPath = `${filePath}.rotating`;
+  try {
+    return openSync(lockPath, "wx");
+  } catch {
+    // Held — unless the holder died mid-rotation and left it behind forever, in
+    // which case nothing would ever rotate this file again (an unbounded log,
+    // which is the bug this module exists to prevent).
+    try {
+      if (Date.now() - statSync(lockPath).mtimeMs <= ROTATE_LOCK_STALE_MS) return null;
+    } catch {
+      return null; // vanished under us — someone else is active; skip this round
+    }
+    // ATOMIC STEAL. `rmSync` + `openSync("wx")` is NOT one: two processes that
+    // both see the same stale lock both unlink and both create, so A's create
+    // succeeds, B's unlink then deletes A's brand-new lock, B's create succeeds
+    // too — and both run the `.N → .N+1` shift concurrently, which is exactly
+    // the interleaving the lock exists to prevent. `renameSync` to a
+    // pid-private name is atomic: only ONE process can rename a given path, and
+    // the loser's rename throws (the source no longer exists) instead of
+    // silently proceeding.
+    const claim = `${lockPath}.steal.${process.pid}`;
+    // Clear our OWN leftover first. If a previous run of this pid died between
+    // the rename and the unlink below, the scratch file survives, and nothing
+    // else ever reaps `*.steal.*` — in the one directory this module exists to
+    // keep bounded. Per-pid naming makes this a complete reap for us.
+    rmSync(claim, { force: true });
+    try {
+      renameSync(lockPath, claim);
+    } catch {
+      return null; // another process won the steal
+    }
+    rmSync(claim, { force: true });
+    try {
+      return openSync(lockPath, "wx");
+    } catch {
+      // The winner of the steal race re-created it first.
+      return null;
+    }
+  }
+}
+
+function releaseRotateLock(filePath: string, fd: number): void {
+  try {
+    closeSync(fd);
+  } catch {
+    /* already closed */
+  }
+  try {
+    rmSync(`${filePath}.rotating`, { force: true });
+  } catch {
+    /* already gone */
   }
 }
 

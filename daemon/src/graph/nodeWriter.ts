@@ -21,7 +21,7 @@
  */
 import { mkdirSync, readdirSync, readFileSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, sep } from "node:path";
 
 import type { GraphEdge, GraphNode } from "./types.ts";
 import { nodeMarkdownPath } from "./idScheme.ts";
@@ -229,12 +229,21 @@ export async function writeNodeMarkdowns(
  * touches SQLite only, so every renamed, moved or deleted symbol left a
  * permanent orphan `.md` on disk and `.hayven/nodes/` grew monotonically
  * forever. Pair this with `Db.nodeIdsForFile(file)` captured BEFORE the delete.
+ *
+ * CONTAINMENT: an id whose derived path lands OUTSIDE `nodesDir` is skipped, not
+ * unlinked. Ids are path-derived and `nodeMarkdownPath`'s sanitizer preserves
+ * `.`, so `..` survives as a path segment and `join` resolves it outward — this
+ * function would otherwise delete a `.md` file (and then, via
+ * {@link pruneEmptyDirs}, its directory) belonging to something else entirely.
+ * We only ever reclaim inside the directory we own.
  */
 export function removeNodeMarkdowns(nodesDir: string, ids: Iterable<string>): number {
   let removed = 0;
   const dirs = new Set<string>();
+  const boundary = nodesDir.endsWith(sep) ? nodesDir : nodesDir + sep;
   for (const id of ids) {
     const path = nodeFilePath(nodesDir, id);
+    if (!path.startsWith(boundary)) continue; // escapes nodesDir — never ours to delete
     try {
       unlinkSync(path);
       removed++;
@@ -350,11 +359,21 @@ function isOwnNodeMarkdown(nodesDir: string, path: string): boolean {
  * Remove now-empty directories, walking upward from each of `dirs` but NEVER
  * past (or including) `root`. `rmdirSync` fails on a non-empty dir, which is
  * exactly the stop condition we want, so a failure just ends that branch.
+ *
+ * CONTAINMENT: the guard is `root + sep`, not a bare `startsWith(root)`. A bare
+ * prefix match treats `/…/nodesX` as being "inside" `/…/nodes`, so a directory
+ * that merely SHARES A NAME PREFIX with the root would be rmdir'd — the same
+ * unguarded-prefix shape that let `/foo` match `/foobar` in a separate bug this
+ * round. It is reachable here: node ids are path-derived and `nodeMarkdownPath`
+ * preserves `.`, so an id like `../nodesX/thing` resolves to a SIBLING of
+ * `nodesDir` whose path passes a bare prefix test. Deleting a directory outside
+ * the directory we own is never acceptable, whatever produced the id.
  */
 function pruneEmptyDirs(dirs: Set<string>, root: string): void {
+  const boundary = root.endsWith(sep) ? root : root + sep;
   for (const start of dirs) {
     let dir = start;
-    while (dir.length > root.length && dir.startsWith(root)) {
+    while (dir.length > root.length && dir.startsWith(boundary)) {
       try {
         rmdirSync(dir); // throws ENOTEMPTY when it still holds entries
       } catch {

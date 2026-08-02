@@ -375,9 +375,10 @@ export const MAX_PACK_FILE_BYTES = 8 * 1024 * 1024;
  * so did `.git/config` (which carries an embedded token whenever a remote URL
  * has credentials in it) and `id_rsa`.
  *
- * This is a DENYLIST of well-known credential shapes. It is NOT a general
- * secret detector and it is NOT a `.gitignore` implementation — see
- * {@link resolveWithinRepo}'s note on what is and is not guaranteed.
+ * This is a DENYLIST of well-known credential SHAPES. It is deliberately kept
+ * as belt-and-braces UNDERNEATH the class rule in {@link isIndexerAdmissible},
+ * which is what actually bounds this surface: a denylist can only ever name the
+ * secrets someone thought of.
  */
 const DENIED_DIR_SEGMENTS = new Set([
   ".git",
@@ -386,6 +387,66 @@ const DENIED_DIR_SEGMENTS = new Set([
   ".gnupg",
   ".docker",
   ".hayven",
+]);
+
+/**
+ * Directory names the Rust walker ALWAYS prunes
+ * (`native/src/parse/walker.rs::ALWAYS_SKIP_DIRS`), mirrored here name-for-name.
+ *
+ * These are where gitignored content actually lives, and the prune is
+ * UNCONDITIONAL on the Rust side — no walk option turns it back on — so nothing
+ * under them can ever be an indexed node, and mirroring it costs no legitimate
+ * read. The walker's CONDITIONAL prunes (`VENDORED_DIRS`, `FIXTURE_LIKE_DIRS`,
+ * fixture ancestors) are deliberately NOT mirrored: `--include-vendored` /
+ * `--include-fixtures` make those files real indexed nodes, and refusing to pack
+ * a node the index contains would break the packer for no security gain.
+ */
+const ALWAYS_SKIP_DIR_SEGMENTS = new Set([
+  "node_modules",
+  "target",
+  "dist",
+  "build",
+  ".venv",
+  "venv",
+  "__pycache__",
+  ".next",
+  ".turbo",
+  ".cache",
+]);
+
+/**
+ * File extensions the indexer can actually PARSE, mirroring
+ * `native/src/parse/language.rs::Language::from_extension` EXACTLY — the same
+ * kind of mirror as {@link MAX_PACK_FILE_BYTES} against the walker's
+ * `max_file_size`.
+ *
+ * THIS IS THE CLASS FIX. The denylist above enumerates credential SHAPES, so a
+ * gitignored file with a name nobody enumerated — a stray `dump.sql`, a
+ * `backup.json`, a `secrets.yaml.bak`, a `db.sqlite` — was still readable if the
+ * caller named it exactly, which made the packer strictly MORE permissive than
+ * the indexer on the one path that feeds a model prompt. The indexer would never
+ * open any of those files, because it only opens files of a language it parses.
+ * Requiring the same here closes the whole "data file named anything" class in
+ * one predicate instead of chasing names, AND keeps the legitimate case the
+ * denylist was shaped around: a brand-new, not-yet-indexed `src/foo.ts` still
+ * packs, because the gate is about what the indexer WOULD admit, not about what
+ * it has already seen.
+ *
+ * Kept lowercase; the caller lowercases the basename before testing.
+ */
+const SOURCE_EXTENSIONS = new Set([
+  "py",
+  "ts",
+  "cts",
+  "mts",
+  "tsx",
+  "js",
+  "mjs",
+  "cjs",
+  "jsx",
+  "rs",
+  "go",
+  "astro",
 ]);
 
 /** Exact basenames that are credential files by convention. */
@@ -418,6 +479,59 @@ const DENIED_EXTENSIONS = [
   ".gpg",
   ".ppk",
 ];
+
+/**
+ * Would the INDEXER have opened this repo-relative path? The class rule that
+ * replaces "hope the denylist named it".
+ *
+ * The Rust walker admits a file only when ALL of these hold, and this mirrors
+ * the three that are purely path-shaped (size and file-type are enforced
+ * separately by {@link isPackableFile}):
+ *
+ *   1. NOT HIDDEN — `WalkBuilder::hidden(true)` prunes every dot-prefixed
+ *      component. This alone is the reason `.env`, `.envrc`, `.npmrc`,
+ *      `.netrc`, `.git/`, `.ssh/`, `.aws/` are not in the graph, and it covers
+ *      the dotfiles nobody has enumerated yet.
+ *   2. NOT under an ALWAYS-pruned build/VCS/cache directory
+ *      ({@link ALWAYS_SKIP_DIR_SEGMENTS}) — where gitignored output lives.
+ *   3. A PARSEABLE LANGUAGE ({@link SOURCE_EXTENSIONS}) — the indexer opens no
+ *      other file, so neither will we.
+ *
+ * WHY NOT A REAL `.gitignore` MATCH: the honest residual is a gitignored file
+ * that is non-hidden, outside every always-pruned directory, AND carries a
+ * source extension (e.g. a generated `src/gen/keys.ts` listed in `.gitignore`).
+ * Closing THAT needs real gitignore semantics — negations, `**`, directory-only
+ * rules, nested `.gitignore`s, `.git/info/exclude`, `core.excludesFile` — which
+ * is a spec, not a regex, and hand-rolling it half-right buys false confidence.
+ * The correct closure is a native-side call (see the module note in the lane
+ * report); this predicate is the part that can be made exactly right today, and
+ * it removes the entire class of NON-source files that the denylist could only
+ * ever chase by name.
+ */
+function isIndexerAdmissible(rel: string): boolean {
+  const parts = rel.split(/[\\/]+/).filter((p) => p.length > 0);
+  if (parts.length === 0) return false;
+  for (const part of parts) {
+    // (1) hidden — the walker's `hidden(true)`. `.` / `..` cannot appear here
+    //     (the path is already resolved), so a leading dot means dotfile.
+    if (part.startsWith(".")) return false;
+    // (2) always-pruned build/cache/VCS directory, at any depth. CASE-SENSITIVE
+    //     on purpose: `walker.rs::is_skipped_dir` is `ALWAYS_SKIP_DIRS
+    //     .contains(&name)` with no case folding, so a repo with a real `Build/`
+    //     or `Dist/` source tree IS indexed — and lowercasing here would refuse
+    //     to pack nodes the index actually contains, which is the one thing this
+    //     mirror must never do. (The credential DENYLIST below stays
+    //     case-insensitive: over-refusing is the safe direction there, and it is
+    //     not mirroring anything.)
+    if (ALWAYS_SKIP_DIR_SEGMENTS.has(part)) return false;
+  }
+  // (3) parseable language. A basename with no dot has no extension and is
+  //     refused, exactly as `Language::from_extension` refuses it.
+  const base = (parts[parts.length - 1] ?? "").toLowerCase();
+  const dot = base.lastIndexOf(".");
+  if (dot <= 0) return false; // no extension, or a leading dot (already refused)
+  return SOURCE_EXTENSIONS.has(base.slice(dot + 1));
+}
 
 /** Is this repo-relative path one we refuse to read regardless of containment? */
 function isDeniedRepoPath(rel: string): boolean {
@@ -461,19 +575,49 @@ function isDeniedRepoPath(rel: string): boolean {
  *      the read fails on its own.
  *   2. DENYLIST. Containment alone permits `.env`, `.git/config` and `id_rsa`,
  *      all of which are INSIDE the repo — see {@link isDeniedRepoPath}.
- *   3. FILE TYPE + SIZE. See {@link statPackable}: a FIFO inside the repo made
+ *   3. FILE TYPE + SIZE. See {@link isPackableFile}: a FIFO inside the repo made
  *      `readFileSync` block forever, synchronously and uninterruptibly, wedging
  *      the single-process stdio MCP server exactly as an unbounded region loop
  *      did. Directories, sockets and device nodes are refused for the same
  *      reason; oversized files for {@link MAX_PACK_FILE_BYTES}.
  *
- * WHAT THIS DOES NOT GUARANTEE. It is not a `.gitignore` implementation, so an
- * un-indexed, gitignored file whose name is not on the denylist (a stray
- * `dump.sql`, a vendored build artifact) is still readable if the caller names
- * it exactly. The guarantee is: nothing outside the repo, nothing of a
- * well-known credential shape, nothing that can block, and nothing unbounded.
+ *   4. INDEXER PARITY. See {@link isIndexerAdmissible}: hidden paths, always-
+ *      pruned build/cache directories, and any extension the indexer cannot
+ *      parse are refused, so this gate is never MORE permissive than the walker
+ *      that builds the graph. That is what retires the stray-`dump.sql` class
+ *      the denylist alone could not reach.
+ *
+ * WHAT THIS DOES NOT GUARANTEE. It is still not a `.gitignore` implementation.
+ * The residual is precisely: a gitignored file that is non-hidden, outside every
+ * always-pruned directory, and carries a source extension. The guarantee is:
+ * nothing outside the repo, nothing the indexer itself would not open, nothing
+ * of a well-known credential shape, nothing that can block, nothing unbounded.
  */
 export function resolveWithinRepo(repoRoot: string, file: string): string | null {
+  return resolveRepoPath(repoRoot, file)?.abs ?? null;
+}
+
+/** A client-named path that passed every gate: its CANONICAL absolute location
+ *  and the repo-relative spelling the index stores. */
+export interface ResolvedRepoPath {
+  /** Canonical (realpath'd where it exists) absolute path — safe to read. */
+  abs: string;
+  /** Canonical repo-relative path — the form `nodes.file` holds. */
+  rel: string;
+}
+
+/**
+ * The full result of {@link resolveWithinRepo}: both the canonical absolute path
+ * to read AND the canonical repo-relative path to look up in the graph.
+ *
+ * The proxy needs BOTH, and it used to compute them with its own private,
+ * lexical-only copy of this logic — which blessed an in-repo symlink pointing at
+ * an out-of-tree secret (that file was then `readFileSync`'d straight into a
+ * prompt bound for a third-party LLM API) and, in the mirror case, refused every
+ * rewrite when the repo root was spelled via a symlink. Exporting the pair is
+ * what removes the reason to keep a second implementation.
+ */
+export function resolveRepoPath(repoRoot: string, file: string): ResolvedRepoPath | null {
   // A NUL survives `resolve()` but makes every syscall throw. Refuse it here so
   // the gate never green-lights a path that cannot be read.
   if (file.length === 0 || file.includes("\0")) return null;
@@ -499,15 +643,21 @@ export function resolveWithinRepo(repoRoot: string, file: string): string | null
   const root = target.startsWith(rootReal) ? rootReal : rootAbs;
   const rel = target.slice(root.length).replace(/^[\\/]+/, "");
   if (isDeniedRepoPath(rel)) return null;
-  return target;
+  if (!isIndexerAdmissible(rel)) return null;
+  return { abs: target, rel: rel.split(sep).join("/") };
 }
 
 /**
  * `statSync` the path and say whether it is a REGULAR file within
  * {@link MAX_PACK_FILE_BYTES}. `statSync` follows symlinks (so a symlink to a
  * FIFO is caught) and — unlike `open`/`read` — never blocks on one.
+ *
+ * Exported so the guard can be pinned DIRECTLY. Driven only through the packer,
+ * the `isFile()` half is untestable: `readFileSync` on a directory throws
+ * `EISDIR` on its own, so deleting the check changed nothing observable and the
+ * test that "covered" it passed with the guard removed.
  */
-function statPackable(abs: string): boolean {
+export function isPackableFile(abs: string): boolean {
   try {
     const st = statSync(abs);
     return st.isFile() && st.size <= MAX_PACK_FILE_BYTES;
@@ -526,7 +676,7 @@ function makeFileReader(repoRoot: string) {
     if (cache.has(file)) return cache.get(file) ?? null;
     let lines: string[] | null = null;
     const abs = resolveWithinRepo(repoRoot, file);
-    if (abs !== null && statPackable(abs)) {
+    if (abs !== null && isPackableFile(abs)) {
       try {
         lines = readFileSync(abs, "utf8").split("\n");
       } catch {

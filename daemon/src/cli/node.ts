@@ -13,6 +13,11 @@
  */
 import { readFileSync } from "node:fs";
 
+import {
+  CLI_REQUEST_TIMEOUT_MS,
+  describeDaemonFetchFailure,
+  fetchWithTimeout,
+} from "./_fetch.ts";
 import { assertDaemonServesProject, isJson, projectHeader, reportIdentity, requireProject } from "./_shared.ts";
 import type { ParsedArgs } from "../cli.ts";
 
@@ -62,15 +67,22 @@ export async function runNode(args: ParsedArgs): Promise<number> {
 
   let res: Response;
   try {
-    res = await fetch(`${base}/api/nodes/${encodeURIComponent(id)}/body`, {
-      method: "PUT",
-      headers: { "content-type": "application/json", ...projectHeader(identity) },
-      body: JSON.stringify({ body }),
-    });
+    // BOUNDED (T1). This is a WRITE through the daemon's LWW op-log path; with
+    // no signal it inherited Bun's 5-minute idle default, so a wedged daemon
+    // turned `hayven node body` into a silent 300 s stall with no indication of
+    // whether the write had landed.
+    res = await fetchWithTimeout(
+      `${base}/api/nodes/${encodeURIComponent(id)}/body`,
+      {
+        method: "PUT",
+        headers: { "content-type": "application/json", ...projectHeader(identity) },
+        body: JSON.stringify({ body }),
+      },
+      CLI_REQUEST_TIMEOUT_MS,
+    );
   } catch (err) {
     process.stderr.write(
-      `error: could not reach daemon at ${base} (${(err as Error).message}).\n` +
-        "Start it with `hayven daemon start`.\n",
+      `error: ${describeDaemonFetchFailure(base, err, CLI_REQUEST_TIMEOUT_MS)}`,
     );
     return 1;
   }

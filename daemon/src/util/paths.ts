@@ -4,9 +4,9 @@
  * Centralizes repo-root detection (walk up looking for `.git/` then `.hayven/`)
  * and the canonical sub-paths inside `.hayven/`.
  */
-import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 /**
  * Canonical, symlink-resolved absolute path — the identity key for a served
@@ -87,6 +87,16 @@ export function findUp(
 ): string | null {
   let dir = resolve(start);
   const stopAt = opts.stopAt !== undefined ? resolve(opts.stopAt) : null;
+  // The boundary may be spelled differently from the path we are walking:
+  // `homedir()` returns the passwd string with symlinks INTACT, while a walk
+  // that started at `process.cwd()` is already physical. On a host where `$HOME`
+  // has a symlinked component (`/home/x` → `/mnt/…`, an autofs/NFS home, a
+  // relocated macOS home) a raw `dir === stopAt` never fires, the walk sails
+  // straight past home, and BL-15's "never pick a marker above the user's tree"
+  // guarantee is silently off. Resolved ONCE, and only kept when it actually
+  // differs, so the overwhelmingly common unsymlinked case costs nothing.
+  const stopAtCanon = stopAt !== null ? canonicalRoot(stopAt) : null;
+  const needCanonCheck = stopAtCanon !== null && stopAtCanon !== stopAt;
   // Loop terminates at filesystem root (parent === dir) or the stop boundary.
   while (true) {
     const candidate = join(dir, marker);
@@ -95,7 +105,7 @@ export function findUp(
     }
     // BL-15: do not ascend above the boundary (but DO check the boundary
     // itself, above, before bailing out here).
-    if (stopAt !== null && dir === stopAt) {
+    if (stopAt !== null && (dir === stopAt || (needCanonCheck && canonicalRoot(dir) === stopAtCanon))) {
       return null;
     }
     const parent = dirname(dir);
@@ -154,15 +164,30 @@ export function detectRepoRoot(
   const homes = (opts.homeDir !== undefined ? [opts.homeDir] : [homedir(), hayvenHomeDir()]).map((h) =>
     resolve(h),
   );
-  const isHome = (p: string): boolean => homes.includes(resolve(p));
+  // Compare home in BOTH spellings, exactly as `assertRegistrableRoot` does and
+  // for exactly the same reason: `homedir()` keeps symlinks, every path derived
+  // from `process.cwd()` is physical, and a raw `===` between the two lets the
+  // ORIGINAL whole-home-tree bug through on any host with a symlinked home. The
+  // canonical arm is only computed where it differs, so the normal case is free.
+  const homesCanon = homes.map((h) => canonicalRoot(h));
+  const isHome = (p: string): boolean => {
+    const abs = resolve(p);
+    if (homes.includes(abs)) return true;
+    return homesCanon.some((h, i) => h !== homes[i]) && homesCanon.includes(canonicalRoot(abs));
+  };
   // BL-15: bound BOTH marker walks at `$HOME`, but only when the start dir is
   // at/below home. A start ABOVE home (e.g. a system path outside the user's
   // tree) keeps an unbounded walk so out-of-home repos resolve normally. With
   // two candidate homes, bound at the DEEPEST one that contains the start, so
   // the tighter boundary wins.
   const startResolved = resolve(start);
+  const startCanon = canonicalRoot(startResolved);
+  const under = (dir: string, base: string): boolean => dir === base || dir.startsWith(base + sep);
   const containing = homes
-    .filter((h) => startResolved === h || startResolved.startsWith(h + sep))
+    // The containment test needs the same two-spelling treatment: a physical
+    // cwd under a symlink-spelled home is NOT a string prefix of it, so without
+    // this the boundary is simply never installed on those hosts.
+    .filter((h, i) => under(startResolved, h) || under(startCanon, homesCanon[i] as string))
     .sort((a, b) => b.length - a.length);
   const stopAt = containing.length > 0 ? { stopAt: containing[0] as string } : {};
 
@@ -382,11 +407,7 @@ export function isDirectory(path: string): boolean {
 
 /**
  * Directory names the pre-flight count skips, mirroring `ALWAYS_SKIP_DIRS` +
- * `VENDORED_DIRS` in `native/src/parse/walker.rs`. This is a pre-flight
- * ESTIMATE, not a second implementation of the walker: it does not read
- * `.gitignore`, so it can only ever over-count relative to what the native
- * walker would parse. Over-counting is the safe direction for a ceiling whose
- * job is to catch "this root is not a project at all".
+ * `VENDORED_DIRS` in `native/src/parse/walker.rs`.
  */
 const PREFLIGHT_SKIP_DIRS: ReadonlySet<string> = new Set([
   "node_modules",
@@ -406,6 +427,280 @@ const PREFLIGHT_SKIP_DIRS: ReadonlySet<string> = new Set([
   "third_party",
 ]);
 
+/**
+ * `FIXTURE_LIKE_DIRS` from `native/src/parse/walker.rs` — pruned by default
+ * (`include_fixtures: false`), so the pre-flight count must prune them too or
+ * it counts files the ingest would never parse.
+ */
+const PREFLIGHT_FIXTURE_DIRS: ReadonlySet<string> = new Set(["examples", "benchmark", "benchmarks"]);
+
+/** `FIXTURE_ANCESTOR_DIRS` from the walker: under one of these, `fixtures/` is pruned. */
+const PREFLIGHT_FIXTURE_ANCESTORS: ReadonlySet<string> = new Set(["test", "tests", "e2e", "__tests__"]);
+
+/**
+ * Extensions the native parser can actually turn into graph nodes — the exact
+ * arm list of `Language::from_extension` in `native/src/parse/language.rs`.
+ *
+ * WHY THIS EXISTS AS A FILTER, not a comment: the pre-flight count used to
+ * count EVERY non-hidden file of ANY extension, while the ingest cap
+ * (`DEFAULT_MAX_INGEST_FILES` in `graph/ingest.ts`) counts the native walker's
+ * `files_total` — language-mapped AND post-`.gitignore`. Measured on one tree,
+ * the two numbers were 401 and 1. Two ceilings expressed in units that differ
+ * by two orders of magnitude are not two ceilings; the init one just refuses
+ * repos with a large ignored `coverage/`, `out/`, `.output/` or `data/` dir
+ * that the ingest would never have looked at.
+ *
+ * Keep in step with `language.rs`. A NEW language added there and missed here
+ * makes this UNDER-count, which is the direction that lets a huge tree through.
+ */
+export const INDEXABLE_EXTENSIONS: ReadonlySet<string> = new Set([
+  "py",
+  "ts",
+  "cts",
+  "mts",
+  "tsx",
+  "js",
+  "mjs",
+  "cjs",
+  "jsx",
+  "rs",
+  "go",
+  "astro",
+]);
+
+/** Lowercase extension without the dot, or "" when there is none. */
+function extensionOf(name: string): string {
+  const dot = name.lastIndexOf(".");
+  if (dot <= 0 || dot === name.length - 1) return "";
+  return name.slice(dot + 1).toLowerCase();
+}
+
+/* ------------------------------------------------------------------ *
+ * .gitignore matching for the pre-flight count
+ * ------------------------------------------------------------------ */
+
+/**
+ * One compiled ignore pattern. `re` is tested against the candidate's path
+ * RELATIVE to the directory whose ignore file declared it (POSIX separators).
+ */
+export interface IgnoreRule {
+  readonly re: RegExp;
+  /** `!pattern` — re-includes something an earlier rule excluded. */
+  readonly negated: boolean;
+  /** `pattern/` — matches directories only. */
+  readonly dirOnly: boolean;
+}
+
+/** The rules declared by one directory's ignore file(s), plus that directory. */
+interface IgnoreScope {
+  readonly base: string;
+  readonly rules: readonly IgnoreRule[];
+}
+
+/**
+ * Hard bounds on ignore parsing. The counter exists to BOUND work, so its own
+ * ignore handling must not become the unbounded thing: a hostile or generated
+ * `.gitignore` (a megabyte of patterns, one per built artifact) would otherwise
+ * cost a regex compile per pattern per directory.
+ */
+const MAX_IGNORE_BYTES = 256 * 1024;
+const MAX_IGNORE_RULES_PER_FILE = 2_000;
+
+/** Escape a literal character for inclusion in a RegExp source. */
+function escapeRe(c: string): string {
+  return /[\\^$.*+?()[\]{}|]/.test(c) ? `\\${c}` : c;
+}
+
+/**
+ * Strip trailing whitespace that git would ignore. A backslash-escaped trailing
+ * space is significant, so stop at one.
+ */
+function stripTrailingSpaces(line: string): string {
+  let end = line.length;
+  while (end > 0 && (line[end - 1] === " " || line[end - 1] === "\t")) {
+    // An odd number of preceding backslashes escapes this space — keep it.
+    let backslashes = 0;
+    while (end - 2 - backslashes >= 0 && line[end - 2 - backslashes] === "\\") backslashes++;
+    if (backslashes % 2 === 1) break;
+    end--;
+  }
+  return line.slice(0, end);
+}
+
+/**
+ * Compile one `.gitignore` line to a rule, or null for a blank/comment line.
+ *
+ * Implements the subset of gitignore syntax that appears in real repos:
+ * comments, negation, directory-only (`build/`), anchoring (a `/` anywhere but
+ * the end anchors to the declaring dir), `*`, `?`, `**`, character classes and
+ * backslash escapes. Anything it cannot express compiles to a rule that simply
+ * does not match, which OVER-counts — the direction that refuses too loudly
+ * rather than the one that lets a home dir through.
+ */
+export function compileIgnorePattern(raw: string): IgnoreRule | null {
+  let line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+  if (line.length === 0 || line.startsWith("#")) return null;
+  line = stripTrailingSpaces(line);
+  if (line.length === 0) return null;
+
+  let negated = false;
+  if (line.startsWith("!")) {
+    negated = true;
+    line = line.slice(1);
+  } else if (line.startsWith("\\!") || line.startsWith("\\#")) {
+    line = line.slice(1);
+  }
+  let dirOnly = false;
+  while (line.endsWith("/")) {
+    dirOnly = true;
+    line = line.slice(0, -1);
+  }
+  if (line.length === 0) return null;
+
+  // A `/` anywhere except the (already removed) trailing position anchors the
+  // pattern to the declaring directory; otherwise it matches by basename at any
+  // depth. This is the rule that makes `build/` prune every `build` dir but
+  // `src/build` prune only the one.
+  const anchored = line.includes("/");
+  if (line.startsWith("/")) line = line.slice(1);
+
+  let body = "";
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i] as string;
+    if (c === "\\") {
+      body += escapeRe(line[++i] ?? "\\");
+      continue;
+    }
+    if (c === "*") {
+      const doubled = line[i + 1] === "*";
+      if (doubled) {
+        const atStart = i === 0 || line[i - 1] === "/";
+        if (atStart && line[i + 2] === "/") {
+          body += "(?:[^/]+/)*"; // `**/` — zero or more directory levels
+          i += 2;
+          continue;
+        }
+        if (atStart && i + 2 === line.length) {
+          body += ".*"; // trailing `/**` — everything below
+          i += 1;
+          continue;
+        }
+        // `**` not used as a path component is just `*` to git.
+        body += "[^/]*";
+        i += 1;
+        continue;
+      }
+      body += "[^/]*";
+      continue;
+    }
+    if (c === "?") {
+      body += "[^/]";
+      continue;
+    }
+    if (c === "[") {
+      const close = findClassEnd(line, i);
+      if (close === -1) {
+        body += "\\[";
+        continue;
+      }
+      let cls = line.slice(i + 1, close);
+      if (cls.startsWith("!")) cls = `^${cls.slice(1)}`;
+      body += `[${cls}]`;
+      i = close;
+      continue;
+    }
+    body += escapeRe(c);
+  }
+
+  // The `(?:/.*)?` tail is how a matched DIRECTORY also covers its contents —
+  // git never re-includes a file whose parent dir is excluded, and the walk
+  // prunes such a dir on sight, so this only matters when a rule names a dir
+  // the walk reached by another route.
+  const prefix = anchored ? "^" : "^(?:.*/)?";
+  let re: RegExp;
+  try {
+    re = new RegExp(`${prefix}${body}(?:/.*)?$`);
+  } catch {
+    return null; // an unrepresentable class — over-count rather than throw
+  }
+  return { re, negated, dirOnly };
+}
+
+/** Index of the `]` closing a character class opened at `start`, or -1. */
+function findClassEnd(line: string, start: number): number {
+  let i = start + 1;
+  if (line[i] === "!") i++;
+  if (line[i] === "]") i++; // a leading `]` is literal
+  for (; i < line.length; i++) {
+    if (line[i] === "\\") {
+      i++;
+      continue;
+    }
+    if (line[i] === "]") return i;
+  }
+  return -1;
+}
+
+/** Parse one ignore FILE into rules. Returns [] for a missing/huge/unreadable file. */
+function readIgnoreFile(file: string): IgnoreRule[] {
+  let text: string;
+  try {
+    const st = statSync(file);
+    if (!st.isFile() || st.size > MAX_IGNORE_BYTES) return [];
+    text = readFileSync(file, "utf8");
+  } catch {
+    return [];
+  }
+  const rules: IgnoreRule[] = [];
+  for (const line of text.split("\n")) {
+    const rule = compileIgnorePattern(line);
+    if (rule !== null) rules.push(rule);
+    if (rules.length >= MAX_IGNORE_RULES_PER_FILE) break;
+  }
+  return rules;
+}
+
+/**
+ * The ignore scope contributed by `dir`, or null when it declares nothing.
+ *
+ * Reads `.gitignore` and `.ignore` (both honoured by the `ignore` crate the
+ * native walker wraps: `git_ignore(true)` + `ignore(true)`). NOT honoured, and
+ * deliberately so: the user's global core.excludesFile (`git_global(true)`)
+ * and ignore files in directories ABOVE the walk root (`parents(true)`).
+ * Reading either means shelling out to `git config` or walking out of the tree
+ * we were asked to size; both omissions only make this OVER-count, which
+ * refuses too loudly instead of waving a home directory through.
+ */
+function ignoreScopeFor(dir: string, isRoot: boolean): IgnoreScope | null {
+  const rules = [
+    ...readIgnoreFile(join(dir, ".gitignore")),
+    ...readIgnoreFile(join(dir, ".ignore")),
+    // `git_exclude(true)`: the repo-local, uncommitted exclude list.
+    ...(isRoot ? readIgnoreFile(join(dir, ".git", "info", "exclude")) : []),
+  ];
+  return rules.length > 0 ? { base: dir, rules } : null;
+}
+
+/**
+ * True when `abs` is ignored by `scopes` (outermost first).
+ *
+ * Last match wins, and a deeper ignore file overrides a shallower one — the
+ * scopes are already ordered outermost → innermost, so a single left-to-right
+ * pass with "last match wins" gives exactly git's precedence.
+ */
+function isIgnored(abs: string, isDir: boolean, scopes: readonly IgnoreScope[]): boolean {
+  let ignored = false;
+  for (const scope of scopes) {
+    const rel = relative(scope.base, abs).split(sep).join("/");
+    if (rel.length === 0 || rel.startsWith("../")) continue;
+    for (const rule of scope.rules) {
+      if (rule.dirOnly && !isDir) continue;
+      if (rule.re.test(rel)) ignored = !rule.negated;
+    }
+  }
+  return ignored;
+}
+
 export interface BoundedFileCount {
   /** Files seen. A LOWER BOUND when `exact` is false. */
   readonly count: number;
@@ -416,7 +711,7 @@ export interface BoundedFileCount {
 }
 
 /**
- * Count the files a first ingest would walk under `root`, with hard bounds.
+ * Count the files a first ingest would PARSE under `root`, with hard bounds.
  *
  * WHY THIS EXISTS: the home-directory incident (98% CPU for 6h, 195 GB read, a
  * 593 MB index) was NOT caused by home being special. It was caused by an
@@ -426,11 +721,22 @@ export interface BoundedFileCount {
  * that produced most of that 195 GB. So callers get a cheap number they can
  * refuse on BEFORE any of the expensive work starts.
  *
+ * COMPARABLE UNITS. This counts the same population the native walker feeds the
+ * parser, which is also the population `DEFAULT_MAX_INGEST_FILES` in
+ * `graph/ingest.ts` caps (`files_total` off the `start` record): the skip-list
+ * and fixture/vendored prunes, `.gitignore`/`.ignore`/`.git/info/exclude`, and
+ * only extensions `Language::from_extension` maps. It used to count EVERY
+ * non-hidden file of any extension and ignore `.gitignore` entirely — measured
+ * on one tree that was 401 against the ingest's 1, so the init ceiling could
+ * refuse a perfectly normal repo purely for having a large ignored `coverage/`
+ * or `out/` dir. See {@link INDEXABLE_EXTENSIONS}.
+ *
  * The counter is itself bounded, or it would just be the same unbounded walk
  * one step earlier: it stops at `scanCap` files or `budgetMs` of wall clock and
  * reports `exact: false`, so the caller can still say "more than N". It reads
- * directory entries only — never file contents — and never follows symlinks
- * (matching the native walker, and closing the directory-cycle hazard).
+ * directory entries and ignore files only — never source contents — and never
+ * follows symlinks (matching the native walker, and closing the
+ * directory-cycle hazard).
  */
 export function countIndexableFiles(
   root: string,
@@ -443,12 +749,20 @@ export function countIndexableFiles(
   const scanCap = opts.scanCap ?? Math.max(ceiling * 10, ceiling + 1);
   const budgetMs = opts.budgetMs ?? 10_000;
   const deadline = Date.now() + budgetMs;
-  const stack: string[] = [resolve(root)];
+  const start = resolve(root);
+  /**
+   * A pending directory plus the ignore scopes in force there. Scopes are
+   * ordered outermost → innermost and shared by reference between siblings, so
+   * a deep tree costs one array per directory, not one per file.
+   */
+  const stack: Array<{ dir: string; scopes: readonly IgnoreScope[] }> = [];
+  const rootScope = ignoreScopeFor(start, true);
+  stack.push({ dir: start, scopes: rootScope !== null ? [rootScope] : [] });
   let count = 0;
   let checked = 0;
 
   while (stack.length > 0) {
-    const dir = stack.pop() as string;
+    const { dir, scopes } = stack.pop() as { dir: string; scopes: readonly IgnoreScope[] };
     let entries;
     try {
       entries = readdirSync(dir, { withFileTypes: true });
@@ -463,13 +777,24 @@ export function countIndexableFiles(
       // a link — but stated explicitly so a later switch to `stat` cannot
       // quietly reintroduce the cycle.
       if (e.isSymbolicLink()) continue;
+      const abs = join(dir, e.name);
       if (e.isDirectory()) {
         if (e.name.startsWith(".") || PREFLIGHT_SKIP_DIRS.has(e.name)) continue;
-        stack.push(join(dir, e.name));
+        if (isPrunedFixtureDir(start, abs, e.name)) continue;
+        if (isIgnored(abs, true, scopes)) continue;
+        // A child's own ignore file is appended so it OVERRIDES its ancestors'
+        // (git: the deepest matching rule wins).
+        const own = ignoreScopeFor(abs, false);
+        stack.push({ dir: abs, scopes: own !== null ? [...scopes, own] : scopes });
         continue;
       }
       if (!e.isFile()) continue;
       if (e.name.startsWith(".")) continue; // the walker runs with hidden(true)
+      // Extension filter FIRST: it is a set lookup, while `isIgnored` runs a
+      // regex per rule per scope. On a repo with a large ignored build dir the
+      // order is worth several seconds of the scan budget.
+      if (!INDEXABLE_EXTENSIONS.has(extensionOf(e.name))) continue;
+      if (isIgnored(abs, false, scopes)) continue;
       count++;
       if (count >= scanCap) return { count, exceeded: count > ceiling, exact: false };
     }
@@ -480,4 +805,21 @@ export function countIndexableFiles(
     }
   }
   return { count, exceeded: count > ceiling, exact: true };
+}
+
+/**
+ * `is_fixture_dir` from `native/src/parse/walker.rs`: an `examples`/
+ * `benchmark(s)` dir at any depth, or a `fixtures` dir with a test-dir ancestor
+ * INSIDE the walk root. The ancestor check is deliberately repo-relative — a
+ * checkout that happens to live under a directory named `test` on the user's
+ * disk must keep its own `fixtures/` counted.
+ */
+function isPrunedFixtureDir(root: string, abs: string, name: string): boolean {
+  if (PREFLIGHT_FIXTURE_DIRS.has(name)) return true;
+  if (name !== "fixtures") return false;
+  const rel = relative(root, abs);
+  if (rel.length === 0 || rel.startsWith("..")) return false;
+  const parts = rel.split(sep);
+  // Exclude the dir's own name (the last part) from the ancestor scan.
+  return parts.slice(0, -1).some((p) => PREFLIGHT_FIXTURE_ANCESTORS.has(p));
 }

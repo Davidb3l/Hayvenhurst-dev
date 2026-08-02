@@ -23,6 +23,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  utimesSync,
   writeFileSync,
   writeSync,
 } from "node:fs";
@@ -124,6 +125,103 @@ const LOCK_ACQUIRE_BUDGET_MS = 6_000;
  */
 let lockDepth = 0;
 
+/**
+ * The token of the lock THIS process currently holds, or null when it holds
+ * none (not yet acquired, released, degraded-unlocked, or reclaimed out from
+ * under us). Read by {@link renewRegistryLock}.
+ */
+let heldToken: string | null = null;
+
+/**
+ * Set once this section's lease is known to be gone. SEPARATE from
+ * `heldToken === null`, which also means "we never had one" (the deliberate
+ * degraded-unlocked path). Conflating the two made the second renewal in
+ * `writeRegistryUnlocked` report SUCCESS right after the first one detected the
+ * loss and cleared the token — i.e. the detector disarmed itself and the
+ * clobbering rename went ahead exactly as before.
+ */
+let leaseLost = false;
+
+/**
+ * How many times a read → modify → write is re-run after losing its lease.
+ *
+ * Small on purpose. Each retry is a full re-read + re-write against a lock we
+ * just re-acquired, so if we lose the lease three times in a row the machine is
+ * pathologically contended and blocking `daemon start` forever is worse than
+ * one warned-about write. See {@link withRegistryLock}.
+ */
+const LOCK_LOST_RETRIES = 3;
+
+/**
+ * Thrown by {@link writeRegistryUnlocked} when our lease expired before the
+ * publish. Never escapes this module: {@link withRegistryLock} catches it and
+ * re-runs the whole critical section under a fresh lock.
+ */
+class RegistryLockLostError extends Error {
+  constructor() {
+    super("registry lock was reclaimed mid-section");
+    this.name = "RegistryLockLostError";
+  }
+}
+
+/**
+ * Extend our lease on the lockfile, and report whether we still hold it.
+ *
+ * WHY: `LOCK_STALE_MS` is 5s of WALL time and the holder never touched the file
+ * after creating it, so ANY critical section that outlived 5s of wall clock —
+ * a stalled NFS/SMB `statSync`, a laptop that slept mid-section, SIGSTOP, a
+ * contended nested acquire — was reclaimed underneath its live holder and two
+ * writers proceeded at once. `releaseRegistryLock`'s token check made the
+ * loser's UNLINK a no-op but did nothing about its WRITE, so the late finisher
+ * clobbered the winner's registry: a silently lost registration, which is the
+ * exact failure the lock was added to stop.
+ *
+ * The mechanics live in {@link refreshLockFile}. This wrapper adds the sticky
+ * `leaseLost` bit, which is NOT the same as `heldToken === null`: that also
+ * means "we never had a lock" (the deliberate degraded-unlocked path), so
+ * folding the two together made the second renewal in `writeRegistryUnlocked`
+ * report SUCCESS immediately after the first one detected the loss — the
+ * detector disarming itself, and the clobbering rename going ahead unchanged.
+ */
+function renewRegistryLock(): boolean {
+  if (leaseLost) return false; // sticky until the next acquire
+  if (heldToken === null) return true; // degraded/unlocked — nothing to renew
+  if (refreshLockFile(registryLockFile(), heldToken)) return true;
+  heldToken = null;
+  leaseLost = true;
+  return false;
+}
+
+/**
+ * The lease primitive: bump `path`'s mtime iff it still carries `token`.
+ * Returns whether the caller still owns the lock. Exported ONLY so the
+ * heartbeat is testable in isolation — Bun does not let a test intercept a
+ * named `node:fs` import, so there is no way to observe a touch from inside a
+ * real critical section.
+ */
+export function refreshLockFile(path: string, token: string): boolean {
+  try {
+    const now = new Date();
+    // TOUCH FIRST, then verify. `utimesSync` never CREATES, so a lock a
+    // reclaimer already unlinked fails here with ENOENT instead of being
+    // resurrected carrying our token — a resurrected file would read as a live
+    // lock to every other writer while nobody actually held it.
+    utimesSync(path, now, now);
+    // The ownership read comes AFTER the touch, and it is the ONLY ownership
+    // check, so it cannot be skipped without the function claiming every lock
+    // it can stat. Checking BEFORE instead would leave a window: reclaim is
+    // unlink-then-create, and a successor's create landing between a
+    // pre-check and the touch would have had ITS lease extended by us and left
+    // us believing we still held the lock. Bumping a successor's mtime by a few
+    // microseconds is harmless — it only makes a live lock look more alive.
+    return readLockToken(path) === token;
+  } catch {
+    // ENOENT (reclaimed and not yet recreated) or an unreadable lock dir.
+    // Either way we can no longer prove ownership, so we must not claim it.
+    return false;
+  }
+}
+
 /** Block this thread without spinning a core. */
 function sleepSync(ms: number): void {
   try {
@@ -166,15 +264,50 @@ function withRegistryLock<T>(fn: () => T): T {
       lockDepth--;
     }
   }
-  const token = acquireRegistryLock();
+  let token = acquireRegistryLock();
+  heldToken = token;
+  leaseLost = false;
   lockDepth++;
   try {
-    return fn();
+    // Re-run the WHOLE read → modify → write when the publish found our lease
+    // gone. Retrying is the only outcome that preserves both writes: the
+    // reclaimer may have published from a read taken before our change, so our
+    // stale in-memory `entries` must be recomputed from what is now on disk.
+    // The re-run is safe because every `fn` here is read → compute → write with
+    // no side effects of its own.
+    for (let attempt = 0; ; attempt++) {
+      // `lastChance` disarms the lease check on the final attempt so a
+      // pathologically contended machine gets a warned-about write rather than
+      // an exception out of `daemon start`, which prunes and registers on every
+      // start. Same one-directional degradation as `warnUnlocked`.
+      lastChanceWrite = attempt >= LOCK_LOST_RETRIES;
+      try {
+        return fn();
+      } catch (err) {
+        if (!(err instanceof RegistryLockLostError)) throw err;
+        process.stderr.write(
+          `warning: the registry lock at ${registryLockFile()} was reclaimed while this ` +
+            `process held it; retrying the write (attempt ${attempt + 2}).\n`,
+        );
+        token = acquireRegistryLock();
+        heldToken = token;
+        leaseLost = false;
+      }
+    }
   } finally {
+    lastChanceWrite = false;
     lockDepth--;
+    heldToken = null;
+    leaseLost = false;
     if (token !== null) releaseRegistryLock(token);
   }
 }
+
+/**
+ * Set for the final retry only: publish even without a provable lease rather
+ * than throwing out of a `daemon start`. See {@link withRegistryLock}.
+ */
+let lastChanceWrite = false;
 
 /** Say out loud that mutual exclusion is off. Silence here is the bug we are fixing. */
 function warnUnlocked(path: string, why: string): void {
@@ -453,7 +586,18 @@ function writeRegistryUnlocked(entries: ProjectEntry[]): void {
   // target, so the rename is always within one filesystem (never EXDEV).
   const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`;
   try {
+    // Extend the lease BEFORE the write, so a slow `writeFileSync` (a big
+    // registry on a cold network home) cannot itself age the lock past
+    // LOCK_STALE_MS and invite a reclaim.
+    renewRegistryLock();
     writeFileSync(tmp, body);
+    // LAST CHANCE: prove we still hold the lock immediately before publishing.
+    // If it was reclaimed while this section was blocked, the reclaimer's writer
+    // may already have published from a read that predates our change, and this
+    // rename would silently clobber it — the lost registration the lock exists
+    // to prevent. Bail instead; `withRegistryLock` re-acquires and re-runs the
+    // whole read → modify → write.
+    if (!renewRegistryLock() && !lastChanceWrite) throw new RegistryLockLostError();
     // Rename is atomic within a filesystem; avoids a torn read by a concurrent
     // daemon. (This used to `writeFileSync(file, body)` directly — non-atomic
     // despite the comment, and it left a stray `projects.json.tmp` behind.)
@@ -478,6 +622,15 @@ export function deriveAlias(root: string, preferred: string | undefined, taken: 
   const base = sanitizeAlias(preferred && preferred.length > 0 ? preferred : basename(root));
   const byAlias = new Map(taken.map((e) => [e.alias, e.root]));
   // If the base alias is free, or already points at THIS root, use it.
+  //
+  // RAW string comparison, deliberately, and re-checked as part of the
+  // canonical-form sweep: the `=== root` arm is unreachable in both callers.
+  // `registerProject` filters every same-repo entry into `others` before
+  // calling, and `readRegistryRaw`'s repair loop has already deduped rows by
+  // CANONICAL key, so no member of `taken` can be a symlink-equivalent spelling
+  // of `root`. Canonicalizing here instead would mean a `realpathSync` per
+  // candidate inside the repair loop — O(n²) syscalls on exactly the pathology
+  // that loop exists for (measured at 1,200 rows sharing one alias).
   const existing = byAlias.get(base);
   if (existing === undefined || existing === root) return base;
   // Unbounded loop, deliberately: it terminates by pigeonhole. `taken` holds at
@@ -591,6 +744,13 @@ export function pruneStaleProjects(nowMs: number = Date.now()): ProjectEntry[] {
     const removed: ProjectEntry[] = [];
 
     for (const entry of entries) {
+      // HEARTBEAT. The pre-lock pass covers most roots, but the
+      // `?? isDirectory(entry.root)` fallback below still stats INSIDE the lock
+      // for any row that appeared between the two reads — and one cold
+      // SMB/autofs stat there is tens of seconds, i.e. several times
+      // LOCK_STALE_MS. Touching the lockfile each iteration is what stops a
+      // live holder being reclaimed halfway through its own prune.
+      renewRegistryLock();
       // A preserved hand-edited row (non-absolute root) is untouchable: we can
       // neither serve it nor stat it, and `isRegistrableRoot`/`isDirectory`
       // below would `resolve()` it against the daemon's cwd and then evict it
@@ -690,18 +850,108 @@ export function registerProject(root: string, alias?: string): ProjectEntry {
   });
 }
 
-/** Remove a project by alias OR absolute root. Returns true if something was removed. */
-export function unregisterProject(aliasOrRoot: string): boolean {
-  const abs = canonicalRoot(isAbsolute(aliasOrRoot) ? aliasOrRoot : resolve(process.cwd(), aliasOrRoot));
+/**
+ * How an `unregister` argument was interpreted. EXACTLY ONE of the two, never
+ * both — see {@link classifyUnregisterArg}.
+ */
+export type UnregisterTarget =
+  | { readonly kind: "alias"; readonly alias: string }
+  /** `given` is the user's spelling; `root` is its canonical absolute form. */
+  | { readonly kind: "path"; readonly given: string; readonly root: string };
+
+/**
+ * Decide whether an `unregister` argument is an ALIAS or a PATH. Never both.
+ *
+ * THE BUG THIS FIXES (silent data loss): the argument used to be resolved
+ * against `process.cwd()` AND matched against every entry's root, on top of the
+ * alias match. So with a registry of `[{alias:"zzz", root:"$SB/real/repo"}]` and
+ * a cwd of `$SB/real`, `unregisterProject("repo")` resolved `"repo"` to
+ * `$SB/real/repo`, matched `zzz` by ROOT, and deleted it — reporting success.
+ * `hayven daemon unregister myproject` from a parent folder therefore removed a
+ * DIFFERENT project than the one named, with no way for the user to tell.
+ *
+ * THE RULE: an argument that LOOKS like a path is a path; anything else is an
+ * alias, and a bare name is NEVER resolved against the cwd. "Looks like a path"
+ * means absolute, `~`-rooted, `.`/`..`, or containing a separator. That is
+ * unambiguous rather than merely conventional: `sanitizeAlias` strips `/` and
+ * `\` out of every alias this module writes, so no alias can collide with the
+ * path form — the two namespaces cannot overlap.
+ */
+export function classifyUnregisterArg(aliasOrRoot: string, cwd: string = process.cwd()): UnregisterTarget {
+  const arg = aliasOrRoot.trim();
+  const looksLikePath =
+    isAbsolute(arg) ||
+    arg === "~" ||
+    arg.startsWith("~/") ||
+    arg === "." ||
+    arg === ".." ||
+    /[\\/]/.test(arg);
+  if (!looksLikePath) return { kind: "alias", alias: arg };
+  const expanded = expandHomePrefix(arg);
+  return {
+    kind: "path",
+    given: arg,
+    root: canonicalRoot(isAbsolute(expanded) ? expanded : resolve(cwd, expanded)),
+  };
+}
+
+/** The result of an unregister attempt, with a message fit to print verbatim. */
+export interface UnregisterOutcome {
+  readonly removed: boolean;
+  readonly target: UnregisterTarget;
+  /** One line, no trailing newline. Explains WHICH interpretation was used. */
+  readonly message: string;
+}
+
+/**
+ * Remove a project by alias XOR path — the detailed form, so the CLI can say
+ * which of the two it did and why nothing matched. Prefer this over
+ * {@link unregisterProject} at any call site that prints to a user.
+ */
+export function unregisterProjectDetailed(
+  aliasOrRoot: string,
+  cwd: string = process.cwd(),
+): UnregisterOutcome {
+  const target = classifyUnregisterArg(aliasOrRoot, cwd);
   return withRegistryLock(() => {
     // RAW for the same reason as `registerProject`: removing "x" must remove ONLY
     // "x", never everything the serve-time filter would have hidden.
     const entries = readRegistryRaw();
-    const next = entries.filter(
-      (e) => e.alias !== aliasOrRoot && !(isAbsolute(e.root) && canonicalRoot(e.root) === abs),
-    );
-    if (next.length === entries.length) return false;
+    const matches = (e: ProjectEntry): boolean =>
+      target.kind === "alias"
+        ? e.alias === target.alias
+        : isAbsolute(e.root) && canonicalRoot(e.root) === target.root;
+    const next = entries.filter((e) => !matches(e));
+    if (next.length === entries.length) {
+      return { removed: false, target, message: notFoundMessage(target, entries) };
+    }
     writeRegistry(next);
-    return true;
+    const what =
+      target.kind === "alias"
+        ? `alias "${target.alias}"`
+        : `the project rooted at ${target.root}`;
+    return { removed: true, target, message: `unregistered ${what}` };
   });
+}
+
+/** Say what we looked for, how we read the argument, and what exists instead. */
+function notFoundMessage(target: UnregisterTarget, entries: readonly ProjectEntry[]): string {
+  if (target.kind === "alias") {
+    const known = entries.map((e) => e.alias);
+    const listed = known.length > 0 ? known.join(", ") : "(none registered)";
+    return (
+      `no registered project with the alias "${target.alias}". Registered aliases: ${listed}. ` +
+      "A bare name is treated as an ALIAS only — to remove by location, pass a path " +
+      `(e.g. ./${target.alias} or an absolute path).`
+    );
+  }
+  return (
+    `no registered project rooted at ${target.root} ` +
+    `(read "${target.given}" as a path because it names one; a bare name would have been an alias).`
+  );
+}
+
+/** Remove a project by alias XOR path. Returns true if something was removed. */
+export function unregisterProject(aliasOrRoot: string): boolean {
+  return unregisterProjectDetailed(aliasOrRoot).removed;
 }

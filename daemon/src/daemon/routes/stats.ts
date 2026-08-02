@@ -16,6 +16,55 @@ export function statsRoutes(deps: ServerDependencies) {
     .get("/api/stats", () => {
       const counts = deps.db.counts();
       const lastIngestAt = deps.db.getStat("last_ingest_at");
+      // INTEGRITY, not just freshness. `last_ingest_at` lives in `stats` and is
+      // written only on SUCCESS, so it SURVIVES a `clearGraph()` that was never
+      // repopulated: a wiped index reported a recent `last_ingest_at` over HTTP
+      // and every query answered "No matches", which a caller reads as a fact
+      // about their code rather than as a tool failure. The CLI got this check
+      // (`evaluateStaleness` → `broken`) but the daemon-mediated clients — the
+      // viewer, the MCP server, the proxy, anything polling /api/stats — did
+      // not, so the same wiped index still certified itself healthy to all of
+      // them. `checkIndexIntegrity()` never throws (documented); the try is
+      // belt-and-braces so a stats read can never 500 on a health field.
+      let integrity: { ok: boolean; reason: string; detail: string };
+      try {
+        integrity = deps.db.checkIndexIntegrity();
+      } catch (err) {
+        integrity = { ok: false, reason: "unreadable", detail: (err as Error).message };
+      }
+      // IN-FLIGHT IS NOT BROKEN — and mid-ingest, "broken" is NOT KNOWABLE.
+      //
+      // Both integrity reasons a running ingest produces are indistinguishable
+      // from the real failure while it runs:
+      //   - `ingest-interrupted`: `runIngest` sets the in-progress marker for
+      //     EVERY ingest — the startup full run, each branch re-point, and every
+      //     watcher incremental re-ingest.
+      //   - `empty-but-claims-content`: `fullIngest` calls `clearGraph()`, which
+      //     wipes `nodes` while `last_ingest_nodes` survives. From the clear
+      //     until the first batch flushes — the entire native parse phase,
+      //     minutes on a large repo — a HEALTHY daemon looks exactly like one
+      //     whose rebuild was killed.
+      //
+      // Reported verbatim, a healthy daemon would publish `index_ok: false`
+      // every time the user saved a file and for the whole of every full
+      // rebuild, and a client told to branch on the field would be useless. The
+      // remedy the broken state advertises ("run `hayven ingest --full`") is
+      // also precisely what is already running, so the warning could not even be
+      // acted on. `evaluateStaleness` resolves the same ambiguity by deferring
+      // to a running daemon; here we have a sharper signal — `ingest.current()`
+      // says whether THIS project is mid-ingest right now (it resolves through
+      // the multi-project facade's per-request getter).
+      //
+      // The cost is stated rather than hidden: `index_ingesting` is published
+      // alongside, and a client that sees it must not read low counts as truth.
+      // Once the ingest ends, a genuinely wiped index reports broken as before.
+      const ingesting = deps.ingest.current() !== null;
+      if (
+        ingesting &&
+        (integrity.reason === "ingest-interrupted" || integrity.reason === "empty-but-claims-content")
+      ) {
+        integrity = { ok: true, reason: "ok", detail: "" };
+      }
       return {
         ...counts,
         traces: deps.db.observationsCount(),
@@ -25,6 +74,15 @@ export function statsRoutes(deps: ServerDependencies) {
         // §17.2 Layer B: how many files currently fail the pre-merge verify
         // gate. Non-zero means at least one merge materialized but is flagged.
         merge_rejections: deps.db.mergeRejectionCount(),
+        // `index_broken` is null when healthy so a client can branch on one
+        // field; `index_ok` is the same signal spelled positively for readers
+        // that only want a boolean.
+        index_ok: integrity.ok,
+        index_broken: integrity.ok ? null : integrity.reason,
+        index_broken_detail: integrity.ok ? null : integrity.detail,
+        // Distinguishes "healthy and quiet" from "healthy but mid-write", so a
+        // client that sees low counts knows to re-read rather than alarm.
+        index_ingesting: ingesting,
         port: deps.config.daemon_port,
       };
     })

@@ -42,6 +42,17 @@ import { runIngest } from "./ingest.ts";
  * thousands of files. A genuinely huge single repo trips it, which is the
  * intended trade: a loud, one-flag-overridable refusal beats six hours of
  * silent 98%-CPU indexing.
+ *
+ * SAME UNITS as `DEFAULT_MAX_INGEST_FILES` (200_000) in `graph/ingest.ts`, and
+ * deliberately lower. They used to be incommensurable: this one counted every
+ * non-hidden file of any extension and ignored `.gitignore`, that one counts
+ * the native walker's language-mapped, post-gitignore `files_total`. Measured
+ * on one tree the two read 401 and 1 — so "50,000" here was not 4x stricter
+ * than "200,000" there, it was an unrelated number that refused repos with a
+ * big ignored `coverage/`. `countIndexableFiles` now counts the same
+ * population, so the two ceilings are finally comparable and this is the
+ * earlier, friendlier one: it fires before `.hayven/` exists and names a flag,
+ * where the ingest cap fires mid-command.
  */
 export const DEFAULT_MAX_INIT_FILES = 50_000;
 
@@ -79,7 +90,12 @@ export function parseMaxFiles(flag: string | boolean | undefined): number | null
  * Separate from {@link runInit} so the verdict is testable without a filesystem
  * big or slow enough to hit the counter's own bounds.
  */
-export function ceilingVerdict(root: string, scan: BoundedFileCount, ceiling: number): string | null {
+export function ceilingVerdict(
+  root: string,
+  scan: BoundedFileCount,
+  ceiling: number,
+  command: string = "hayven init",
+): string | null {
   if (!scan.exceeded && scan.exact) return null;
   const found = scan.exact
     ? `${scan.count.toLocaleString()} files`
@@ -88,19 +104,47 @@ export function ceilingVerdict(root: string, scan: BoundedFileCount, ceiling: nu
   // the re-run counts higher and fails identically. Only suggest a number when
   // we actually know one.
   const raise = scan.exact
-    ? `  hayven init --max-files=${scan.count}   # accept this tree's ${scan.count.toLocaleString()} files\n`
+    ? `  ${command} --max-files=${scan.count}   # accept this tree's ${scan.count.toLocaleString()} files\n`
     : "";
+  // "above" for a completed scan (`exceeded` is a strict `count > ceiling`);
+  // "at or above" only for the inexact case, where `count` is a lower bound and
+  // we genuinely cannot say which. The old wording said "at or above"
+  // unconditionally, which is false for every exact refusal it prints.
+  const relation = scan.exact ? "above" : "at or above";
   return (
     `error: refusing to initialize ${root} — it contains ${found},\n` +
-    `at or above the --max-files ceiling of ${ceiling.toLocaleString()}.\n\n` +
-    "The first ingest walks and parses every one of them. A count this large\n" +
-    "almost always means this root is not a single project — a home dir,\n" +
-    "/Users, ~/Library, or a mounted volume. Indexing one of those pegs a\n" +
-    "core for hours and writes a multi-hundred-MB index.\n\n" +
+    `${relation} the --max-files ceiling of ${ceiling.toLocaleString()}.\n\n` +
+    "Counted the way the indexer counts: source files only, after .gitignore.\n" +
+    "The first ingest parses every one of them. A count this large almost\n" +
+    "always means this root is not a single project — a home dir, /Users,\n" +
+    "~/Library, or a mounted volume. Indexing one of those pegs a core for\n" +
+    "hours and writes a multi-hundred-MB index.\n\n" +
     "If it really is one project, re-run with an explicit ceiling:\n" +
     raise +
-    "  hayven init --max-files=off   # no ceiling at all\n"
+    `  ${command} --max-files=off   # no ceiling at all\n`
   );
+}
+
+/**
+ * Count `root` and return the refusal text, or `null` to proceed. The one-call
+ * form of {@link countIndexableFiles} + {@link ceilingVerdict}, so a NEW entry
+ * point gets the ceiling in one line and cannot accidentally ship half of it
+ * (count without verdict waves everything through; verdict without a bounded
+ * count is the unbounded walk again).
+ *
+ * `hayven ingest` / `hayven reindex` / `hayven daemon register` /
+ * `POST /api/projects` all start a walk with no ceiling of their own today —
+ * their only backstop is the `files_total` cap inside `graph/ingest.ts`, which
+ * fires only AFTER the native walker has finished walking the whole tree. This
+ * is the pre-walk refusal they should each call first.
+ */
+export function refuseIfOverCeiling(
+  root: string,
+  ceiling: number | null,
+  command: string = "hayven init",
+): string | null {
+  if (ceiling === null) return null;
+  return ceilingVerdict(root, countIndexableFiles(root, ceiling), ceiling, command);
 }
 
 export async function runInit(args: ParsedArgs): Promise<number> {
@@ -144,12 +188,14 @@ export async function runInit(args: ParsedArgs): Promise<number> {
     process.stderr.write(`error: ${ceiling.message}\n`);
     return 1;
   }
-  if (ceiling !== null) {
-    const verdict = ceilingVerdict(root, countIndexableFiles(root, ceiling), ceiling);
-    if (verdict !== null) {
-      process.stderr.write(verdict);
-      return 1;
-    }
+  // MUST stay above the `mkdirSync` tree, the `new Db(...)` and `runIngest` —
+  // a ceiling that fires after `.hayven/` exists has already paid for the
+  // damage AND left a half-built project that makes the retry say
+  // "`.hayven/` already exists" instead of naming the real problem.
+  const verdict = refuseIfOverCeiling(root, ceiling);
+  if (verdict !== null) {
+    process.stderr.write(verdict);
+    return 1;
   }
 
   if (reason === "cwd-fallback") {

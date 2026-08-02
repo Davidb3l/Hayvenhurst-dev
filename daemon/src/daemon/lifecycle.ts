@@ -12,10 +12,14 @@
  * recycled number made `hayven daemon stop` willing to SIGTERM an unrelated
  * process, and made `daemon start` refuse forever ("pidfile reports a live
  * daemon (pid 1800)") with no way to self-heal. So every pidfile now gets a
- * SIDECAR identity file (`daemon.pid.json`) recording the pid, its start time
- * and its `ps` command, and {@link verifyDaemonIdentity} checks the live process
- * against it. The pidfile itself keeps its plain-integer format so older
- * readers are unaffected; a missing sidecar degrades to the old behavior.
+ * SIDECAR identity file (`daemon.pid.json`) recording the pid, its BOOT-RELATIVE
+ * start offset and its `ps` command, and {@link verifyDaemonIdentity} checks the
+ * live process against it. The pidfile itself keeps its plain-integer format so
+ * older readers are unaffected; a missing sidecar degrades to the old behavior.
+ *
+ * The start signal is deliberately boot-relative rather than wall-clock: see
+ * {@link verifyDaemonIdentity} for why comparing two absolute clock readings
+ * turned an NTP step into a duplicate daemon.
  */
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
@@ -31,9 +35,31 @@ export type DaemonStatus =
  */
 export interface DaemonIdentity {
   pid: number;
-  /** Epoch ms this process started (`now - uptime`). The strongest cheap signal:
-   *  a recycled pid is a process that started at a DIFFERENT time. */
+  /**
+   * Epoch ms this process started (`now - uptime`), in WALL-CLOCK terms.
+   *
+   * RETAINED FOR OLD READERS ONLY — {@link verifyDaemonIdentity} no longer
+   * declares anything `foreign` on the strength of this field. It compares two
+   * absolute wall-clock readings taken at different times, so an NTP step or a
+   * VM resume between write and check moves a perfectly healthy daemon outside
+   * the tolerance: it was then reported `foreign`, which made `daemon stop` say
+   * "not running" and DELETE the pidfile, and the next `daemon start` bring up a
+   * duplicate. Use {@link DaemonIdentity.startOffsetFromBootMs}.
+   */
   startedAtMs: number;
+  /**
+   * How long after BOOT this process started, in ms — the clock-agreement-free
+   * identity signal.
+   *
+   * Derived as `etime(pid 1) - process.uptime()`. Both terms are computed by the
+   * kernel from the same reference, so a wall-clock step shifts them by the SAME
+   * amount and cancels out of the difference; at verify time the same quantity
+   * is recomputed as `etime(pid 1) - etime(pid)`. A recycled pid started later
+   * in the machine's life and cannot match. `null` when `ps -p 1` was
+   * unavailable (a restricted sandbox), in which case the check degrades to
+   * `unknown` rather than guessing.
+   */
+  startOffsetFromBootMs: number | null;
   /** `ps -o comm=` at write time, or null when `ps` was unavailable. */
   comm: string | null;
   /** Guards a pidfile that reached another machine (synced dotfiles, NFS home). */
@@ -55,6 +81,25 @@ export type IdentityVerdict = "ours" | "foreign" | "unknown";
  * same command to slip through.
  */
 export const IDENTITY_START_TOLERANCE_MS = 10_000;
+
+/**
+ * Milliseconds since boot, read as pid 1's elapsed time.
+ *
+ * pid 1 exists on every POSIX system this ships to (launchd on macOS, init /
+ * systemd on Linux, the container's entrypoint inside a container) and is by
+ * definition the first process, so its `etime` IS the machine's (or the
+ * namespace's) uptime. We only ever use it as a shared reference point that both
+ * the write and the verify subtract from, so it does not matter that a
+ * container's pid 1 is younger than the host — it just has to be the same
+ * reference on both sides, and it is.
+ *
+ * `null` when `ps` is unavailable or unparseable.
+ */
+export function systemUptimeMs(): number | null {
+  const raw = psFields(1, "etime=");
+  if (raw === null) return null;
+  return parseEtime(raw);
+}
 
 /** Absolute path of the sidecar identity file for a pidfile. */
 export function identityFileFor(pidFile: string): string {
@@ -90,9 +135,13 @@ export function parseEtime(raw: string): number | null {
 }
 
 function currentIdentity(): DaemonIdentity {
+  const uptimeMs = systemUptimeMs();
   return {
     pid: process.pid,
     startedAtMs: Math.round(Date.now() - process.uptime() * 1000),
+    // Boot-relative, so it survives an NTP step or a VM resume. See the field doc.
+    startOffsetFromBootMs:
+      uptimeMs === null ? null : Math.round(uptimeMs - process.uptime() * 1000),
     comm: psFields(process.pid, "comm="),
     host: hostname(),
   };
@@ -107,6 +156,11 @@ export function readIdentityFile(pidFile: string): DaemonIdentity | null {
     return {
       pid: parsed.pid,
       startedAtMs: parsed.startedAtMs,
+      // Absent in sidecars written before this field existed — `null` there is
+      // what makes `verifyDaemonIdentity` degrade to `unknown` instead of
+      // falling back to the wall-clock comparison it replaced.
+      startOffsetFromBootMs:
+        typeof parsed.startOffsetFromBootMs === "number" ? parsed.startOffsetFromBootMs : null,
       comm: typeof parsed.comm === "string" ? parsed.comm : null,
       host: typeof parsed.host === "string" ? parsed.host : "",
     };
@@ -120,6 +174,16 @@ export function readIdentityFile(pidFile: string): DaemonIdentity | null {
  *
  * Answers `unknown` — never a guess — whenever the evidence is missing, so a
  * pidfile written by a pre-upgrade daemon keeps behaving exactly as before.
+ *
+ * NO VERDICT DEPENDS ON TWO CLOCKS AGREEING. The original check compared
+ * `ps -o etime=` (wall clock, read now) against `Date.now() - uptime` (wall
+ * clock, recorded at write time) with a 10 s tolerance. Any NTP step or VM
+ * resume in between exceeded that by construction, and a healthy daemon was
+ * then reported `foreign` — at which point `daemon stop` printed "not running"
+ * and deleted the pidfile, and the next `daemon start` brought up a DUPLICATE
+ * daemon on the same indexes. The replacement compares BOOT-RELATIVE start
+ * offsets (`etime(pid 1) - etime(pid)`), which a clock step shifts identically
+ * on both terms, so it cancels.
  */
 export function verifyDaemonIdentity(pidFile: string, pid: number): IdentityVerdict {
   const id = readIdentityFile(pidFile);
@@ -133,8 +197,25 @@ export function verifyDaemonIdentity(pidFile: string, pid: number): IdentityVerd
   if (!m) return "unknown";
   const elapsedMs = parseEtime(m[1]!);
   if (elapsedMs === null) return "unknown";
+  // Command mismatch is clock-free proof of a recycled pid — keep it first.
   if (id.comm !== null && m[2]!.trim() !== id.comm) return "foreign";
-  if (Math.abs(Date.now() - elapsedMs - id.startedAtMs) > IDENTITY_START_TOLERANCE_MS) return "foreign";
+
+  // Boot-relative start offset: the same quantity the sidecar recorded, but
+  // recomputed from two `ps` readings taken in the same instant.
+  if (id.startOffsetFromBootMs === null) {
+    // Pre-upgrade sidecar. There is no clock-free start evidence, and the
+    // wall-clock field it does carry is exactly the one that mis-fires — so we
+    // report `unknown` (callers fall back to pre-identity behavior: `stop` still
+    // signals the pid, `status` still says running) rather than risk declaring a
+    // healthy daemon foreign. The next daemon start writes a full sidecar.
+    return "unknown";
+  }
+  const uptimeMs = systemUptimeMs();
+  if (uptimeMs === null) return "unknown"; // no reference point — do not guess
+  const observedOffset = uptimeMs - elapsedMs;
+  if (Math.abs(observedOffset - id.startOffsetFromBootMs) > IDENTITY_START_TOLERANCE_MS) {
+    return "foreign";
+  }
   return "ours";
 }
 
