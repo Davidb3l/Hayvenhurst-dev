@@ -26,8 +26,8 @@
  * `resolveNodeId` (the same fuzzy locator `refs`/`impact` use). No embeddings,
  * no model — exact-identifier, never-stale, line-exact.
  */
-import { readFileSync } from "node:fs";
-import { isAbsolute, join } from "node:path";
+import { readFileSync, realpathSync, statSync } from "node:fs";
+import { isAbsolute, resolve, sep } from "node:path";
 
 import { IMPORT_KIND, isCallKind, resolveNodeId } from "./graph_walk.ts";
 import { collectImportedSymbols } from "./imported_symbol.ts";
@@ -154,6 +154,23 @@ const MAX_REF_LINES = 40;
  *  (and on the slice's `truncatedFromEndLine`), never injected into `text`.
  *  Overridable per call via `opts.maxRefSliceLines`. */
 const DEFAULT_MAX_REF_SLICE_LINES = 12;
+
+/**
+ * Read a "how many" pack knob, falling back to `dflt` for anything that is not
+ * an integer >= `min`.
+ *
+ * These knobs arrive from surfaces that own no validated numeric type — the MCP
+ * tool arguments, and the daemon route's query string — and a negative one was
+ * not merely ignored, it corrupted the OUTPUT: `maxRefSliceLines: -1000000`
+ * produced slices with `endLine < startLine` (`[3, -999998]`), which then flowed
+ * into the `order` continuation token a builder threads back, and made
+ * `lineCount` hugely negative. `0` is meaningful for the caps (`maxNeighbors: 0`
+ * = no neighbors, `maxCallers: 0` = no caller hop), so `min` defaults to 0 and
+ * only the slice LENGTH knob raises it to 1.
+ */
+function countOpt(v: number | undefined, dflt: number, min = 0): number {
+  return typeof v === "number" && Number.isInteger(v) && v >= min ? v : dflt;
+}
 
 /** ≈4 chars/token — the cheap, tokenizer-robust proxy the pivot used to report
  *  ratios. Exact counts need a tokenizer; ratios hold either way. */
@@ -324,19 +341,197 @@ function moduleScopeSegments(
   });
 }
 
+/** `realpathSync` that yields `null` instead of throwing on a missing path. */
+function tryRealpath(p: string): string | null {
+  try {
+    return realpathSync(p);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Largest file the packer will read, mirroring the Rust walker's
+ * `max_file_size` (`native/src/parse/walker.rs`) EXACTLY — a file the indexer
+ * refuses to walk is not one the packer should slurp either.
+ *
+ * Without this, one `context_for_change` call naming a large in-repo file was an
+ * amplifier: a 200 MiB file cost +835 MB RSS, a 32 MiB file turned a 156-BYTE
+ * request into a 67.1 MB response (430,000x), and 100 MiB reached
+ * `RangeError: Out of memory` on the real stdio path. Every knob a client could
+ * send was bounded except the one that actually determines the work.
+ */
+export const MAX_PACK_FILE_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Path segments and basenames that are NEVER packed, even though they sit
+ * inside the repo.
+ *
+ * WHY THIS EXISTS SEPARATELY FROM CONTAINMENT — containment says nothing about
+ * `.env`, because `.env` IS in the repo root. The packer reads the raw file
+ * whether or not it is INDEXED, so `.gitignore` (which the Rust walker honours,
+ * keeping these out of the graph entirely) gives no protection on this path.
+ * `tools/call {file:".env"}` was as easy to name as `/etc/passwd`, and leaked;
+ * so did `.git/config` (which carries an embedded token whenever a remote URL
+ * has credentials in it) and `id_rsa`.
+ *
+ * This is a DENYLIST of well-known credential shapes. It is NOT a general
+ * secret detector and it is NOT a `.gitignore` implementation — see
+ * {@link resolveWithinRepo}'s note on what is and is not guaranteed.
+ */
+const DENIED_DIR_SEGMENTS = new Set([
+  ".git",
+  ".ssh",
+  ".aws",
+  ".gnupg",
+  ".docker",
+  ".hayven",
+]);
+
+/** Exact basenames that are credential files by convention. */
+const DENIED_BASENAMES = new Set([
+  ".npmrc",
+  ".netrc",
+  "_netrc",
+  ".pgpass",
+  ".htpasswd",
+  ".git-credentials",
+  ".dockercfg",
+  ".envrc",
+  "credentials",
+  "master.key",
+  "terraform.tfstate",
+]);
+
+/** Basename PREFIXES that are private-key material by convention. */
+const DENIED_BASENAME_PREFIXES = ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", ".env"];
+
+/** Extensions that are key/certificate material, never source. */
+const DENIED_EXTENSIONS = [
+  ".pem",
+  ".key",
+  ".p12",
+  ".pfx",
+  ".jks",
+  ".keystore",
+  ".asc",
+  ".gpg",
+  ".ppk",
+];
+
+/** Is this repo-relative path one we refuse to read regardless of containment? */
+function isDeniedRepoPath(rel: string): boolean {
+  const parts = rel.split(/[\\/]+/).filter((p) => p.length > 0);
+  if (parts.length === 0) return true;
+  // Any DIRECTORY component in the denied set poisons the whole path, so
+  // `.git/config` and `.ssh/known_hosts` lose no matter how deep.
+  for (const part of parts.slice(0, -1)) {
+    if (DENIED_DIR_SEGMENTS.has(part.toLowerCase())) return true;
+  }
+  const base = (parts[parts.length - 1] ?? "").toLowerCase();
+  // A denied name used AS a directory (`.git/…` was covered above, but
+  // `.ssh` alone as the final component) is refused too.
+  if (DENIED_DIR_SEGMENTS.has(base)) return true;
+  if (DENIED_BASENAMES.has(base)) return true;
+  // `.env`, `.env.local`, `.env.production`; `id_rsa`, `id_rsa.pub`.
+  if (DENIED_BASENAME_PREFIXES.some((p) => base === p || base.startsWith(`${p}.`))) {
+    return true;
+  }
+  if (DENIED_EXTENSIONS.some((e) => base.endsWith(e))) return true;
+  return false;
+}
+
+/**
+ * Resolve `file` (repo-relative, or absolute) to an absolute path the packer is
+ * allowed to read, or `null`.
+ *
+ * SECURITY — this is the gate for every file the packer reads. The packer's
+ * `file` argument is CLIENT-SUPPLIED on the `hayven mcp` surface
+ * (`context_for_change`'s `file` tool arg goes straight through
+ * `contextForChange` → {@link buildContextPackForChange} → the file reader), so
+ * an MCP host — or a prompt injection sitting inside an indexed source file —
+ * gets to name the path. Three independent checks:
+ *
+ *   1. CONTAINMENT. Lexically, so `../../secret` and an out-of-tree absolute
+ *      path lose; and after `realpathSync`, so a SYMLINK inside the repo
+ *      pointing out loses. For a path that EXISTS the realpath is authoritative
+ *      and is what we return, which also closes the check-then-read window a
+ *      swapped symlink would otherwise open. A path that does not exist yet
+ *      cannot be a symlink escape, so it falls back to the lexical answer and
+ *      the read fails on its own.
+ *   2. DENYLIST. Containment alone permits `.env`, `.git/config` and `id_rsa`,
+ *      all of which are INSIDE the repo — see {@link isDeniedRepoPath}.
+ *   3. FILE TYPE + SIZE. See {@link statPackable}: a FIFO inside the repo made
+ *      `readFileSync` block forever, synchronously and uninterruptibly, wedging
+ *      the single-process stdio MCP server exactly as an unbounded region loop
+ *      did. Directories, sockets and device nodes are refused for the same
+ *      reason; oversized files for {@link MAX_PACK_FILE_BYTES}.
+ *
+ * WHAT THIS DOES NOT GUARANTEE. It is not a `.gitignore` implementation, so an
+ * un-indexed, gitignored file whose name is not on the denylist (a stray
+ * `dump.sql`, a vendored build artifact) is still readable if the caller names
+ * it exactly. The guarantee is: nothing outside the repo, nothing of a
+ * well-known credential shape, nothing that can block, and nothing unbounded.
+ */
+export function resolveWithinRepo(repoRoot: string, file: string): string | null {
+  // A NUL survives `resolve()` but makes every syscall throw. Refuse it here so
+  // the gate never green-lights a path that cannot be read.
+  if (file.length === 0 || file.includes("\0")) return null;
+  const rootAbs = resolve(repoRoot);
+  const rootReal = tryRealpath(rootAbs) ?? rootAbs;
+  const inside = (p: string): boolean =>
+    p === rootAbs ||
+    p.startsWith(rootAbs + sep) ||
+    p === rootReal ||
+    p.startsWith(rootReal + sep);
+
+  const abs = isAbsolute(file) ? resolve(file) : resolve(rootAbs, file);
+  const real = tryRealpath(abs);
+  // For an existing path the REAL location decides, both ways: it is the only
+  // check that catches a symlink escape, and it is what rescues the mirror-image
+  // case (a `repoRoot` given as the realpath with `file` given via the symlinked
+  // spelling, which a purely lexical test refuses for no reason).
+  const target = real ?? abs;
+  if (!inside(target)) return null;
+
+  // Denylist on the path RELATIVE to whichever root form matched, so `.env`
+  // named as `./.env`, `a/../.env` or an absolute path all normalize the same.
+  const root = target.startsWith(rootReal) ? rootReal : rootAbs;
+  const rel = target.slice(root.length).replace(/^[\\/]+/, "");
+  if (isDeniedRepoPath(rel)) return null;
+  return target;
+}
+
+/**
+ * `statSync` the path and say whether it is a REGULAR file within
+ * {@link MAX_PACK_FILE_BYTES}. `statSync` follows symlinks (so a symlink to a
+ * FIFO is caught) and — unlike `open`/`read` — never blocks on one.
+ */
+function statPackable(abs: string): boolean {
+  try {
+    const st = statSync(abs);
+    return st.isFile() && st.size <= MAX_PACK_FILE_BYTES;
+  } catch {
+    return false;
+  }
+}
+
 /** A tiny per-call file cache: neighbors frequently share the target's file, so
  *  read each file at most once. Returns the file's lines, or `null` if it can't
- *  be read (deleted, binary, outside the repo). */
+ *  be read (deleted, binary, too large, not a regular file, or — see
+ *  {@link resolveWithinRepo} — outside the repo or denied). */
 function makeFileReader(repoRoot: string) {
   const cache = new Map<string, string[] | null>();
   return (file: string): string[] | null => {
     if (cache.has(file)) return cache.get(file) ?? null;
     let lines: string[] | null = null;
-    try {
-      const abs = isAbsolute(file) ? file : join(repoRoot, file);
-      lines = readFileSync(abs, "utf8").split("\n");
-    } catch {
-      lines = null;
+    const abs = resolveWithinRepo(repoRoot, file);
+    if (abs !== null && statPackable(abs)) {
+      try {
+        lines = readFileSync(abs, "utf8").split("\n");
+      } catch {
+        lines = null;
+      }
     }
     cache.set(file, lines);
     return lines;
@@ -430,10 +625,14 @@ export function buildContextPack(
   opts: ContextPackOptions = {},
 ): ContextPack | null {
   const includeNeighbors = opts.neighbors !== false;
-  const maxNeighbors = opts.maxNeighbors ?? DEFAULT_MAX_NEIGHBORS;
-  const maxHeaderLines = opts.maxHeaderLines ?? DEFAULT_MAX_HEADER_LINES;
-  const maxRefSliceLines = opts.maxRefSliceLines ?? DEFAULT_MAX_REF_SLICE_LINES;
-  const maxCallers = opts.maxCallers ?? DEFAULT_MAX_CALLERS;
+  const maxNeighbors = countOpt(opts.maxNeighbors, DEFAULT_MAX_NEIGHBORS);
+  const maxHeaderLines = countOpt(opts.maxHeaderLines, DEFAULT_MAX_HEADER_LINES);
+  const maxRefSliceLines = countOpt(
+    opts.maxRefSliceLines,
+    DEFAULT_MAX_REF_SLICE_LINES,
+    1,
+  );
+  const maxCallers = countOpt(opts.maxCallers, DEFAULT_MAX_CALLERS);
   const importedSymbols = opts.importedSymbols === true;
 
   const resolved = resolveNodeId(db, rawId);
@@ -789,7 +988,7 @@ export function buildModuleFrame(
   file: string,
   opts: { maxLines?: number; anchorRanges?: Array<[number, number]> } = {},
 ): ContextPack | null {
-  const maxLines = opts.maxLines ?? DEFAULT_MAX_HEADER_LINES;
+  const maxLines = countOpt(opts.maxLines, DEFAULT_MAX_HEADER_LINES);
   const read = makeFileReader(repoRoot);
   const lines = read(file);
   if (!lines) return null;
@@ -856,9 +1055,13 @@ export function buildContextPackForSymbols(
   opts: ContextPackOptions = {},
 ): ContextPack | null {
   const includeNeighbors = opts.neighbors !== false;
-  const maxNeighbors = opts.maxNeighbors ?? DEFAULT_MAX_NEIGHBORS;
-  const maxHeaderLines = opts.maxHeaderLines ?? DEFAULT_MAX_HEADER_LINES;
-  const maxRefSliceLines = opts.maxRefSliceLines ?? DEFAULT_MAX_REF_SLICE_LINES;
+  const maxNeighbors = countOpt(opts.maxNeighbors, DEFAULT_MAX_NEIGHBORS);
+  const maxHeaderLines = countOpt(opts.maxHeaderLines, DEFAULT_MAX_HEADER_LINES);
+  const maxRefSliceLines = countOpt(
+    opts.maxRefSliceLines,
+    DEFAULT_MAX_REF_SLICE_LINES,
+    1,
+  );
 
   const read = makeFileReader(repoRoot);
   const slices: ContextSlice[] = [];
@@ -1117,19 +1320,42 @@ export function buildContextPackForChange(
   const entityIds: string[] = [];
   const seen = new Set<string>();
   let anyModuleLevel = false;
+  /**
+   * Entity coverage for this file as a bitmap over `1..maxEntityEnd`, built ONCE
+   * in O(rows + lines).
+   *
+   * BOUND — the scan below used to ask "is line L inside any entity?" by walking
+   * `rows` for EVERY line of EVERY region, i.e. O(regions × lines × entities).
+   * That survived the gap-fill clamp and was independently measured at 76
+   * SECONDS for 1024 whole-file regions against a 20k-line / 5k-entity file —
+   * every one of those regions schema-valid and accepted by the MCP wire. Same
+   * permanent wedge of the synchronous single-process stdio server, reached
+   * through the other loop. The bitmap makes the scan O(lines).
+   *
+   * `range_end` comes from the index, so a corrupt/stale row could claim an
+   * absurd end and turn the allocation itself into the DoS; cap it. Lines past
+   * the cap answer "module scope", which is the inclusive (never-lose-context)
+   * direction.
+   */
+  const MAX_COVERAGE_LINES = 10_000_000;
+  const maxEntityEnd = Math.min(
+    MAX_COVERAGE_LINES,
+    rows.reduce((m, r) => Math.max(m, r.range_end), 0),
+  );
+  const insideEntity = new Uint8Array(maxEntityEnd + 2);
+  for (const r of rows) {
+    const from = Math.max(1, r.range_start);
+    const to = Math.min(maxEntityEnd, r.range_end);
+    for (let L = from; L <= to; L++) insideEntity[L] = 1;
+  }
   /** Mark every line in [lo,hi] that is NOT inside ANY entity → if any remains,
    *  the region touches true module scope and needs the frame. */
   const regionTouchesModuleScope = (lo: number, hi: number): boolean => {
-    for (let L = lo; L <= hi; L++) {
-      let inside = false;
-      for (const r of rows) {
-        if (r.range_start <= L && r.range_end >= L) {
-          inside = true;
-          break;
-        }
-      }
-      if (!inside) return true;
-    }
+    // A line below 1 or past the last entity is outside every entity, so it IS
+    // the answer — return without walking the range at all. (This also keeps a
+    // hugely negative `lo` from becoming its own unbounded loop.)
+    if (lo < 1 || hi > maxEntityEnd) return true;
+    for (let L = lo; L <= hi; L++) if (!insideEntity[L]) return true;
     return false;
   };
   for (const region of regions) {
@@ -1173,7 +1399,10 @@ export function buildContextPackForChange(
       : null;
   const framePack = anyModuleLevel
     ? buildModuleFrame(db, repoRoot, file, {
-        maxLines: opts.maxHeaderLines,
+        // Through `countOpt` like every other read of this knob — reading the
+        // raw option here was a hole in the guard (a negative/fractional
+        // `maxHeaderLines` reached `computeModuleScope` untouched on this path).
+        maxLines: countOpt(opts.maxHeaderLines, DEFAULT_MAX_HEADER_LINES),
         // Anchor frame-trimming to the changed regions so the module-scope runs
         // a (straddle) change touches — e.g. a gap line between two entities —
         // are retained instead of trimmed away in a large file.
@@ -1218,13 +1447,33 @@ export function buildContextPackForChange(
   if (fileLines) {
     const covered = (L: number): boolean =>
       slices.some((s) => s.file === file && s.startLine <= L && s.endLine >= L);
-    const uncovered: number[] = [];
+    // BOUND — clamp every region to the file's real line span, then MERGE the
+    // clamped spans before walking lines. Two failure modes this closes, both
+    // reachable from `hayven mcp`'s client-supplied `regions` arg:
+    //   - one huge `endLine` (a client using MAX_SAFE_INTEGER as a "whole file"
+    //     sentinel) walked the whole range against a 10-line file — measured at
+    //     197s for 2e10, ~years for 2^53, with the synchronous stdio server
+    //     pegged and unable to answer another call;
+    //   - many overlapping regions multiplied the per-line `covered()` scan.
+    // After clamp+merge the per-line work is bounded by the FILE's length no
+    // matter what the caller sends, so a future caller cannot reintroduce this.
+    const spans: Array<[number, number]> = [];
     for (const region of regions) {
-      const lo = Math.min(region.startLine, region.endLine);
-      const hi = Math.max(region.startLine, region.endLine);
-      for (let L = lo; L <= hi; L++) {
-        if (L >= 1 && L <= fileLines.length && !covered(L)) uncovered.push(L);
-      }
+      const lo = Math.max(1, Math.min(region.startLine, region.endLine));
+      const hi = Math.min(fileLines.length, Math.max(region.startLine, region.endLine));
+      // NaN/Infinity fall out here: every comparison against them is false.
+      if (Number.isFinite(lo) && Number.isFinite(hi) && hi >= lo) spans.push([lo, hi]);
+    }
+    spans.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    const merged: Array<[number, number]> = [];
+    for (const [lo, hi] of spans) {
+      const last = merged[merged.length - 1];
+      if (last && lo <= last[1] + 1) last[1] = Math.max(last[1], hi);
+      else merged.push([lo, hi]);
+    }
+    const uncovered: number[] = [];
+    for (const [lo, hi] of merged) {
+      for (let L = lo; L <= hi; L++) if (!covered(L)) uncovered.push(L);
     }
     uncovered.sort((a, b) => a - b);
     let i = 0;

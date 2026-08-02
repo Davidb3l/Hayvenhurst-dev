@@ -42,8 +42,10 @@ import {
   type StableContextOptions,
   type StableContextResult,
 } from "../db/context_helper.ts";
+import { resolveWithinRepo } from "../db/context_pack.ts";
 import type { ChangeRegion, ContextPackOptions } from "../db/context_pack.ts";
 import type { Db } from "../db/queries.ts";
+import { isAbsolute } from "node:path";
 
 /** The protocol version we advertise in the `initialize` result. MCP pins the
  *  wire contract by date; this is the revision the handshake below implements. */
@@ -87,43 +89,93 @@ const ERR_INTERNAL = -32603;
 // Tool input schemas (advertised by `tools/list`, validated in `tools/call`).
 // ---------------------------------------------------------------------------
 
-/** A single changed region — mirrors {@link ChangeRegion} exactly. */
+/** Largest `startLine`/`endLine` we accept. No source file on earth has 10M
+ *  lines; anything above it is a client sentinel (a "whole file" marker like
+ *  `Number.MAX_SAFE_INTEGER`) or a typo, and MUST be refused at the wire rather
+ *  than turned into work. See {@link readRegions}. */
+const MAX_REGION_LINE = 10_000_000;
+
+/** Max regions per call. A change set is a handful of hunks; thousands is a
+ *  client bug or an attempt to multiply per-region work inside the packer. */
+const MAX_REGIONS = 1024;
+
+/** Max symbols per `context_for_symbols` call. Each costs a node lookup plus an
+ *  FTS5 fuzzy resolve; see the bound note at the call site. */
+const MAX_SYMBOLS = 1024;
+
+/** A single changed region — mirrors {@link ChangeRegion} exactly. The bounds
+ *  are advertised, not just enforced, so a client can see them before it sends
+ *  a sentinel. {@link readRegions} is the enforcement. */
 const CHANGE_REGION_SCHEMA = {
   type: "object",
   properties: {
-    startLine: { type: "integer", description: "1-based inclusive first changed line." },
-    endLine: { type: "integer", description: "1-based inclusive last changed line." },
+    startLine: {
+      type: "integer",
+      minimum: 1,
+      maximum: MAX_REGION_LINE,
+      description: "1-based inclusive first changed line.",
+    },
+    endLine: {
+      type: "integer",
+      minimum: 1,
+      maximum: MAX_REGION_LINE,
+      description:
+        "1-based inclusive last changed line; must be >= startLine. There is NO " +
+        '"whole file" sentinel — pass the file\'s real last line.',
+    },
   },
   required: ["startLine", "endLine"],
   additionalProperties: false,
 } as const;
 
-/** The optional pack-shaping knobs shared by both tools — the subset of
- *  {@link ContextPackOptions} that is a plain scalar (the function-valued
- *  `fenceLangFor` and the object-valued `prior` are handled separately). */
+/**
+ * The optional pack-shaping knobs shared by both tools — the subset of
+ * {@link ContextPackOptions} that is a plain scalar (the function-valued
+ * `fenceLangFor` and the object-valued `prior` are handled separately).
+ *
+ * `maxCallers` and `importedSymbols` are NOT here even though
+ * {@link ContextPackOptions} carries them. Both tools route through
+ * `buildContextPackForSymbols` (the multi-root path), and only the SINGLE-symbol
+ * `buildContextPack` implements the caller hop and the imported-symbol pass — so
+ * advertising them here promised behavior the server silently could not deliver
+ * (verified: `importedSymbols: true` returned byte-identical output to `false`).
+ * See {@link UNSUPPORTED_PACK_OPTS}, which refuses them loudly instead.
+ */
 const PACK_OPT_PROPERTIES = {
   neighbors: {
     type: "boolean",
     description: "Include 1-hop callee/ref neighbors (default true).",
   },
-  maxNeighbors: { type: "integer", description: "Max neighbor slices (default 10)." },
+  maxNeighbors: {
+    type: "integer",
+    minimum: 0,
+    description: "Max neighbor slices (default 10; 0 = none).",
+  },
   maxHeaderLines: {
     type: "integer",
+    minimum: 0,
     description: "Max lines pulled into the module-scope header (default 120).",
   },
   maxRefSliceLines: {
     type: "integer",
+    minimum: 1,
     description: "Cap an included referenced-type slice to its first N lines (default 12).",
   },
-  maxCallers: {
-    type: "integer",
-    description: "Opt-in incoming-caller hop: max callers to inline (default 0 = off).",
-  },
-  importedSymbols: {
-    type: "boolean",
-    description: "Opt-in cross-file imported non-node symbols (default false).",
-  },
 } as const;
+
+/** Knobs a client may plausibly send (they exist on the library's option type
+ *  and were once advertised here) that this surface CANNOT honour. These get a
+ *  NAMED reason; every other unknown key is refused generically by
+ *  {@link rejectUnknownArgs}. A silently ignored knob is a client shipping a
+ *  prompt it believes contains context it does not. */
+const UNSUPPORTED_PACK_OPTS: Record<string, string> = {
+  maxCallers:
+    "the incoming-caller hop is implemented only on the single-symbol pack path, " +
+    "which neither MCP tool uses",
+  importedSymbols:
+    "cross-file imported non-node symbols are implemented only on the " +
+    "single-symbol pack path, which neither MCP tool uses",
+};
 
 /** The `prior` continuation input. Opaque to the client EXCEPT that it round-trips
  *  a prior tool result; we describe it loosely so the schema stays small but the
@@ -194,19 +246,81 @@ const TOOLS = [
 // Argument coercion — read the JSON tool args into the helper's option shapes.
 // ---------------------------------------------------------------------------
 
-/** Read the scalar pack opts off the tool args, ignoring absent/ill-typed ones
- *  so the helper falls back to its own defaults. Plus the append-only `prior`
- *  continuation (passed straight through — it is opaque DATA the client owns). */
-function packOptsFrom(args: Record<string, unknown>): StableContextOptions {
+/**
+ * Enforce the `additionalProperties: false` that both tool schemas ALREADY
+ * declare. Returns an error message for the first unknown key, or `null`.
+ *
+ * Without this, "refuse loudly, never accept-and-ignore" was a two-item
+ * denylist rather than a policy: `maxCallers` hard-errored while `maxCalers`
+ * (one-char typo) and `maxNeighbours` (British spelling) were swallowed with
+ * byte-identical output and no signal. Erroring here is the server agreeing
+ * with the schema it publishes. Derived FROM the schema so the two cannot drift.
+ */
+function rejectUnknownArgs(toolName: string, args: Record<string, unknown>): string | null {
+  const tool = TOOLS.find((t) => t.name === toolName);
+  if (!tool) return null;
+  const allowed = new Set<string>(Object.keys(tool.inputSchema.properties));
+  for (const key of Object.keys(args)) {
+    if (allowed.has(key)) continue;
+    // A knob we deliberately dropped gets its specific reason instead of the
+    // generic "unknown"; the client asked for something real that we cannot do.
+    const named = UNSUPPORTED_PACK_OPTS[key];
+    if (named) return `\`${key}\` is not supported here: ${named}.`;
+    return `unknown argument \`${key}\` for ${toolName} (schema is additionalProperties: false).`;
+  }
+  return null;
+}
+
+/** Upper bound for the integer pack knobs. They only ever CAP work, so a huge
+ *  value is not itself a wedge — but `maxHeaderLines: 1e18` is a client bug, and
+ *  a knob that silently means something other than what was asked is the class
+ *  of defect this surface is being hardened against. */
+const MAX_PACK_OPT = 100_000;
+
+/**
+ * Read one integer pack knob. Returns `undefined` when absent (the helper's own
+ * default applies) or a string error message when present-but-invalid.
+ *
+ * Rejects rather than ignores: `typeof === "number"` used to be the whole check,
+ * so `maxRefSliceLines: -1000000` sailed through and produced slices with
+ * `endLine < startLine` inside the `order` continuation the client threads back,
+ * plus a negative `lineCount`. (The packer now floors these too — this is the
+ * wire-level half, and it is the half that TELLS the client.)
+ */
+function readIntOpt(
+  args: Record<string, unknown>,
+  key: string,
+  min: number,
+): number | undefined | string {
+  const v = args[key];
+  if (v === undefined) return undefined;
+  if (!Number.isInteger(v)) return `\`${key}\` must be an integer.`;
+  const n = v as number;
+  if (n < min) return `\`${key}\` must be >= ${min} (got ${n}).`;
+  if (n > MAX_PACK_OPT) return `\`${key}\` must be <= ${MAX_PACK_OPT} (got ${n}).`;
+  return n;
+}
+
+/** Read the scalar pack opts off the tool args. Returns a string error message
+ *  (for ERR_INVALID_PARAMS) when a knob is present but invalid or unsupported.
+ *  Plus the append-only `prior` continuation (passed straight through — it is
+ *  opaque DATA the client owns). */
+function packOptsFrom(args: Record<string, unknown>): StableContextOptions | string {
   const opts: StableContextOptions = {};
-  if (typeof args["neighbors"] === "boolean") opts.neighbors = args["neighbors"];
-  if (typeof args["maxNeighbors"] === "number") opts.maxNeighbors = args["maxNeighbors"];
-  if (typeof args["maxHeaderLines"] === "number") opts.maxHeaderLines = args["maxHeaderLines"];
-  if (typeof args["maxRefSliceLines"] === "number")
-    opts.maxRefSliceLines = args["maxRefSliceLines"];
-  if (typeof args["maxCallers"] === "number") opts.maxCallers = args["maxCallers"];
-  if (typeof args["importedSymbols"] === "boolean")
-    opts.importedSymbols = args["importedSymbols"];
+  if (args["neighbors"] !== undefined) {
+    if (typeof args["neighbors"] !== "boolean") return "`neighbors` must be a boolean.";
+    opts.neighbors = args["neighbors"];
+  }
+  for (const [key, min] of [
+    ["maxNeighbors", 0],
+    ["maxHeaderLines", 0],
+    // 0 would yield an inverted slice range (`start .. start-1`); 1 is the floor.
+    ["maxRefSliceLines", 1],
+  ] as const) {
+    const got = readIntOpt(args, key, min);
+    if (typeof got === "string") return got;
+    if (got !== undefined) opts[key] = got;
+  }
   // The continuation: pass the whole prior result back as DATA. We trust its
   // shape — it is something WE returned to the client on a previous call — but
   // only forward it when it actually looks like a result (has an `order` array),
@@ -226,24 +340,51 @@ function isStableResultish(v: unknown): boolean {
   );
 }
 
-/** Coerce the `regions` arg into validated {@link ChangeRegion}[]. Returns a
- *  string error message (for ERR_INVALID_PARAMS) when malformed. */
+/**
+ * Coerce the `regions` arg into validated {@link ChangeRegion}[]. Returns a
+ * string error message (for ERR_INVALID_PARAMS) when malformed.
+ *
+ * BOUNDS — this used to check only `typeof === "number"`, with no magnitude
+ * limit and no ordering rule. The packer's gap-fill then walked the whole
+ * `[startLine..endLine]` range: a single `endLine: 2e10` against a 10-line file
+ * measured 197 SECONDS, and `Number.MAX_SAFE_INTEGER` (a plausible "the whole
+ * file" sentinel from a client) extrapolates to years. The stdio server is
+ * synchronous and single-process, so that is not a slow call — it is a
+ * PERMANENTLY WEDGED server: no further tool calls, DB handle held, one core
+ * pinned, no error and no log line. Reject rather than clamp, so a client
+ * sending a sentinel learns it was wrong instead of silently getting a
+ * different file's worth of context than it asked for.
+ *
+ * The packer ALSO clamps regions to the file's real line count (see
+ * `buildContextPackForChange`); that is the intrinsic bound protecting every
+ * other caller (CLI, daemon route, proxy). This is the wire-level one.
+ */
 function readRegions(raw: unknown): ChangeRegion[] | string {
   if (!Array.isArray(raw)) return "`regions` must be an array of {startLine,endLine}.";
+  if (raw.length > MAX_REGIONS) {
+    return `too many regions (${raw.length} > ${MAX_REGIONS}).`;
+  }
   const out: ChangeRegion[] = [];
   for (const r of raw) {
-    if (
-      typeof r !== "object" ||
-      r === null ||
-      typeof (r as ChangeRegion).startLine !== "number" ||
-      typeof (r as ChangeRegion).endLine !== "number"
-    ) {
+    if (typeof r !== "object" || r === null) {
       return "each region must be an object with numeric `startLine` and `endLine`.";
     }
-    out.push({
-      startLine: (r as ChangeRegion).startLine,
-      endLine: (r as ChangeRegion).endLine,
-    });
+    const { startLine, endLine } = r as ChangeRegion;
+    // `Number.isInteger` rejects non-numbers, NaN, ±Infinity and fractions in
+    // one predicate — all of which produce a nonsense or non-terminating range.
+    if (!Number.isInteger(startLine) || !Number.isInteger(endLine)) {
+      return "each region must be an object with integer `startLine` and `endLine`.";
+    }
+    if (startLine < 1 || endLine < 1) {
+      return "region lines are 1-based; `startLine` and `endLine` must be >= 1.";
+    }
+    if (endLine < startLine) {
+      return "each region must have `endLine` >= `startLine`.";
+    }
+    if (endLine > MAX_REGION_LINE) {
+      return `region \`endLine\` exceeds the ${MAX_REGION_LINE}-line limit (got ${endLine}).`;
+    }
+    out.push({ startLine, endLine });
   }
   return out;
 }
@@ -327,13 +468,32 @@ export function createContextMcpServer(db: Db, repoRoot: string): ContextMcpServ
         : {};
 
     if (name === "context_for_change") {
+      const unknown = rejectUnknownArgs(name, args);
+      if (unknown) return fail(id, ERR_INVALID_PARAMS, unknown);
       const file = args["file"];
       if (typeof file !== "string" || file.length === 0) {
         return fail(id, ERR_INVALID_PARAMS, "`file` (string) is required.");
       }
+      // SECURITY — `file` is fully client-controlled and flows into a
+      // `readFileSync`. An MCP host (or a prompt injection riding inside an
+      // indexed source file, which is the same thing once an agent relays it)
+      // could otherwise ask for `/etc/passwd`, `~/.aws/credentials`, `.env` or
+      // `~/.ssh/id_rsa` and get the contents back inside a model prompt. The
+      // packer enforces containment too (`resolveWithinRepo` in the file
+      // reader); refusing HERE is what turns a silent empty result into a
+      // visible protocol error, and what rejects an absolute path outright —
+      // this tool's contract is a REPO-RELATIVE path.
+      if (isAbsolute(file)) {
+        return fail(id, ERR_INVALID_PARAMS, "`file` must be repo-relative, not absolute.");
+      }
+      if (resolveWithinRepo(repoRoot, file) === null) {
+        return fail(id, ERR_INVALID_PARAMS, "`file` resolves outside the repository.");
+      }
       const regions = readRegions(args["regions"]);
       if (typeof regions === "string") return fail(id, ERR_INVALID_PARAMS, regions);
-      const result = contextForChange(db, repoRoot, file, regions, packOptsFrom(args));
+      const opts = packOptsFrom(args);
+      if (typeof opts === "string") return fail(id, ERR_INVALID_PARAMS, opts);
+      const result = contextForChange(db, repoRoot, file, regions, opts);
       if (!result) {
         return ok(
           id,
@@ -347,6 +507,8 @@ export function createContextMcpServer(db: Db, repoRoot: string): ContextMcpServ
     }
 
     if (name === "context_for_symbols") {
+      const unknown = rejectUnknownArgs(name, args);
+      if (unknown) return fail(id, ERR_INVALID_PARAMS, unknown);
       const symbolsRaw = args["symbols"];
       if (
         !Array.isArray(symbolsRaw) ||
@@ -358,7 +520,20 @@ export function createContextMcpServer(db: Db, repoRoot: string): ContextMcpServ
       if (symbols.length === 0) {
         return fail(id, ERR_INVALID_PARAMS, "`symbols` must be non-empty.");
       }
-      const result = contextForSymbols(db, repoRoot, symbols, packOptsFrom(args));
+      // BOUND — same class as `regions`' MAX_REGIONS. Every element costs a
+      // `getNode` plus an FTS5 fuzzy lookup, so an unbounded array is a
+      // linear-cost wedge of the synchronous stdio server; one 64 MB request
+      // line holds millions of short strings. A pack is a handful of symbols.
+      if (symbols.length > MAX_SYMBOLS) {
+        return fail(
+          id,
+          ERR_INVALID_PARAMS,
+          `too many symbols (${symbols.length} > ${MAX_SYMBOLS}).`,
+        );
+      }
+      const opts = packOptsFrom(args);
+      if (typeof opts === "string") return fail(id, ERR_INVALID_PARAMS, opts);
+      const result = contextForSymbols(db, repoRoot, symbols, opts);
       if (!result) {
         return ok(
           id,
@@ -436,10 +611,37 @@ export function createContextMcpServer(db: Db, repoRoot: string): ContextMcpServ
 // ---------------------------------------------------------------------------
 
 /**
+ * Max characters we will hold for ONE not-yet-terminated line. Generous against
+ * the largest legitimate request — a `prior` continuation round-trips a whole
+ * rendered pack — while still bounded: without a cap, a client that opens a
+ * connection and never sends a newline grows the buffer until the process is
+ * OOM-killed. */
+export const MAX_PENDING_LINE_CHARS = 64 * 1024 * 1024;
+
+/**
+ * Max characters in ONE response line.
+ *
+ * The input side was capped while the OUTPUT side was not, which is the wrong
+ * way round for an amplifier: a 156-BYTE `context_for_change` request naming a
+ * 32 MiB in-repo file produced a 67.1 MB response (430,000x), and a 100 MiB
+ * file reached `RangeError: Out of memory` on the real stdio path — inside
+ * `JSON.stringify`, i.e. before a single byte could be written or logged. The
+ * packer's {@link MAX_PACK_FILE_BYTES} bound makes that hard to reach now; this
+ * is the belt to that braces, and it turns an OOM crash into an error a client
+ * can read. */
+export const MAX_RESPONSE_CHARS = 16 * 1024 * 1024;
+
+/**
  * Run the server over a newline-delimited (one JSON object per line) JSON-RPC
  * stream. Reads requests from `input`, writes responses to `write`. Each inbound
  * line is parsed independently; a parse error yields a JSON-RPC parse-error
  * response (id `null`, per spec). Returns when the input stream ends.
+ *
+ * A line that exceeds {@link MAX_PENDING_LINE_CHARS} is refused with a JSON-RPC
+ * invalid-request error and then SKIPPED to the next newline — the framing has
+ * already been violated, so the only safe resynchronisation point is the next
+ * line boundary. Dropping it loudly beats buffering it until the OOM killer
+ * takes the whole server down mid-session.
  *
  * Split out from the loop's I/O so the framing is testable without real fds:
  * the test drives {@link createContextMcpServer}'s `handle` directly; this
@@ -452,8 +654,45 @@ export async function runStdioLoop(
 ): Promise<void> {
   const decoder = new TextDecoder();
   let buf = "";
+  /** True while we are discarding the tail of an over-long line. */
+  let skipping = false;
   const emit = (resp: JsonRpcResponse | null): void => {
-    if (resp !== null) write(JSON.stringify(resp) + "\n");
+    if (resp === null) return;
+    let line: string;
+    try {
+      line = JSON.stringify(resp);
+    } catch (err) {
+      // `JSON.stringify` is where a too-large response actually dies (a
+      // RangeError, thrown before anything reaches stdout). Answer the client
+      // instead of taking the server down mid-session.
+      write(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: (resp as { id: string | number | null }).id,
+          error: {
+            code: ERR_INTERNAL,
+            message: `response could not be serialized: ${(err as Error).message}`,
+          },
+        }) + "\n",
+      );
+      return;
+    }
+    if (line.length > MAX_RESPONSE_CHARS) {
+      write(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: (resp as { id: string | number | null }).id,
+          error: {
+            code: ERR_INTERNAL,
+            message:
+              `response of ${line.length} chars exceeds the ${MAX_RESPONSE_CHARS}-char ` +
+              "limit — narrow the request (fewer regions/symbols, or a smaller file)",
+          },
+        }) + "\n",
+      );
+      return;
+    }
+    write(line + "\n");
   };
   const processLine = (line: string): void => {
     const trimmed = line.trim();
@@ -468,15 +707,57 @@ export async function runStdioLoop(
     emit(server.handle(req));
   };
 
+  const tooLong = (): void => {
+    emit({
+      jsonrpc: "2.0",
+      id: null,
+      error: {
+        code: ERR_INVALID_REQUEST,
+        message: `line exceeds ${MAX_PENDING_LINE_CHARS} chars — discarded`,
+      },
+    });
+  };
+
   for await (const chunk of input) {
-    buf += typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
-    let nl: number;
-    while ((nl = buf.indexOf("\n")) >= 0) {
+    // Decode BEFORE the skip branch so a multi-byte character split across the
+    // chunk boundary is still stitched by the streaming decoder — dropping the
+    // chunk undecoded would corrupt the first character of the NEXT line.
+    const text = typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
+    if (skipping) {
+      // Still inside the over-long line: throw characters away until a newline
+      // gives us a clean frame boundary again.
+      const nl = text.indexOf("\n");
+      if (nl < 0) continue;
+      skipping = false;
+      buf = text.slice(nl + 1);
+    } else {
+      buf += text;
+    }
+    // Drain complete lines, refusing any SINGLE line longer than the cap. The
+    // length test lives inside this loop, not after it, so the cap is absolute:
+    // an over-long line whose terminating newline arrives in the same chunk as
+    // the overflow is refused too, rather than being parsed because the buffer
+    // happened to be drained before the check.
+    for (;;) {
+      const nl = buf.indexOf("\n");
+      if ((nl < 0 ? buf.length : nl) > MAX_PENDING_LINE_CHARS) {
+        tooLong();
+        if (nl < 0) {
+          // No boundary yet — drop what we hold and skip to the next newline.
+          buf = "";
+          skipping = true;
+          break;
+        }
+        buf = buf.slice(nl + 1); // drop the whole over-long line, keep the rest
+        continue;
+      }
+      if (nl < 0) break;
       const line = buf.slice(0, nl);
       buf = buf.slice(nl + 1);
       processLine(line);
     }
   }
-  // Flush a trailing line with no terminating newline.
-  if (buf.trim().length > 0) processLine(buf);
+  // Flush a trailing line with no terminating newline (never the discarded tail
+  // of an over-long one).
+  if (!skipping && buf.trim().length > 0) processLine(buf);
 }

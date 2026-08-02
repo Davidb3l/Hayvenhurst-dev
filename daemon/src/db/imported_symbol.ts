@@ -43,6 +43,7 @@ import { isAbsolute, join } from "node:path";
 
 import { IMPORT_KIND } from "./graph_walk.ts";
 import type { Db, NodeRow } from "./queries.ts";
+import { resolveWithinRepo } from "./context_pack.ts";
 import type { ContextSlice } from "./context_pack.ts";
 
 export interface ImportedSymbolOptions {
@@ -85,8 +86,15 @@ function makeFileReader(repoRoot: string) {
     if (cache.has(file)) return cache.get(file) ?? null;
     let lines: string[] | null = null;
     try {
-      const abs = isAbsolute(file) ? file : join(repoRoot, file);
-      lines = readFileSync(abs, "utf8").split("\n");
+      // Containment-checked, exactly like `context_pack.ts`'s reader. Reading
+      // `isAbsolute(file) ? file : join(repoRoot, file)` verbatim — as this did
+      // — will read ANY file on disk, and a symlink inside the repo is enough
+      // to reach one: a `repo/env.ts` pointing at an out-of-tree secret had its
+      // contents returned straight into a context pack. Not MCP-reachable today
+      // only by accident, but `hayven context`, fleet-context and the
+      // orchestrator all reach here.
+      const abs = resolveWithinRepo(repoRoot, file);
+      lines = abs === null ? null : readFileSync(abs, "utf8").split("\n");
     } catch {
       lines = null;
     }

@@ -16,8 +16,29 @@ interface SyncSummary {
   pushedSegments: number;
   pushedBytes: number;
   roundTrips: number;
+  /** Segments the far side refused (F4 bounds: bad segment day, oversized
+   *  batch, segment at its cap). Counted and reported, NEVER fatal — see the
+   *  note on the transfer loops below. */
+  refusedSegments: number;
   startedAtMs: number;
   finishedAtMs: number;
+}
+
+/**
+ * A segment transfer that the receiver REFUSED (HTTP 4xx), as opposed to a
+ * transport failure. Matched against the exact message `postJson` builds:
+ * `POST <url> → <status>: <body>`. Exported for the lane-F regression test —
+ * the distinction between "skip this segment" and "abort the sync" must not be
+ * able to drift silently. F4 added real rejections to `/api/sync/push`, and letting
+ * one of them abort `runSyncWith` would be a much worse bug than the one it
+ * guards: a single peer segment stamped with a skewed clock would permanently
+ * prevent every OTHER segment in the session from transferring, on every run.
+ * So a refusal skips that segment, is counted, and the sync continues.
+ */
+export function isRefusal(err: unknown): boolean {
+  const msg = (err as Error | undefined)?.message ?? "";
+  // The trailing (?!\d) matters: without it a bogus "4000" would read as a 4xx.
+  return /→ 4\d\d(?!\d)/.test(msg);
 }
 
 export async function runSync(args: ParsedArgs): Promise<number> {
@@ -77,6 +98,7 @@ export async function runSync(args: ParsedArgs): Promise<number> {
     pushedSegments: 0,
     pushedBytes: 0,
     roundTrips: 0,
+    refusedSegments: 0,
     startedAtMs: Date.now(),
     finishedAtMs: 0,
   };
@@ -341,15 +363,25 @@ async function runSyncWith(
     summary.pulledBytes += bytes.length;
     summary.roundTrips += 1;
     for (const batch of splitSegmentBatches(bytes)) {
-      await postJson(
-        `${localUrl}/api/sync/push`,
-        {
-          type: target.type,
-          path: target.path,
-          batch: bufferToBase64(batch),
-        },
-        localHeaders,
-      );
+      try {
+        await postJson(
+          `${localUrl}/api/sync/push`,
+          {
+            type: target.type,
+            path: target.path,
+            batch: bufferToBase64(batch),
+          },
+          localHeaders,
+        );
+      } catch (err) {
+        if (!isRefusal(err)) throw err;
+        summary.refusedSegments += 1;
+        process.stderr.write(
+          `sync: local daemon refused ${target.type}/${target.path} — ` +
+            `${(err as Error).message}\n`,
+        );
+        break; // the whole segment is unacceptable; move to the next one
+      }
     }
   }
 
@@ -361,15 +393,25 @@ async function runSyncWith(
     summary.pushedBytes += bytes.length;
     for (const batch of splitSegmentBatches(bytes)) {
       summary.roundTrips += 1;
-      await postJson(
-        `${peerUrl}/api/sync/push`,
-        {
-          type: target.type,
-          path: target.path,
-          batch: bufferToBase64(batch),
-        },
-        peerHeaders,
-      );
+      try {
+        await postJson(
+          `${peerUrl}/api/sync/push`,
+          {
+            type: target.type,
+            path: target.path,
+            batch: bufferToBase64(batch),
+          },
+          peerHeaders,
+        );
+      } catch (err) {
+        if (!isRefusal(err)) throw err;
+        summary.refusedSegments += 1;
+        process.stderr.write(
+          `sync: peer refused ${target.type}/${target.path} — ` +
+            `${(err as Error).message}\n`,
+        );
+        break;
+      }
     }
   }
 
@@ -463,6 +505,7 @@ function renderSummary(s: SyncSummary, upToDate: boolean): string {
     `- Pulled: ${s.pulledSegments} segments, ${formatBytes(s.pulledBytes)}\n` +
     `- Pushed: ${s.pushedSegments} segments, ${formatBytes(s.pushedBytes)}\n` +
     `- Round-trips: ${s.roundTrips}\n` +
+    (s.refusedSegments > 0 ? `- Refused:  ${s.refusedSegments} segments (see stderr)\n` : "") +
     `- Duration:    ${dur} ms\n`
   );
 }

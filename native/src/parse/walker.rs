@@ -170,11 +170,9 @@ pub fn discover(root: &Path, opts: &WalkOptions) -> Vec<Candidate> {
     out
 }
 
-/// True iff this entry is a directory the walker must not descend into:
-/// always a build/VCS/cache artifact (`ALWAYS_SKIP_DIRS`); unless
-/// `include_vendored`, a dependency-source dir (`VENDORED_DIRS`); and unless
-/// `include_fixtures`, a fixture-like dir (`FIXTURE_LIKE_DIRS`) or a
-/// `fixtures/` dir with a test-dir ancestor (`FIXTURE_ANCESTOR_DIRS`).
+/// True iff this entry is a directory the walker must not descend into.
+/// Thin `DirEntry` adapter over [`is_pruned_dir_name`], which is the shared
+/// decision the incremental and watch paths use too (see `parse::scope`).
 fn is_skipped_dir(
     entry: &DirEntry,
     root: &Path,
@@ -188,26 +186,52 @@ fn is_skipped_dir(
         Some(n) => n,
         None => return false,
     };
+    // Only REPO-RELATIVE ancestors count for the fixture check (never the path
+    // above the walk root): a repo that happens to live under a directory
+    // named `test` on the user's disk must keep its own `fixtures/` indexed.
+    let rel = entry.path().strip_prefix(root).unwrap_or(entry.path());
+    is_pruned_dir_name(name, rel, include_vendored, include_fixtures)
+}
+
+/// THE directory-scope decision, shared by all three paths that need it: the
+/// full walk's `filter_entry`, the incremental `--files-stdin` path, and the
+/// watcher. `name` is the directory's own file name; `rel` is its path
+/// RELATIVE TO THE WALK ROOT (needed for the fixture-ancestor rule).
+///
+/// A directory is pruned when it is: always a build/VCS/cache artifact
+/// (`ALWAYS_SKIP_DIRS`); unless `include_vendored`, a dependency-source dir
+/// (`VENDORED_DIRS`); or unless `include_fixtures`, a fixture-like dir
+/// (`FIXTURE_LIKE_DIRS`) or a `fixtures/` dir with a test-dir ancestor
+/// (`FIXTURE_ANCESTOR_DIRS`).
+///
+/// F5: this used to exist only inside the walker, and the watcher carried a
+/// hand-copied subset of `ALWAYS_SKIP_DIRS` that had drifted (no `vendor`,
+/// no `examples`, no fixtures) while the `--files-stdin` path applied no
+/// directory rules at all. Keep this the ONLY place the lists are consulted.
+pub fn is_pruned_dir_name(
+    name: &str,
+    rel: &Path,
+    include_vendored: bool,
+    include_fixtures: bool,
+) -> bool {
     ALWAYS_SKIP_DIRS.contains(&name)
         || (!include_vendored && VENDORED_DIRS.contains(&name))
-        || (!include_fixtures && is_fixture_dir(entry, root, name))
+        || (!include_fixtures && is_fixture_dir(rel, name))
 }
 
 /// True iff this directory is fixture-like: NAMED `examples`/`benchmark(s)`
 /// (any depth), or NAMED `fixtures` with ANY ancestor path component in
-/// `FIXTURE_ANCESTOR_DIRS`. The ancestor walk needs the entry's full path — a
-/// bare `src/fixtures/` (first-party module, no test-dir ancestor) must NOT be
-/// skipped, while `pkg/test/fixtures/` and the nested
+/// `FIXTURE_ANCESTOR_DIRS`. `rel` is the directory's path relative to the walk
+/// root — a bare `src/fixtures/` (first-party module, no test-dir ancestor)
+/// must NOT be skipped, while `pkg/test/fixtures/` and the nested
 /// `pkg/test/functions/fixtures/` both must.
-fn is_fixture_dir(entry: &DirEntry, root: &Path, name: &str) -> bool {
+fn is_fixture_dir(rel: &Path, name: &str) -> bool {
     if FIXTURE_LIKE_DIRS.contains(&name) {
         return true;
     }
     if name != "fixtures" {
         return false;
     }
-    // Only REPO-RELATIVE ancestors count (never the path above the walk root).
-    let rel = entry.path().strip_prefix(root).unwrap_or(entry.path());
     rel.ancestors().skip(1).any(|a| {
         a.file_name()
             .and_then(|n| n.to_str())

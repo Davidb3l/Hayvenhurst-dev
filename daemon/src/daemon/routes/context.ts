@@ -14,7 +14,9 @@
  *   - `GET /api/context?task=<text>&top=N`  — task mode: resolve a natural-language
  *       task to candidate symbols via the embedding-free FTS path
  *       (`resolveTaskToSymbols`), pack each, and return
- *       `{ task, resolved: string[], packs: ContextPack[] }`.
+ *       `{ task, resolved: string[], packs: ContextPack[] }`. `top` is capped
+ *       (see {@link MAX_TOP}); an out-of-range knob is a 400, never a silent
+ *       substitution.
  *
  * Entity ids contain `/` (e.g. `utils/cookie/parse`); Elysia path params don't
  * capture slashes, so — exactly like `routes/nodes.ts` — we accept the symbol
@@ -64,23 +66,66 @@ function notFound(set: { status?: number | string }, symbol: string) {
   };
 }
 
-/** Parse a query value as a positive-ish int, or `undefined` when absent/invalid
- *  (so the packer falls back to its own default). */
-function intParam(v: unknown): number | undefined {
+/**
+ * Hard ceiling for `?top=N` in task mode.
+ *
+ * EVERY resolved symbol costs a full {@link buildContextPack}: graph walks plus
+ * a whole-file read each, all on the daemon's SINGLE event loop. `intParam`
+ * accepted any finite number, so `?top=1e9` on a 600-entity repo with 500 KB
+ * files measured 440 ms, 135 MB RSS and ~300 MB read — and the daemon has no
+ * Origin gate, so any web page open in the user's browser can fire that at
+ * 127.0.0.1:7777 in a loop. The MCP wire caps its equivalent (`MAX_SYMBOLS`);
+ * this is the HTTP twin of that cap.
+ */
+const MAX_TOP = 50;
+const DEFAULT_TOP = 3;
+
+/** Ceiling for the integer packer knobs. They only ever CAP work, but an
+ *  unvalidated one is how `maxRefSliceLines=-1` produced inverted slice ranges. */
+const MAX_PACK_OPT = 100_000;
+
+/** A bounded integer query param. Returns the value, `undefined` when absent,
+ *  or an ERROR OBJECT when present-but-invalid — the route turns that into a
+ *  400 rather than silently substituting a default, so a client sending
+ *  `?maxNeighbors=-3` learns it was wrong instead of quietly getting a pack
+ *  with every neighbor dropped and an HTTP 200. */
+type IntParam = number | undefined | { error: string };
+
+function intParam(name: string, v: unknown, min: number, max: number): IntParam {
+  if (v === undefined) return undefined;
   if (typeof v !== "string" || v.length === 0) return undefined;
   const n = Number(v);
-  return Number.isFinite(n) ? Math.trunc(n) : undefined;
+  if (!Number.isFinite(n) || !Number.isInteger(n)) {
+    return { error: `\`${name}\` must be an integer (got ${v}).` };
+  }
+  if (n < min || n > max) {
+    return { error: `\`${name}\` must be between ${min} and ${max} (got ${n}).` };
+  }
+  return n;
+}
+
+function isParamError<T>(v: T | { error: string }): v is { error: string } {
+  return typeof v === "object" && v !== null && "error" in v;
 }
 
 /** Build the packer options from the shared query params. `neighbors` defaults
- *  to true; only `?neighbors=false` (or `=0`) turns it off. */
-function optsFromQuery(query: Record<string, string | undefined>): ContextPackOptions {
+ *  to true; only `?neighbors=false` (or `=0`) turns it off. Returns an error
+ *  object when a knob is present but out of range. */
+function optsFromQuery(
+  query: Record<string, string | undefined>,
+): ContextPackOptions | { error: string } {
   const neighbors = !(query["neighbors"] === "false" || query["neighbors"] === "0");
-  return {
-    neighbors,
-    maxNeighbors: intParam(query["maxNeighbors"]),
-    maxRefSliceLines: intParam(query["maxRefSliceLines"]),
-  };
+  const maxNeighbors = intParam("maxNeighbors", query["maxNeighbors"], 0, MAX_PACK_OPT);
+  if (isParamError(maxNeighbors)) return maxNeighbors;
+  // 0 would yield a `start .. start-1` slice; 1 is the floor.
+  const maxRefSliceLines = intParam(
+    "maxRefSliceLines",
+    query["maxRefSliceLines"],
+    1,
+    MAX_PACK_OPT,
+  );
+  if (isParamError(maxRefSliceLines)) return maxRefSliceLines;
+  return { neighbors, maxNeighbors, maxRefSliceLines };
 }
 
 export function contextRoutes(deps: ServerDependencies) {
@@ -102,9 +147,17 @@ export function contextRoutes(deps: ServerDependencies) {
               "or GET /api/context/<symbol> for a single symbol.",
           };
         }
-        const top = intParam(query["top"]);
-        const limit = top !== undefined && top > 0 ? top : 3;
+        const top = intParam("top", query["top"], 1, MAX_TOP);
+        if (isParamError(top)) {
+          set.status = 400;
+          return { error: top.error, hint: `\`top\` is capped at ${MAX_TOP}.` };
+        }
+        const limit = top ?? DEFAULT_TOP;
         const opts = optsFromQuery(query);
+        if (isParamError(opts)) {
+          set.status = 400;
+          return { error: opts.error };
+        }
         const resolved = resolveTaskToSymbols(deps.db, task, limit);
         const packs = resolved
           .map((id) => packFor(id, opts))
@@ -114,7 +167,12 @@ export function contextRoutes(deps: ServerDependencies) {
       // Single/already-encoded ids (`utils%2Fcookie%2Fparse`, or a slash-free id).
       .get("/api/context/:symbol", ({ params, query, set }) => {
         const symbol = decodePathId(params.symbol);
-        const pack = packFor(symbol, optsFromQuery(query));
+        const opts = optsFromQuery(query);
+        if (isParamError(opts)) {
+          set.status = 400;
+          return { error: opts.error };
+        }
+        const pack = packFor(symbol, opts);
         if (!pack) return notFound(set, symbol);
         return pack;
       })
@@ -122,7 +180,12 @@ export function contextRoutes(deps: ServerDependencies) {
       // wildcard rejoins them into `params["*"]` so the id stays intact.
       .get("/api/context/*", ({ params, query, set }) => {
         const symbol = decodePathId(params["*"]);
-        const pack = packFor(symbol, optsFromQuery(query));
+        const opts = optsFromQuery(query);
+        if (isParamError(opts)) {
+          set.status = 400;
+          return { error: opts.error };
+        }
+        const pack = packFor(symbol, opts);
         if (!pack) return notFound(set, symbol);
         return pack;
       })

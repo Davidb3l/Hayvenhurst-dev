@@ -10,6 +10,7 @@
 pub mod extract;
 pub mod hash;
 pub mod language;
+pub mod scope;
 pub mod signature;
 pub mod walker;
 
@@ -27,6 +28,7 @@ use rayon::prelude::*;
 use crate::proto::Record;
 use crate::{version_record, VERSION};
 use language::Language;
+use scope::ScopeFilter;
 use walker::{Candidate, WalkOptions};
 
 /// CLI-facing options for `hayven-native parse`.
@@ -67,6 +69,22 @@ pub struct ParseOptions {
 /// pipe on big repos.
 const PROGRESS_INTERVAL: usize = 100;
 
+/// Bound on the number of fully-serialized records queued for the writer
+/// thread.
+///
+/// F6: this channel used to be `mpsc::channel` — UNBOUNDED. When the daemon
+/// reads our stdout slowly the writer thread blocks on the pipe, and with an
+/// unbounded queue every record the rayon workers produce in the meantime
+/// piles up in the child's RAM with nothing to stop it: a large repo can
+/// serialize far faster than a busy consumer drains, so peak RSS is set by the
+/// consumer's worst stall rather than by anything we control. A `sync_channel`
+/// makes the workers block instead, which is real backpressure — the parse
+/// slows to the consumer's rate rather than growing the heap. 4096 records is
+/// deep enough that ordinary jitter never stalls a worker (records are
+/// typically a few hundred bytes, so this is single-digit MB) and shallow
+/// enough that a genuinely stuck reader cannot run us out of memory.
+const RECORD_QUEUE_DEPTH: usize = 4096;
+
 /// Run the parse pipeline. Returns the exit code the process should
 /// use: `0` on success, `1` on fatal error (after a `Fatal` record has
 /// been written).
@@ -87,7 +105,12 @@ pub fn run(opts: ParseOptions) -> Result<i32> {
     };
 
     let candidates: Vec<Candidate> = if let Some(files) = &opts.explicit_files {
-        candidates_from_explicit_files(&root, files, &walk_opts)
+        // F5: the incremental path now applies the SAME scope decision as the
+        // full walk (prune lists + hidden + gitignore), not just language and
+        // size. Without it, `hayven ingest` and the watcher's re-ingest wrote
+        // different node sets into the same graph.
+        let scope = ScopeFilter::new(&root, &walk_opts);
+        candidates_from_explicit_files(&root, files, &walk_opts, &scope)
     } else {
         walker::discover(&root, &walk_opts)
     };
@@ -109,7 +132,7 @@ pub fn run(opts: ParseOptions) -> Result<i32> {
 
     // Wire up the ordered writer: workers send fully-encoded byte
     // buffers, the writer thread flushes them in receive order.
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(RECORD_QUEUE_DEPTH);
     let writer_handle = std::thread::spawn(move || -> io::Result<()> {
         let stdout = io::stdout();
         let mut out = BufWriter::new(stdout.lock());
@@ -217,7 +240,7 @@ pub fn run(opts: ParseOptions) -> Result<i32> {
 /// the writer thread. JSON serialization failure is unrecoverable here
 /// (it would only happen for non-finite floats, which we never emit),
 /// but we still degrade safely by skipping the record.
-fn send_record(tx: &mpsc::Sender<Vec<u8>>, rec: &Record) {
+fn send_record(tx: &mpsc::SyncSender<Vec<u8>>, rec: &Record) {
     let Ok(mut buf) = serde_json::to_vec(rec) else {
         return;
     };
@@ -238,10 +261,18 @@ fn send_record(tx: &mpsc::Sender<Vec<u8>>, rec: &Record) {
 /// would otherwise discard the base and parse an arbitrary file. This is
 /// defense-in-depth: today's only caller (the watcher) passes in-root
 /// relative paths, but the function must be safe for any future caller.
+///
+/// F5: `scope` applies the full walk's DIRECTORY rules (prune lists, hidden
+/// names, gitignore) that this path used to skip entirely. Before this, any
+/// build writing into a gitignored output directory got its generated
+/// artifacts written permanently into the graph by the watcher's re-ingest,
+/// while a full `hayven ingest` of the same repo excluded them — two paths
+/// disagreeing about what the graph contains.
 fn candidates_from_explicit_files(
     root: &Path,
     rels: &[String],
     opts: &WalkOptions,
+    scope: &ScopeFilter,
 ) -> Vec<Candidate> {
     let mut out = Vec::with_capacity(rels.len());
     for rel in rels {
@@ -261,6 +292,11 @@ fn candidates_from_explicit_files(
             continue;
         };
         if !full.starts_with(root) {
+            continue;
+        }
+        // Same scope decision the full walk makes. Applied BEFORE the language
+        // and metadata checks so a vendored/gitignored path costs no syscalls.
+        if !scope.accepts(&full, false) {
             continue;
         }
         let Some(language) = Language::from_path(&full) else {
@@ -317,7 +353,8 @@ mod tests {
                 .into_owned(),
         ];
 
-        let out = candidates_from_explicit_files(&root, &rels, &opts);
+        let scope = scope::ScopeFilter::new(&root, &opts);
+        let out = candidates_from_explicit_files(&root, &rels, &opts, &scope);
 
         assert_eq!(
             out.len(),
@@ -330,6 +367,74 @@ mod tests {
             out[0].path
         );
         assert!(out[0].path.ends_with("inside.py"));
+    }
+
+    /// F5, the exact reproduction from the finding: build a repo with `src/`,
+    /// `vendor/`, `examples/` and a gitignored `out/`, then compare what the
+    /// FULL walk indexes against what the INCREMENTAL `--files-stdin` path
+    /// indexes when handed every file in the tree. They must agree.
+    ///
+    /// Before the shared `ScopeFilter` this asserted the divergence: the full
+    /// walk produced `app.ts, lib.ts` while the incremental path additionally
+    /// produced the vendored, example, fixture and generated files.
+    #[test]
+    fn incremental_scope_matches_the_full_walk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonicalize");
+        // `require_git(true)` means .gitignore is inert outside a repo, so the
+        // fixture must be repo-shaped or this exercises the wrong branch.
+        std::fs::create_dir_all(root.join(".git")).expect("mkdir .git");
+        std::fs::write(root.join(".git/HEAD"), b"ref: refs/heads/main\n").expect("write HEAD");
+        std::fs::write(root.join(".gitignore"), b"out/\ncoverage/\n").expect("write gitignore");
+
+        let files = [
+            "src/app.ts",
+            "lib.ts",
+            "vendor/dep/vendored.ts",
+            "third_party/tp.ts",
+            "examples/demo.ts",
+            "benchmark/bench.ts",
+            "pkg/test/fixtures/app/fixture.ts",
+            "out/bundle.ts",
+            "coverage/generated.ts",
+            ".output/server.ts",
+            "node_modules/pkg/index.ts",
+        ];
+        for f in files {
+            let p = root.join(f);
+            std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&p, b"export const x = 1;\n").expect("write");
+        }
+
+        let opts = WalkOptions::default();
+        let mut full: Vec<String> = walker::discover(&root, &opts)
+            .into_iter()
+            .map(|c| rel_of(&root, &c.path))
+            .collect();
+        full.sort();
+
+        let scope = scope::ScopeFilter::new(&root, &opts);
+        let rels: Vec<String> = files.iter().map(|f| (*f).to_string()).collect();
+        let mut incremental: Vec<String> =
+            candidates_from_explicit_files(&root, &rels, &opts, &scope)
+                .into_iter()
+                .map(|c| rel_of(&root, &c.path))
+                .collect();
+        incremental.sort();
+
+        assert_eq!(
+            full, incremental,
+            "the full walk and the incremental path must index the SAME files"
+        );
+        // And that agreed-on set is the first-party one, not "everything".
+        assert_eq!(full, vec!["lib.ts".to_string(), "src/app.ts".to_string()]);
+    }
+
+    fn rel_of(root: &Path, p: &Path) -> String {
+        p.strip_prefix(root)
+            .unwrap_or(p)
+            .to_string_lossy()
+            .replace('\\', "/")
     }
 
     /// Vendored dependency dirs are skipped by default and included only when

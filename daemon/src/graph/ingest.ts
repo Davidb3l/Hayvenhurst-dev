@@ -8,7 +8,7 @@
 import { blake3 } from "@noble/hashes/blake3";
 
 import { deriveEntityId, unresolvedEdgeId } from "./idScheme.ts";
-import { writeNodeMarkdowns } from "./nodeWriter.ts";
+import { pruneOrphanNodeMarkdowns, writeNodeMarkdowns } from "./nodeWriter.ts";
 import { normalizePosix, SpecifierResolver } from "./specifierResolve.ts";
 import { WorkspaceMap } from "./workspace.ts";
 import type { GraphEdge, GraphNode, RawEdge } from "./types.ts";
@@ -19,6 +19,39 @@ import type { Logger } from "../util/log.ts";
 
 const NODE_BATCH = 1000;
 const EDGE_BATCH = 1000;
+
+/**
+ * HARD CAPS on a single ingest run — the "unbounded work with no user-visible
+ * signal" guard.
+ *
+ * A `hayven daemon` once indexed an entire home directory for six hours (98%
+ * CPU, 195 GB read, a 593 MB index) because nothing anywhere bounded how much
+ * an ingest could take on. `files_total` arrives in the native `start` record
+ * and was LOGGED but never checked against anything, and `nodes[]`/`rawEdges[]`
+ * are held in memory for the whole run (see the comment on those arrays), so
+ * heap grows linearly with repo size with no ceiling either.
+ *
+ * These caps are deliberately GENEROUS — far above any real first-party repo,
+ * chosen to catch "you are indexing something that is not a project" rather
+ * than to police large monorepos. Exceeding one FAILS LOUDLY with a message
+ * naming the cap and its override. A refusal that has not yet written anything
+ * (the file cap, evaluated on the `start` record) leaves the index untouched AND
+ * unflagged; one that fires after rows have landed leaves it flagged BROKEN.
+ * Override per-process via the env vars below when a genuinely huge repo needs
+ * it. A non-positive / non-finite value falls back to the default.
+ */
+const DEFAULT_MAX_INGEST_FILES = 200_000;
+const DEFAULT_MAX_INGEST_NODES = 2_000_000;
+const DEFAULT_MAX_INGEST_EDGES = 5_000_000;
+
+/** Read a positive-integer cap from `env`, else `fallback`. Use-time, not
+ *  module-load, so tests/operators can set it per-process. */
+function capFromEnv(env: string, fallback: number): number {
+  const raw = process.env[env];
+  if (raw === undefined) return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
 
 /** Aliased import binding (`import { a as b }` → {local:"b",imported:"a"}). */
 type ImportAliasPair = { local: string; imported: string };
@@ -95,6 +128,47 @@ export interface IngestOptions {
    * resolution works regardless.
    */
   repoRoot?: string;
+  /**
+   * Declare this run an AUTHORITATIVE WHOLE-REPO REBUILD (the caller cleared the
+   * graph and is re-parsing everything). Default `false` = a scoped run that
+   * replaces only what it parsed.
+   *
+   * This governs two reclaim steps that are only SAFE when the run's output is
+   * the complete graph:
+   *   - call sites: a full rebuild does the O(1) `clearCallSites()`; a scoped
+   *     run replaces only the parsed files' sites (see below).
+   *   - node markdown: a full rebuild sweeps `nodesDir` for orphan `.md` files
+   *     whose node no longer exists. A scoped run must NEVER sweep — it knows
+   *     only the changed files' nodes and would delete the rest of the repo's
+   *     markdown.
+   *
+   * Defaulting to `false` is the SAFE default: a caller that forgets to set it
+   * gets correct-but-less-thorough reclaim, never destruction.
+   */
+  fullRebuild?: boolean;
+  /**
+   * Let `runIngest` perform the `clearGraph()` itself, at the ONE safe moment:
+   * after the native `start` record has cleared the file-count cap, and before
+   * any node batch flushes. Default `false` (the caller manages its own clear).
+   *
+   * A caller that clears BEFORE `startParse` destroys a good index whenever the
+   * run is then refused for scope — and every retry re-destroys it, because the
+   * now-empty index is ineligible for the incremental path and takes the full
+   * path again. Delegating the clear here makes a scope refusal non-destructive.
+   */
+  clearBeforeIngest?: boolean;
+  /**
+   * Permit the FULL-rebuild orphan-markdown sweep. Default `false`, and
+   * deliberately SEPARATE from {@link fullRebuild}, because the sweep is only
+   * safe when this index is the ONLY writer of `nodesDir`.
+   *
+   * `nodesDir` is one directory per PROJECT (`util/paths.ts`), shared by every
+   * per-branch index, so sweeping "every `.md` not in THIS branch's node set"
+   * deletes other branches' markdown. Callers must pass `true` only when
+   * per-branch caching is not in play. Even then the sweep refuses to delete
+   * anything it cannot prove hayven wrote — see `pruneOrphanNodeMarkdowns`.
+   */
+  sweepOrphanMarkdown?: boolean;
 }
 
 /**
@@ -131,8 +205,48 @@ export async function runIngest(opts: IngestOptions): Promise<IngestResult> {
   const { db, nodesDir, run, logger } = opts;
   const startedAt = Date.now();
 
+  // MARK THE INDEX IN-PROGRESS BEFORE WRITING ANYTHING.
+  //
+  // Node rows flush in 1000-row batches DURING the drain below — i.e. BEFORE the
+  // native exit-code gate — while ALL edges, call sites and stats are written
+  // AFTER it. So a run killed anywhere in the middle (the 300s ingest timeout,
+  // `kill -9`, OOM, a full disk, a segfaulting native binary) leaves nodes with
+  // ZERO edges, or an empty graph if the caller cleared first. `last_ingest_at`
+  // lives in `stats` and is only written on SUCCESS, so the wreckage kept the
+  // PREVIOUS successful timestamp and `evaluateStaleness` reported `stale:
+  // false` — every query answered "No matches" and the user read that as a fact
+  // about their code.
+  //
+  // We cannot wrap clear+repopulate in one SQLite transaction (the repopulate
+  // spans a subprocess that runs for minutes and flushes in batches), so we do
+  // the equivalent: flag the index unusable up front and unflag it ONLY in the
+  // same transaction that records success. Any reader that finds the flag treats
+  // the index as broken rather than fresh. Idempotent — `clearGraph()` already
+  // stamped it inside its own wipe transaction and the earliest start wins.
+  db.markIngestInProgress(startedAt);
+
   const nodes: GraphNode[] = [];
   const rawEdges: RawEdge[] = [];
+  /**
+   * Every source file this run actually parsed (from the node records' `file`).
+   * This is what lets the call-site replacement below be per-file WITHOUT the
+   * caller having to tell us which files it handed the parser — see the
+   * `clearCallSites` discussion further down.
+   */
+  const parsedFiles = new Set<string>();
+  const maxFiles = capFromEnv("HAYVEN_MAX_INGEST_FILES", DEFAULT_MAX_INGEST_FILES);
+  const maxNodes = capFromEnv("HAYVEN_MAX_INGEST_NODES", DEFAULT_MAX_INGEST_NODES);
+  const maxEdges = capFromEnv("HAYVEN_MAX_INGEST_EDGES", DEFAULT_MAX_INGEST_EDGES);
+  /** Set when a hard cap is breached; ends the drain and throws (see caps above). */
+  let abortReason: string | null = null;
+  /**
+   * True once this run has made ANY destructive or partial write to the index
+   * (the delegated `clearGraph`, or a node batch flush). Drives whether an
+   * aborted run leaves the index FLAGGED: a scope refusal that never touched a
+   * byte must leave a good index both intact AND unflagged, or it is still
+   * "destroyed for being large" as far as every reader is concerned.
+   */
+  let mutatedIndex = false;
 
   /**
    * file → module name, populated as we see each file's synthetic `module`
@@ -154,11 +268,13 @@ export async function runIngest(opts: IngestOptions): Promise<IngestResult> {
   const flushNodes = (): void => {
     if (nodeBuffer.length === 0) return;
     db.upsertNodes(nodeBuffer);
+    mutatedIndex = true; // rows are now persisted — an abort leaves it partial
     nodeBuffer.length = 0;
   };
 
   for await (const rec of run.records) {
     handleRecord(rec);
+    if (abortReason !== null) break;
   }
 
   function handleRecord(rec: NativeRecord): void {
@@ -169,6 +285,33 @@ export async function runIngest(opts: IngestOptions): Promise<IngestResult> {
           files_total: rec.files_total,
           native_version: rec.version,
         });
+        // `files_total` was logged here and NEVER checked against anything —
+        // there was no file-count cap anywhere. This is the earliest and
+        // cheapest point to refuse an absurd scope (the home-directory case),
+        // before a single file is parsed.
+        if (filesTotal > maxFiles) {
+          abortReason =
+            `refusing to ingest ${filesTotal} files — above the ${maxFiles}-file ` +
+            "cap. This usually means the ingest root is not a project (e.g. a " +
+            "home directory). Check the root, or raise HAYVEN_MAX_INGEST_FILES. " +
+            "The existing index was NOT modified.";
+          break;
+        }
+        // THE DESTRUCTIVE CLEAR HAPPENS HERE, NOT BEFORE THE PARSE.
+        //
+        // `cli/ingest.ts` used to call `db.clearGraph()` before `startParse`,
+        // while the file cap is only knowable from this `start` record — so a
+        // repo above the cap had its previously-good index destroyed and flagged
+        // broken purely for being large, and every retry re-wiped it: the next
+        // run saw 0 nodes, was ineligible for the incremental path, took the
+        // full path, cleared again, refused again. Permanently wedged until
+        // someone exported the override. A scope refusal MUST precede the
+        // destructive step, so the caller now delegates the clear to us and we
+        // do it only once the run is known to be in-bounds.
+        if (opts.clearBeforeIngest === true) {
+          db.clearGraph();
+          mutatedIndex = true;
+        }
         break;
       case "node": {
         const qn = rec.qualified_name || rec.name;
@@ -198,8 +341,16 @@ export async function runIngest(opts: IngestOptions): Promise<IngestResult> {
           logical_clock: 0,
         };
         nodes.push(node);
+        parsedFiles.add(rec.file);
         nodeBuffer.push(node);
         if (nodeBuffer.length >= NODE_BATCH) flushNodes();
+        if (nodes.length > maxNodes) {
+          abortReason =
+            `refusing to ingest more than ${maxNodes} nodes — \`nodes[]\` is held ` +
+            "in memory for the whole run (resolveEdges and the markdown writer " +
+            "need the full set), so this is the heap ceiling. Raise " +
+            "HAYVEN_MAX_INGEST_NODES if this repo really is that large.";
+        }
         break;
       }
       case "edge": {
@@ -264,6 +415,13 @@ export async function runIngest(opts: IngestOptions): Promise<IngestResult> {
           ...(line !== undefined ? { line } : {}),
           ...(col !== undefined ? { col } : {}),
         } as RawEdgeWithChain);
+        if (rawEdges.length > maxEdges) {
+          abortReason =
+            `refusing to ingest more than ${maxEdges} edges — \`rawEdges[]\` is ` +
+            "held in memory until the second-pass resolve, so this is the heap " +
+            "ceiling. Raise HAYVEN_MAX_INGEST_EDGES if this repo really is that " +
+            "large.";
+        }
         break;
       }
       case "progress":
@@ -281,6 +439,28 @@ export async function runIngest(opts: IngestOptions): Promise<IngestResult> {
         break;
     }
   }
+  // A cap breach means we are ABANDONING this run: kill the child (it would
+  // otherwise keep burning CPU on a root we've already refused) and throw
+  // WITHOUT flushing the tail buffer. Whatever earlier batches already landed
+  // stay flagged by the in-progress marker, so the index reads as broken rather
+  // than as a smaller-but-fine graph.
+  if (abortReason !== null) {
+    try {
+      await run.kill();
+    } catch {
+      // the throw below is the signal that matters; a kill failure must not mask it
+    }
+    // A refusal that never wrote anything must leave the index EXACTLY as it
+    // found it — including unflagged. Retract our own in-flight token so an
+    // over-cap repo is not reported broken purely for being large (which also
+    // made the next run ineligible for the incremental path, so it took the
+    // full path, refused again, and stayed wedged). If we DID write, the flag
+    // stays: the index really is partial.
+    if (!mutatedIndex) db.endIngest();
+    logger?.error("ingest aborted — hard cap exceeded", { reason: abortReason });
+    throw new Error(abortReason);
+  }
+
   flushNodes();
 
   // Verify the native binary exited cleanly.
@@ -293,48 +473,125 @@ export async function runIngest(opts: IngestOptions): Promise<IngestResult> {
   const { resolved, unresolved, sites } = resolveEdges(nodes, rawEdges, {
     repoRoot: opts.repoRoot ?? process.cwd(),
   });
-  // Batch insert resolved + unresolved edges.
-  const allEdges: GraphEdge[] = [...resolved, ...unresolved];
+  // AGGREGATE before writing: `resolveEdges` emits ONE GraphEdge per raw edge
+  // OCCURRENCE, so the same (src, dst, kind) key recurs once per call site. Fold
+  // them into one row per key with the weight summed, then write with SET (not
+  // accumulate) semantics via `replaceEdges`.
+  //
+  // WHY: `upsertEdges` does `weight = edges.weight + excluded.weight` on
+  // conflict, which is correct ONLY if each key is written once per rebuild.
+  // `hayven ingest` guaranteed that by calling `clearGraph()` first — and the
+  // daemon's full re-ingest simply did not clear, so every repeated full ingest
+  // INFLATED every edge weight without bound (measured: max weight 1 → 3 after
+  // two runs), silently corrupting every weight-ordered ranking with no
+  // user-visible signal. Making the DB write idempotent means a caller that
+  // forgets to clear can no longer cause that. Correct on the incremental path
+  // too: edges are keyed by `src`, and the incremental reconcile deletes a
+  // changed file's nodes (and their src-side edges) before re-parsing, so every
+  // key this run re-emits is a key it fully re-derived.
+  const aggregated = new Map<string, GraphEdge>();
+  for (const e of [...resolved, ...unresolved]) {
+    const key = `${e.src} ${e.dst} ${e.kind}`;
+    const prior = aggregated.get(key);
+    if (prior === undefined) aggregated.set(key, { ...e });
+    else prior.weight += e.weight;
+  }
+  const allEdges: GraphEdge[] = [...aggregated.values()];
   if (allEdges.length > 0) {
     for (let i = 0; i < allEdges.length; i += EDGE_BATCH) {
-      const batch = allEdges.slice(i, i + EDGE_BATCH);
-      db.upsertEdges(batch);
+      db.replaceEdges(allEdges.slice(i, i + EDGE_BATCH));
     }
   }
 
-  // Line-precise call sites. `runIngest` is the FULL-ingest path (it rebuilds
-  // the whole graph), so mirror how edges are handled: clear the table, then
-  // rewrite every site this run produced. (INCREMENTAL GAP: the `--files`
-  // re-ingest path lives elsewhere and would instead call
-  // `db.deleteCallSitesByFile(changedFiles)` + `insertCallSites(sites)` to
-  // replace just the changed files' sites; that integration is left to the
-  // watcher path — here we always do the authoritative full clear+rewrite.)
-  db.clearCallSites();
+  // Line-precise call sites — replace only what this run re-derived.
+  //
+  // This used to call `db.clearCallSites()` UNCONDITIONALLY, on the assumption
+  // that `runIngest` is only ever the full-ingest path. It is not: the daemon
+  // watcher's incremental `--files` batch drains through this exact function. So
+  // saving ONE file in a watched project wiped the `call_sites` table for the
+  // ENTIRE repo, and `refs --sites` then silently returned nothing for anything
+  // except the last-saved file until someone ran a manual full ingest.
+  //
+  // We do not need the caller to tell us which files it handed the parser — the
+  // node records already name every file this run parsed (`parsedFiles`). A call
+  // site's `file` is the CALLER's source location, so re-parsing that file
+  // supersedes its sites: deleting exactly the parsed files' sites and
+  // re-inserting is correct for a full run AND a scoped one. `fullRebuild`
+  // additionally opts into the O(1) whole-table clear, which also reclaims sites
+  // belonging to files that vanished from the repo.
+  if (opts.fullRebuild === true) {
+    db.clearCallSites();
+  } else if (parsedFiles.size > 0) {
+    db.deleteCallSitesByFile(parsedFiles);
+  }
   if (sites.length > 0) {
     for (let i = 0; i < sites.length; i += EDGE_BATCH) {
       db.insertCallSites(sites.slice(i, i + EDGE_BATCH));
     }
   }
 
-  // Write markdown files in parallel.
+  // Write markdown files. `writeNodeMarkdowns` skips any file whose bytes are
+  // already identical, so a watcher cycle over an unchanged repo now writes
+  // nothing at all (this unconditional per-node rewrite was a direct contributor
+  // to the incident's 12.6 GB written).
   await writeNodeMarkdowns(nodesDir, nodes, new Map(), opts.markdownConcurrency ?? 16);
 
-  // Stash stats.
+  // Reclaim orphan markdown — files whose symbol was renamed or removed. ONLY
+  // on a declared full rebuild, where `nodes` IS the complete graph; a scoped
+  // run knows only the changed files' nodes and sweeping would delete the rest
+  // of the repo's markdown. (Scoped runs reclaim via `removeNodeMarkdowns` with
+  // ids captured before the per-file delete — see cli/ingest.ts.) Best-effort:
+  // never fail a successful ingest over disk hygiene.
+  if (opts.fullRebuild === true && opts.sweepOrphanMarkdown === true) {
+    try {
+      const orphans = pruneOrphanNodeMarkdowns(
+        nodesDir,
+        nodes.map((n) => n.id),
+      );
+      if (orphans > 0) logger?.info("reclaimed orphan node markdown", { removed: orphans });
+    } catch (err) {
+      logger?.warn("orphan node-markdown sweep failed (non-fatal)", {
+        error: (err as Error).message,
+      });
+    }
+  }
+
+  // Stash stats. Record the git HEAD the index was built against, for the
+  // freshness lane (it READS this stat; we only WRITE it). BEST-EFFORT + SAFE:
+  // if git is unavailable, errors, times out, or this isn't a git repo, we
+  // silently skip it — the ingest must never fail because of this. Bounded by a
+  // short timeout so a hung git can't stall the ingest. Read BEFORE opening the
+  // transaction so a slow git never holds a write lock.
   const finishedAt = Date.now();
-  db.setStat("last_ingest_at", String(finishedAt));
-  // Record the git HEAD the index was built against, for the freshness lane
-  // (it READS this stat; we only WRITE it). BEST-EFFORT + SAFE: if git is
-  // unavailable, errors, times out, or this isn't a git repo, we silently skip
-  // it — the ingest must never fail because of this. Bounded by a short timeout
-  // so a hung git can't stall the ingest.
   const gitHead = readGitHead(opts.repoRoot ?? process.cwd());
-  if (gitHead) db.setStat("last_ingest_git_head", gitHead);
-  // `nativeNodes` is the node count from the native `done` record — store it
-  // under a key that names what it is. (It was previously written under a
-  // `…native_version` key, a copy-paste mismatch: the value is a count, not a
-  // version, and nothing read it.)
-  db.setStat("last_ingest_nodes", String(nativeNodes));
-  db.setStat("last_ingest_warnings", String(warnings));
+
+  // ONE transaction: record success AND clear the in-progress marker together.
+  // These must not be separable — a crash between them would either leave a
+  // completed index flagged broken (annoying) or, far worse, an unflagged index
+  // carrying a fresh `last_ingest_at` it never earned.
+  db.transaction(() => {
+    db.setStat("last_ingest_at", String(finishedAt));
+    if (gitHead) db.setStat("last_ingest_git_head", gitHead);
+    // `last_ingest_nodes` records how many nodes the GRAPH held at the moment
+    // this ingest succeeded — the live row count, NOT the native `done`
+    // record's count. `checkIndexIntegrity` compares this against the current
+    // row count, so it is precisely the "the index used to have content and now
+    // has none" tripwire. The native count would be wrong for that purpose on an
+    // incremental run (it counts only the re-parsed files' nodes, so a one-file
+    // save would reset the watermark to ~5 — or to 0 for a file that defines
+    // nothing — and a later wipe would go undetected). The native count is still
+    // recorded, under a key that says what it is.
+    // Only a declared full rebuild may LOWER the watermark — a scoped run's
+    // live `counts()` can read 0 while a CONCURRENT process holds the graph
+    // cleared, and committing that 0 disarms the empty-but-claims-content
+    // detector. See `Db.recordNodeWatermark`.
+    db.recordNodeWatermark(db.counts().nodes, opts.fullRebuild === true);
+    db.setStat("last_ingest_native_nodes", String(nativeNodes));
+    db.setStat("last_ingest_warnings", String(warnings));
+    // Retracts ONLY this handle's token, so a concurrent ingest keeps its own
+    // protection rather than being silently un-flagged by our success.
+    db.endIngest();
+  });
 
   return {
     startedAt,

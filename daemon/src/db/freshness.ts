@@ -55,7 +55,7 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 
 import { resolveReadIndex } from "./branch_index.ts";
-import { Db } from "./queries.ts";
+import { Db, type IndexIntegrityReason } from "./queries.ts";
 import { daemonStatus } from "../daemon/lifecycle.ts";
 import { runIngest } from "../cli/ingest.ts";
 import type { HayvenPaths } from "../util/paths.ts";
@@ -412,10 +412,23 @@ export interface StalenessResult {
   stale: boolean;
   /** The single concise stderr line to print, or "" when nothing to say. */
   message: string;
+  /**
+   * Set when the index is not merely stale but STRUCTURALLY BROKEN — an ingest
+   * cleared or half-rewrote it and never finished. Distinguished from ordinary
+   * staleness because the remedy differs (rebuild, not "it's a bit behind") and
+   * because a broken index answers every query with "No matches", which reads
+   * as a fact about the user's code rather than as a tool failure.
+   */
+  broken?: IndexIntegrityReason;
 }
 
 /**
  * Decide whether to warn about a stale index — pure given its probes.
+ *
+ * Runs an INTEGRITY check first (see {@link Db.checkIndexIntegrity}): a
+ * half-written index is reported BROKEN (`stale: true` plus a `broken` reason)
+ * rather than being allowed to certify itself fresh off a surviving
+ * `last_ingest_at`. Otherwise the ordinary mtime staleness logic applies.
  *
  * Returns `stale: false` (and an empty message) when:
  *   - a daemon/watcher is already running for this project (it owns freshness);
@@ -430,9 +443,71 @@ export function evaluateStaleness(
   paths: HayvenPaths,
   probes: FreshnessProbes = defaultProbes,
 ): StalenessResult {
-  // Guard FIRST and cheapest: if the watcher owns this project, say nothing.
-  // This also means we never even stat the tree when a daemon is up.
+  // INTEGRITY BEFORE FRESHNESS. A half-written index is not "stale" — it is
+  // unusable, and it used to report itself FRESH: `clearGraph()` commits its own
+  // transaction, the re-parse runs after it with nothing spanning the two, and
+  // `last_ingest_at` (in `stats`, written only on SUCCESS) survives the wipe. So
+  // a killed ingest left 0 nodes carrying the PREVIOUS successful timestamp, the
+  // mtime comparison below returned `stale: false`, and every query answered "No
+  // matches" — which the user reads as a fact about their code.
+  const integrity = db.checkIndexIntegrity();
+
+  // `empty-but-claims-content` is unambiguous corruption: the graph is empty and
+  // a previous ingest recorded that it was not. Report it EVEN IF a daemon is
+  // running — a live daemon is the most likely thing to have caused it, so
+  // deferring to the watcher here would suppress exactly the signal that
+  // matters. A genuinely-empty index (never ingested) has no recorded count and
+  // never trips this, so it cannot false-fire.
+  if (integrity.reason === "empty-but-claims-content") {
+    return {
+      stale: true,
+      broken: integrity.reason,
+      message:
+        `WARNING: the index is BROKEN, not stale — ${integrity.detail}. ` +
+        "Queries will return NO MATCHES until it is rebuilt; that is a tool " +
+        "failure, not a fact about your code. Run `hayven ingest --full`.",
+    };
+  }
+
+  // `unreadable` means the `stats`/`nodes` tables are missing or corrupt — most
+  // often a `hayven reindex` killed between `dropDerived` (which DROPs both) and
+  // the follow-on ingest. This must be handled HERE: falling through would reach
+  // `db.getStat("last_ingest_at")` and throw `no such table: stats`, which
+  // `warnIfStale` swallows — so the user got NO warning at all about an index
+  // that cannot answer anything. Report it before any further read of `db`.
+  if (integrity.reason === "unreadable") {
+    return {
+      stale: true,
+      broken: integrity.reason,
+      message:
+        `WARNING: the index is UNREADABLE — ${integrity.detail}. This usually ` +
+        "means a `hayven reindex` was interrupted before it could rebuild. " +
+        "Run `hayven ingest --full` to recreate it.",
+    };
+  }
+
+  // Guard: if the watcher owns this project, say nothing. This also means we
+  // never even stat the tree when a daemon is up.
+  //
+  // The in-progress marker is checked AFTER this guard on purpose. With a daemon
+  // up, a set marker most likely means an ingest is running RIGHT NOW (the
+  // watcher re-ingests on every save), and warning on each of those short
+  // windows would be the false-stale noise this module exists to avoid. With NO
+  // daemon, nobody is ingesting — so a marker that is still set means the
+  // process that set it died, which is precisely the interrupted-ingest case.
   if (probes.daemonRunning(paths)) return { stale: false, message: "" };
+
+  if (integrity.reason === "ingest-interrupted") {
+    return {
+      stale: true,
+      broken: integrity.reason,
+      message:
+        `WARNING: the index may be INCOMPLETE — ${integrity.detail}, and no ` +
+        "daemon is running to finish it. Nodes are written before edges and " +
+        "call sites, so results may be silently partial. Run `hayven ingest " +
+        "--full` to rebuild.",
+    };
+  }
 
   const raw = db.getStat("last_ingest_at");
   if (raw === null) return { stale: false, message: "" };

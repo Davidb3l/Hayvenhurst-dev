@@ -98,6 +98,68 @@ export interface ServerDependencies {
    * facade there silently yields the PRIMARY project's op-log.
    */
   resolveProject?: ((alias: string | null) => ServerDependencies | undefined) | undefined;
+  /** Ingest backlog + failure-breaker state for THIS project (see {@link IngestHealth}). */
+  ingestHealth?: (() => IngestHealth) | undefined;
+  /** Clear this project's tripped ingest breaker so automatic re-ingest resumes. */
+  resetIngestBreaker?: (() => void) | undefined;
+  /** Multi-project only: {@link IngestHealth} for EVERY served project. */
+  listIngestHealth?: (() => Array<IngestHealth & { alias: string }>) | undefined;
+}
+
+/**
+ * Automatic-ingest health for one project — the signal the runaway-ingest
+ * incident had no way to surface.
+ *
+ * The daemon re-ingests on its own (watcher batches, watcher overflow, branch
+ * re-point). When that work starts failing, or starts piling up, NOTHING was
+ * visible to the user: the incident ran 11,600 ingest cycles while every symptom
+ * lived only in a 576 MB log nobody was reading. These counters are served over
+ * HTTP so "is my daemon melting down?" is one request away.
+ */
+export interface IngestHealth {
+  /** Consecutive AUTOMATIC ingest failures since the last success. */
+  consecutiveFailures: number;
+  /** True once the breaker tripped: automatic re-ingest is STOPPED here. */
+  tripped: boolean;
+  /**
+   * Which bound tripped. `"rate"` is the one that matches the original
+   * incident — work that SUCCEEDED, far too often — and `"failures"` is the
+   * classic retry-forever case.
+   */
+  tripReason: "failures" | "rate" | null;
+  /** ISO timestamp the breaker tripped, else null. */
+  trippedAt: string | null;
+  /** Message of the most recent automatic-ingest failure, else null. */
+  lastError: string | null;
+  /** Message of the most recent MANUAL ingest failure, tracked separately so a
+   *  manual run can never disarm the automatic breaker. */
+  lastManualError: string | null;
+  /** Automatic whole-repo re-ingests started inside the current rate window. */
+  autoRunsInWindow: number;
+  /** The work-rate limit those runs are measured against. */
+  autoRunLimitPerWindow: number;
+  /** Length of the work-rate window, in ms. */
+  rateWindowMs: number;
+  /** Minimum enforced gap between automatic whole-repo re-ingests, in ms. */
+  minIntervalMs: number;
+  /** Times a queued full re-ingest had to wait out the minimum interval. */
+  rateLimitedWaits: number;
+  /** Daemon-wide automatic ingests running right now (across ALL projects). */
+  limiterActive: number;
+  /** Daemon-wide automatic ingests queued behind the concurrency limit. */
+  limiterWaiting: number;
+  /** A full re-ingest is queued but has not started yet (coalesced to <= 1). */
+  fullIngestQueued: boolean;
+  /** Full re-ingest requests that COLLAPSED into an already-queued run. */
+  fullIngestsCoalesced: number;
+  /** Watcher events buffered right now (the backlog). */
+  pendingWatchEvents: number;
+  /** True while a watcher batch handler is running. */
+  watchBatchInFlight: boolean;
+  /** True while a watcher overflow full-rescan is running. */
+  watchOverflowInFlight: boolean;
+  /** Overflow records that collapsed into a running/queued rescan. */
+  watchOverflowsCoalesced: number;
 }
 
 /** One row of the multi-project `/api/health` listing. */
@@ -156,6 +218,49 @@ export function wireBranchAwareDb(deps: ServerDependencies): void {
   });
 }
 
+/**
+ * Strip the user's home directory out of an error message before it leaves the
+ * process. `onError` echoes `error.message` straight back to the caller, and
+ * those messages routinely embed absolute paths — which leaks the account name
+ * and the on-disk layout to anything that can reach the port. The message stays
+ * readable (`~/code/repo/...`); the full text still goes to the daemon log.
+ */
+export function redactHomePaths(message: string): string {
+  const home = process.env["HOME"];
+  if (typeof home !== "string" || home.length < 2) return message;
+  return message.split(home).join("~");
+}
+
+/**
+ * `GET /api/ingest/health` + `POST /api/ingest/health/reset`.
+ *
+ * Defined here rather than in `routes/` because it reports on daemon-level
+ * machinery (the per-project ingest breaker and watcher backlog wired up in
+ * `cli/daemon.ts`), not on the graph. Both are no-ops with a clear 501 for
+ * single-project/test callers that never wired the state.
+ */
+function ingestHealthRoutes(deps: ServerDependencies) {
+  return new Elysia()
+    .get("/api/ingest/health", () => {
+      const all = deps.listIngestHealth?.();
+      if (all) {
+        return { ok: true, tripped: all.filter((p) => p.tripped).map((p) => p.alias), projects: all };
+      }
+      const one = deps.ingestHealth?.();
+      if (!one) return { ok: true, tripped: [], projects: [] };
+      const alias = deps.primaryAlias ?? "primary";
+      return { ok: true, tripped: one.tripped ? [alias] : [], projects: [{ alias, ...one }] };
+    })
+    .post("/api/ingest/health/reset", ({ set }) => {
+      if (!deps.resetIngestBreaker) {
+        set.status = 501;
+        return { error: "this daemon does not expose an ingest breaker" };
+      }
+      deps.resetIngestBreaker();
+      return { ok: true, reset: true, health: deps.ingestHealth?.() ?? null };
+    });
+}
+
 // Intentionally untyped return — Elysia's chained generics inflate the signature
 // past TypeScript's comparison limits when composed with `.use()` modules.
 export function buildApp(deps: ServerDependencies, opts: BuildAppOptions = {}) {
@@ -178,8 +283,11 @@ export function buildApp(deps: ServerDependencies, opts: BuildAppOptions = {}) {
 
   app
     .onError(({ error, code }) => {
-      deps.logger.error("request error", { code, message: (error as Error).message });
-      return { error: (error as Error).message, code };
+      const message = (error as Error).message;
+      // Log the FULL message (the daemon log is local and is the debugging
+      // surface); return a home-redacted one to the caller.
+      deps.logger.error("request error", { code, message });
+      return { error: redactHomePaths(message), code };
     })
     // The `/` JSON banner only fires if no static file serves at root —
     // viewerRoutes registers a `GET /*` catch-all below, so this is a
@@ -204,6 +312,7 @@ export function buildApp(deps: ServerDependencies, opts: BuildAppOptions = {}) {
     .use(claimsRoutes(deps))
     .use(tracesRoutes(deps))
     .use(ingestRoutes(deps))
+    .use(ingestHealthRoutes(deps))
     .use(syncRoutes(deps))
     .use(wsRoutes(deps))
     // viewerRoutes contains `/node/*` and a `/*` catch-all — MUST be last.
@@ -242,6 +351,25 @@ const projectContext = new AsyncLocalStorage<ServerDependencies>();
  *  hard-refuse (404) rather than fall back to the primary project. */
 const MUTATING_METHODS: ReadonlySet<string> = new Set(["POST", "PUT", "DELETE", "PATCH"]);
 
+
+/**
+ * True when `origin` is a loopback web origin (or the opaque `"null"` that a
+ * `file://` page sends). Used to refuse browser-driven mutations against an
+ * unauthenticated localhost daemon.
+ */
+export function isLocalOrigin(origin: string): boolean {
+  if (origin === "null") return false; // opaque origin — treat as untrusted
+  let host: string;
+  try {
+    host = new URL(origin).hostname;
+  } catch {
+    return false; // unparseable Origin is not something to trust
+  }
+  const h = host.toLowerCase().replace(/^\[|\]$/g, "");
+  if (h === "localhost" || h === "::1" || h === "::ffff:127.0.0.1") return true;
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
+}
+
 /**
  * Build ONE Elysia app that serves N projects from a single daemon. The route
  * modules are UNCHANGED: they close over a facade `deps` whose db/paths/config/
@@ -275,13 +403,30 @@ export function buildMultiProjectApp(multi: MultiProjectDeps) {
     addProject: multi.addProject,
     removeProject: multi.removeProject,
     subscribeProjects: multi.subscribeProjects,
+    listIngestHealth: (): Array<IngestHealth & { alias: string }> => {
+      const out: Array<IngestHealth & { alias: string }> = [];
+      for (const [alias, d] of multi.projects) {
+        const h = d.ingestHealth?.();
+        if (h) out.push({ alias, ...h });
+      }
+      return out;
+    },
     // Live map lookup (not a snapshot): hot-added projects are ws-reachable
     // immediately, removed ones stop resolving.
     resolveProject: (alias: string | null) =>
       alias === null ? primaryDeps : multi.projects.get(alias),
   } as ServerDependencies;
 
-  for (const key of ["db", "dbRef", "config", "paths", "ingest", "crdt"] as const) {
+  for (const key of [
+    "db",
+    "dbRef",
+    "config",
+    "paths",
+    "ingest",
+    "crdt",
+    "ingestHealth",
+    "resetIngestBreaker",
+  ] as const) {
     Object.defineProperty(facade, key, {
       configurable: true,
       enumerable: true,
@@ -313,6 +458,40 @@ export function buildMultiProjectApp(multi: MultiProjectDeps) {
     // method once a selector is present.
     // /ws/sync is the WebSocket sibling of POST /api/sync/push (it streams
     // CRDT ops into the op-log), so its upgrade GET gets the same strictness.
+    // CROSS-ORIGIN GATE on mutations.
+    //
+    // The daemon has no authentication, so any web page the user happens to have
+    // open can aim requests at 127.0.0.1:7777. The browser's same-origin policy
+    // stops it READING the responses, but nothing stopped it CAUSING WRITES —
+    // registering claims, adding/removing projects, triggering ingests. A
+    // cross-origin `fetch` always carries an `Origin` header, while the CLI,
+    // curl and the daemon's own same-origin viewer either omit it or send a
+    // loopback one, so this costs legitimate callers nothing.
+    //
+    // Applied to MUTATIONS only. Reads are deliberately left alone: the viewer
+    // is served from this origin, an opaque cross-origin GET leaks nothing to
+    // the caller, and refusing them would break embedding without closing a
+    // hole. (Unbounded-work GETs are a separate problem, fixed by bounding the
+    // work, not by guessing at the caller.)
+    if (MUTATING_METHODS.has(request.method)) {
+      const origin = request.headers.get("origin");
+      if (origin !== null && !isLocalOrigin(origin)) {
+        multi.logger.warn("request: REFUSED cross-origin mutation", {
+          origin,
+          method: request.method,
+          path: pathname,
+        });
+        return new Response(
+          JSON.stringify({
+            error:
+              "cross-origin mutations are refused: this daemon is unauthenticated and " +
+              "must not be driven by a web page.",
+          }),
+          { status: 403, headers: { "content-type": "application/json" } },
+        );
+      }
+    }
+
     const strictRoute = pathname.startsWith("/api/sync/") || pathname === "/ws/sync";
     if (alias && !selected && (strictRoute || MUTATING_METHODS.has(request.method))) {
       return new Response(
@@ -321,6 +500,34 @@ export function buildMultiProjectApp(multi: MultiProjectDeps) {
         }),
         { status: 404, headers: { "content-type": "application/json" } },
       );
+    }
+
+    // Two SILENT fall-throughs remain below. Neither can be closed unilaterally
+    // (see the notes), so at minimum they must stop being invisible — the
+    // logger dedups identical lines, so a chatty client cannot flood the log.
+    if (alias && !selected) {
+      // A READ with an unknown selector answers from the PRIMARY project's
+      // index — a DIFFERENT repo. Kept (a viewer holding a stale alias degrades
+      // instead of erroring), but it is a wrong answer with no error, so say so.
+      multi.logger.warn("request: unknown project selector — answered from the PRIMARY project", {
+        requested: alias,
+        primary: multi.primary,
+        method: request.method,
+        path: pathname,
+      });
+    } else if (!alias && MUTATING_METHODS.has(request.method) && multi.projects.size > 1) {
+      // A MUTATION with no selector writes into whichever project happens to be
+      // primary. Refusing it outright is the real fix, but `cli/_shared.ts`
+      // deliberately omits the header when the daemon's primary IS this project
+      // (`projectHeader()` returns {} in that case), so refusing here would
+      // break every correct CLI mutation from the primary repo. Making the
+      // client always send its alias is a cross-lane change; until then, log it.
+      multi.logger.warn("request: un-addressed MUTATION routed to the primary project", {
+        primary: multi.primary,
+        projectsServed: multi.projects.size,
+        method: request.method,
+        path: pathname,
+      });
     }
 
     projectContext.enterWith(selected ?? primaryDeps);

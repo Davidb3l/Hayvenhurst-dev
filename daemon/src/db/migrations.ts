@@ -36,6 +36,14 @@ export interface MigrationResult {
  */
 export function migrate(db: Database): MigrationResult {
   const fromVersion = currentUserVersion(db);
+  // MUST be the first thing we do — before SCHEMA_SQL, before any DDL. A
+  // downgrade used to be accepted SILENTLY (we ran every migration step and
+  // then stamped `user_version` DOWN to this build's SCHEMA_VERSION), so an old
+  // binary opening an index a newer daemon wrote would rewrite the version
+  // marker, hide the newer tables/columns it cannot see, and let every
+  // subsequent write corrupt them. A stale `~/.local/bin/hayven` is exactly the
+  // shape of the bug that re-armed today's incident, so this is a hard refusal.
+  assertSchemaCompatible(db, fromVersion);
   let appliedFts = false;
 
   db.exec(SCHEMA_SQL);
@@ -230,6 +238,41 @@ export function currentUserVersion(db: Database): number {
   return row?.user_version ?? 0;
 }
 
+/** Thrown when an index was written by a hayven NEWER than this build. */
+export class SchemaTooNewError extends Error {
+  readonly indexVersion: number;
+  readonly buildVersion: number;
+  constructor(indexVersion: number, buildVersion: number) {
+    super(
+      `this index was written by a NEWER hayven (schema v${indexVersion}); ` +
+        `this build only understands schema v${buildVersion}.\n` +
+        "Refusing to touch it. Migrating an index DOWN silently discards the newer " +
+        "schema's tables and columns and corrupts what the newer daemon wrote.\n" +
+        "Upgrade hayven (or run the newer binary), then retry. If you are certain " +
+        "you want the old build, point it at a different index directory instead.",
+    );
+    this.name = "SchemaTooNewError";
+    this.indexVersion = indexVersion;
+    this.buildVersion = buildVersion;
+  }
+}
+
+/**
+ * Refuse to operate on an index newer than this build understands.
+ *
+ * `migrate()` calls this before ANY DDL; destructive CLI paths that open the DB
+ * WITHOUT migrating (`hayven reindex` opens a raw {@link Db} and drops tables)
+ * must call it themselves — otherwise a stale binary happily rewrites an index
+ * whose shape it does not know.
+ *
+ * Equal or older is fine (older is what the migration steps above are FOR).
+ * Only "newer than us" is unrecoverable, because we cannot know what to preserve.
+ */
+export function assertSchemaCompatible(db: Database, fromVersion?: number): void {
+  const version = fromVersion ?? currentUserVersion(db);
+  if (version > SCHEMA_VERSION) throw new SchemaTooNewError(version, SCHEMA_VERSION);
+}
+
 function setUserVersion(db: Database, version: number): void {
   // PRAGMA does not support parameter binding in sqlite.
   db.exec(`PRAGMA user_version = ${Math.trunc(version)}`);
@@ -258,24 +301,177 @@ export function ftsAvailable(db: Database): boolean {
   }
 }
 
-/** Drop all tables (used by `hayven reindex`). */
-export function dropAll(db: Database): void {
-  db.exec(`
-    DROP TRIGGER IF EXISTS nodes_fts_ai;
-    DROP TRIGGER IF EXISTS nodes_fts_ad;
-    DROP TRIGGER IF EXISTS nodes_fts_au;
-    DROP TRIGGER IF EXISTS fleet_memory_fts_ai;
-    DROP TRIGGER IF EXISTS fleet_memory_fts_ad;
-    DROP TABLE  IF EXISTS nodes_fts;
-    DROP TABLE  IF EXISTS fleet_memory_fts;
-    DROP TABLE  IF EXISTS fleet_memory;
-    DROP TABLE  IF EXISTS edges;
-    DROP TABLE  IF EXISTS call_sites;
-    DROP TABLE  IF EXISTS claims;
-    DROP TABLE  IF EXISTS stats;
-    DROP TABLE  IF EXISTS observations;
-    DROP TABLE  IF EXISTS merge_rejections;
-    DROP TABLE  IF EXISTS nodes;
-  `);
-  db.exec("PRAGMA user_version = 0");
+/**
+ * Tables a `hayven reindex` MUST NOT destroy, because nothing can re-derive
+ * them from a re-parse of the working tree:
+ *
+ *   - `fleet_memory` (+ its FTS shadow) — agent/user-AUTHORED knowledge:
+ *     decisions, dead-ends, gotchas. There is no CRDT op-log behind it and no
+ *     markdown mirror; SQLite is the only copy. This is the single most
+ *     valuable non-derivable thing in the index.
+ *   - `observations` / `test_coverage` — RUNTIME trace history. Only a traced
+ *     run produces these; a parser cannot.
+ *   - `claims` — live coordination state for other agents mid-edit.
+ *
+ * The old `dropAll` dropped the first three of these (and kept `test_coverage`
+ * purely by accident of hand-enumeration), so `hayven reindex` silently and
+ * permanently deleted user knowledge while its own help text said markdown was
+ * "left untouched". {@link dropDerived} is the replacement.
+ */
+export const REINDEX_PRESERVED_TABLES = [
+  "fleet_memory",
+  "fleet_memory_fts",
+  "observations",
+  "claims",
+  "test_coverage",
+] as const;
+
+/**
+ * `stats` KEYS that must survive a reindex, because they are the two
+ * independent detectors that make a half-written index announce itself
+ * (`Db.checkIndexIntegrity`):
+ *
+ *   - `ingest_in_progress` — the in-flight ownership tokens. Set before the
+ *     wipe, retracted only after the rebuild commits.
+ *   - `last_ingest_nodes`  — the node-count watermark. `nodes === 0` while this
+ *     says otherwise is unambiguous corruption, and it fires even if the marker
+ *     was somehow lost.
+ *
+ * `dropDerived` used to `DROP TABLE stats`, which destroyed BOTH in the same
+ * breath as the graph. A Ctrl-C or OOM between the drop and the follow-on
+ * ingest then left a zero-node index reporting `{ok:true,reason:"ok"}` and
+ * `stale:false`, so every query answered "No matches" and the user read that as
+ * a fact about their code — the exact failure the marker discipline exists to
+ * prevent. Everything ELSE in `stats` (`last_ingest_at`, `last_ingest_git_head`,
+ * `last_ingest_warnings`) is deliberately cleared: those assert a SUCCESSFUL
+ * ingest that has not happened yet, and leaving `last_ingest_at` behind is what
+ * makes staleness lie.
+ *
+ * COUPLING, FLAGGED: these literals mirror private constants in
+ * `db/queries.ts` (`INGEST_IN_PROGRESS_KEY`) and `cli/ingest.ts`. The
+ * `fix_c_reindex_*` tests drive Lane B's PUBLIC API (`beginIngest` /
+ * `ingestInProgressSince`) rather than these strings, so a rename over there
+ * turns those tests red instead of silently disarming the detector.
+ */
+export const REINDEX_PRESERVED_STAT_KEYS = ["ingest_in_progress", "last_ingest_nodes"] as const;
+
+/** True when an ingest has declared itself in flight (any live token). */
+function hasIngestMarker(db: Database): boolean {
+  try {
+    const row = db
+      .query<{ value: string }, []>("SELECT value FROM stats WHERE key = 'ingest_in_progress'")
+      .get();
+    const raw = row?.value;
+    return raw !== undefined && raw !== null && raw !== "" && raw !== "[]";
+  } catch {
+    return false; // no `stats` table at all — nothing has been marked.
+  }
+}
+
+/**
+ * COUNT(*) for each preserved table that currently exists. Missing tables are
+ * omitted rather than counted as 0, so a pre-v7 index (no `fleet_memory_fts`)
+ * does not read as "rows vanished".
+ */
+function preservedCounts(db: Database): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const table of REINDEX_PRESERVED_TABLES) {
+    const exists = db
+      .query<{ n: number }, [string]>(
+        "SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name=?",
+      )
+      .get(table);
+    if ((exists?.n ?? 0) === 0) continue;
+    const row = db.query<{ n: number }, []>(`SELECT COUNT(*) AS n FROM "${table}"`).get();
+    out[table] = row?.n ?? 0;
+  }
+  return out;
+}
+
+/**
+ * Drop ONLY the tables a full re-ingest re-derives, for `hayven reindex`.
+ *
+ * Derived = `nodes`, `edges`, `call_sites`, the `nodes_fts` shadow, the
+ * `merge_rejections` advisory side-table, and `stats` (pure ingest bookkeeping:
+ * `last_ingest_*`, `ingest_in_progress`). Everything in
+ * {@link REINDEX_PRESERVED_TABLES} is left in place — we PRESERVE rather than
+ * drop-and-restore, so there is no window in which the only copy of a user's
+ * fleet memory lives in a JS array.
+ *
+ * Two deliberate non-obvious choices:
+ *
+ *  - `user_version` is NOT reset. The old code stamped it to 0 because it had
+ *    just emptied the whole database; now that v7 data SURVIVES, claiming v0
+ *    would invite a re-migration against rows the migrations already ran on.
+ *    The schema version genuinely did not change, so neither does the marker.
+ *  - `fleet_memory`'s FTS triggers are NOT dropped. They only fire on
+ *    `fleet_memory` writes, which this function does not perform.
+ *
+ * `fleet_memory.node_id` values referencing dropped nodes are intentionally left
+ * dangling (there is no FK): the re-ingest reproduces the same node ids, so a
+ * note re-attaches to its symbol rather than being orphaned.
+ *
+ * TRIPWIRE: the whole thing runs in one transaction and re-counts every
+ * preserved table afterwards. If a row count moved — someone added a table to
+ * the drop list, or a trigger cascaded — we ROLL BACK and throw instead of
+ * proceeding. Losing the reindex is recoverable; losing fleet memory is not.
+ */
+export function dropDerived(db: Database): void {
+  // PRECONDITION, not a courtesy: the caller must ALREADY have declared the
+  // ingest in flight (`Db.beginIngest()`), because the instant the graph is
+  // gone the index is unusable and only that marker says so. Refusing here is
+  // what makes the "wipe first, mark never" ordering structurally impossible to
+  // reintroduce from a future call site.
+  if (!hasIngestMarker(db)) {
+    throw new Error(
+      "refusing to clear the graph: no ingest is marked in flight. " +
+        "Call `db.beginIngest()` on this handle FIRST, otherwise an interrupted " +
+        "rebuild leaves a zero-node index that reports itself healthy.",
+    );
+  }
+
+  const keepKeys = REINDEX_PRESERVED_STAT_KEYS.map((k) => `'${k}'`).join(", ");
+  db.exec("BEGIN");
+  try {
+    const before = preservedCounts(db);
+    db.exec(`
+      DROP TRIGGER IF EXISTS nodes_fts_ai;
+      DROP TRIGGER IF EXISTS nodes_fts_ad;
+      DROP TRIGGER IF EXISTS nodes_fts_au;
+      DROP TABLE  IF EXISTS nodes_fts;
+      DROP TABLE  IF EXISTS merge_rejections;
+      DROP TABLE  IF EXISTS call_sites;
+      DROP TABLE  IF EXISTS edges;
+      DROP TABLE  IF EXISTS nodes;
+      -- NOT \`DROP TABLE stats\`: that took the in-progress marker and the node
+      -- watermark down with the graph. Clear only the keys that claim a
+      -- successful ingest.
+      DELETE FROM stats WHERE key NOT IN (${keepKeys});
+    `);
+    // Second tripwire, same spirit as the row-count one: the marker must still
+    // be standing on the way out. If a future edit puts `stats` back on the drop
+    // list, this rolls the whole thing back instead of shipping a wipe with no
+    // detector behind it.
+    if (!hasIngestMarker(db)) {
+      throw new Error(
+        "reindex aborted: clearing the graph would have destroyed the " +
+          "ingest-in-progress marker, leaving an interrupted rebuild " +
+          "indistinguishable from a healthy empty index. Nothing was changed.",
+      );
+    }
+    const after = preservedCounts(db);
+    for (const [table, count] of Object.entries(before)) {
+      if (after[table] !== count) {
+        throw new Error(
+          `reindex aborted: it would have destroyed non-rebuildable data. ` +
+            `"${table}" went from ${count} to ${after[table] ?? "missing"} rows. ` +
+            "Nothing was changed. This is a bug in hayven; please report it.",
+        );
+      }
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
 }

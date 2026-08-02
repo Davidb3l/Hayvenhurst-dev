@@ -273,16 +273,84 @@ export function listBranchIndexes(
 
 /**
  * Pick the freshest (most-recently-ingested) seed for a NEW branch index:
- * the newest sibling branch index, or — when there is none — the legacy index
- * if it exists. Returns the source PATH, or `null` when nothing is seedable.
+ * the newest sibling branch index that ACTUALLY HAS CONTENT, or — when there is
+ * none — the legacy index if it exists and has content. Returns the source
+ * PATH, or `null` when nothing is seedable.
+ *
+ * THE CONTENT CHECK IS THE POINT. "Freshest" was measured purely by mtime, and
+ * a `clearGraph()` write makes the just-EMPTIED index the newest file on disk —
+ * so an index wrecked by an interrupted ingest was precisely the one most likely
+ * to be chosen as the seed. Emptiness then PROPAGATED: the new branch inherited
+ * the empty graph AND the seed's `last_ingest_git_head`, which made
+ * `cli/ingest.ts` treat the branch as eligible for the INCREMENTAL path, so the
+ * next ingest re-parsed only the git diff and the branch stayed permanently
+ * partial while certifying itself fresh. Skipping empty/broken candidates
+ * (rather than seeding and hoping) is the conservative fix: a branch with no
+ * valid seed simply does a full parse, which is slower but correct.
  */
 function freshestSeed(paths: HayvenPaths, exceptKey: string): string | null {
-  const siblings = listBranchIndexes(paths)
+  const candidates = listBranchIndexes(paths)
     .filter((b) => b.key !== exceptKey)
-    .sort((a, b) => b.mtimeMs - a.mtimeMs);
-  const newest = siblings[0];
-  if (newest !== undefined) return newest.path;
-  return existsSync(paths.sqliteFile) ? paths.sqliteFile : null;
+    .sort((a, b) => b.mtimeMs - a.mtimeMs)
+    .map((b) => b.path);
+  if (existsSync(paths.sqliteFile)) candidates.push(paths.sqliteFile);
+  for (const path of candidates) {
+    if (hasSeedableContent(path)) return path;
+  }
+  return null;
+}
+
+/**
+ * True unless we can POSITIVELY determine that `path` is a hayven index with no
+ * usable graph — i.e. it opens, its `nodes` table is readable, and either that
+ * table is empty or an interrupted ingest left the in-progress marker set.
+ *
+ * The asymmetry is deliberate and narrow. This function exists to stop ONE
+ * thing: a real hayven index that an interrupted ingest emptied being copied
+ * into a new branch. It must NOT change the outcome for anything else, so
+ * "cannot tell" (not a SQLite file, no `nodes`/`stats` table, a pre-schema or
+ * foreign index) returns TRUE and preserves the previous seed-it-anyway
+ * behaviour, exactly as the legacy `.hayven/index.sqlite` fallback relies on.
+ * Rejecting those too would have been a bigger, unrelated behaviour change.
+ *
+ * A wrong TRUE costs what today already costs (a seed that may be useless, then
+ * a normal ingest); a wrong FALSE costs one full re-parse. Neither loses data.
+ * Never throws.
+ */
+function hasSeedableContent(path: string): boolean {
+  if (!existsSync(path)) return false;
+  let db: Database | null = null;
+  try {
+    db = new Database(path, { readonly: true });
+    let nodes: number;
+    try {
+      nodes = db.query<{ c: number }, []>("SELECT COUNT(*) AS c FROM nodes").get()?.c ?? 0;
+    } catch {
+      return true; // no `nodes` table → not a hayven graph index; leave as-is
+    }
+    if (nodes === 0) return false; // THE BUG: an emptied index must not propagate
+    // A set `ingest_in_progress` marker means an ingest cleared or half-rewrote
+    // this index and never finished — the other state we must not propagate.
+    // Mirrors `Db.checkIndexIntegrity`; read directly here so this stays a plain
+    // `bun:sqlite` read with no Db-wrapper (and no migrate) side effects.
+    try {
+      const marker = db
+        .query<{ value: string }, [string]>("SELECT value FROM stats WHERE key = ?")
+        .get("ingest_in_progress");
+      if (marker !== null && marker !== undefined) return false;
+    } catch {
+      // no `stats` table — the node count above already vouched for content
+    }
+    return true;
+  } catch {
+    return true; // unopenable/unreadable → unchanged from prior behaviour
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      // ignore close failures
+    }
+  }
 }
 
 /** One per-branch cache directory removed by {@link pruneBranches}. */

@@ -19,14 +19,36 @@ set -eu
 log() { printf '%s\n' "$*" >&2; }
 
 # Only act inside Hayvenhurst projects.
+#
+# `$HOME/.hayven` is the GLOBAL config dir (registry, writer id, logs), not a
+# project marker — so a bare `[ -d .hayven ]` says "yes, a project" whenever a
+# session happens to start in the home dir. That started a daemon with cwd=$HOME,
+# which registered the user's ENTIRE home tree as one project and indexed it.
+# Home is never a project: bail before the marker check.
+#
+# Guard the compare on HOME being set AND non-empty first. Under `set -u` an
+# unset HOME aborts the script at expansion time (before any `2>/dev/null` can
+# suppress it), and — worse — `cd ""` SUCCEEDS and stays put, so an empty HOME
+# would make `$(cd "$HOME" && pwd -P)` return the CURRENT dir and the equality
+# hold everywhere, silently disabling this hook in every project. Empty/unset
+# HOME shows up under launchd/systemd, some CI runners, and slim containers;
+# there we cannot identify home, so just skip the home check and carry on.
+#
+# Resolve it ONCE here. Every later `$HOME` use has the same `set -u` hazard,
+# and an empty HOME would otherwise send the log dir to `/.hayven/logs` (which
+# fails read-only on macOS).
+HOME_DIR="${HOME:-}"
+if [ -n "$HOME_DIR" ] && [ -d "$HOME_DIR" ]; then
+  [ "$(pwd -P)" != "$(cd "$HOME_DIR" && pwd -P)" ] || exit 0
+fi
 [ -d .hayven ] || exit 0
 
 # Find the hayven binary: PATH first, then the plugin's persistent install dir.
 HAYVEN_BIN=""
 if command -v hayven >/dev/null 2>&1; then
   HAYVEN_BIN="$(command -v hayven)"
-elif [ -x "${CLAUDE_PLUGIN_DATA:-$HOME/.local}/bin/hayven" ]; then
-  HAYVEN_BIN="${CLAUDE_PLUGIN_DATA:-$HOME/.local}/bin/hayven"
+elif [ -x "${CLAUDE_PLUGIN_DATA:-$HOME_DIR/.local}/bin/hayven" ]; then
+  HAYVEN_BIN="${CLAUDE_PLUGIN_DATA:-$HOME_DIR/.local}/bin/hayven"
 else
   # install-hayven.sh --check (the other SessionStart hook) already tells the
   # user how to install; nothing useful to add here.
@@ -50,7 +72,13 @@ fi
 # process group. Output goes to the user-global log the daemon also uses.
 # (Backgrounding always "succeeds"; a failed start surfaces in autostart.log
 # and the next session's health probe retries.)
-LOG_DIR="$HOME/.hayven/logs"
+# With no usable HOME, fall back to a temp dir rather than `/.hayven/logs`,
+# which `mkdir -p` cannot create on a read-only root.
+if [ -n "$HOME_DIR" ]; then
+  LOG_DIR="$HOME_DIR/.hayven/logs"
+else
+  LOG_DIR="${TMPDIR:-/tmp}/hayven-logs"
+fi
 mkdir -p "$LOG_DIR"
 ( nohup "$HAYVEN_BIN" daemon start >>"$LOG_DIR/autostart.log" 2>&1 & )
 log "hayven: daemon was not running, started it (port $PORT, log: $LOG_DIR/autostart.log)"

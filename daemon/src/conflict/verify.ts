@@ -296,21 +296,84 @@ export async function verifyMerge(
 // (`startParse` for the native parser, `Bun.spawn` for typecheckers).
 
 /** Minimal `Bun.spawn` subset we use for typecheck subprocesses. */
-type SpawnFn = (cmd: string[], opts: { cwd: string }) => Promise<{
+export type SpawnFn = (cmd: string[], opts: { cwd: string; timeoutMs?: number | undefined }) => Promise<{
   exitCode: number;
   stdout: string;
   stderr: string;
+  /** True when the process was killed for exceeding `timeoutMs`. */
+  timedOut?: boolean;
 }>;
 
-/** Default spawn: run a command in `cwd`, capture exit + stdout/stderr. */
-const bunSpawn: SpawnFn = async (cmd, opts) => {
+/**
+ * Default wall-clock ceiling on ONE typecheck subprocess.
+ *
+ * These commands are whole-PROJECT checks (`tsc --noEmit` ignores the changed
+ * file list entirely), and they used to run with no timeout and no kill on the
+ * watcher's hot path — so a single one-file save triggered a native parse, a
+ * SECOND native parse of the same file, and then a full-project typecheck. A
+ * `cargo check` blocked on the user's own `cargo build` lock simply never
+ * returned, wedging the project's ingest chain indefinitely; the daemon's
+ * shutdown drain then timed out at 5 s and closed the Db underneath it.
+ */
+export const TYPECHECK_TIMEOUT_MS = 60_000;
+/** Grace between SIGTERM and SIGKILL for a typecheck that ignores the first. */
+const TYPECHECK_KILL_GRACE_MS = 2_000;
+/** How long we wait for stdout/stderr AFTER the process has exited. */
+const OUTPUT_DRAIN_MS = 2_000;
+
+/**
+ * Default spawn: run a command in `cwd`, capture exit + stdout/stderr, and KILL
+ * it if it outlives `timeoutMs`. Exported so the kill path can be tested
+ * directly against a real hanging process.
+ */
+export const spawnWithTimeout: SpawnFn = async (cmd, opts) => {
   const proc = Bun.spawn(cmd, { cwd: opts.cwd, stdout: "pipe", stderr: "pipe" });
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  return { exitCode, stdout, stderr };
+  const limit = opts.timeoutMs ?? TYPECHECK_TIMEOUT_MS;
+  let timedOut = false;
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  let hardKillTimer: ReturnType<typeof setTimeout> | undefined;
+  if (limit > 0 && Number.isFinite(limit)) {
+    killTimer = setTimeout(() => {
+      timedOut = true;
+      try {
+        proc.kill("SIGTERM");
+      } catch {
+        // Already gone.
+      }
+      // Escalate: a wedged `cargo`/`tsc` that ignores SIGTERM must still die, or
+      // the bound we just added is not a bound.
+      hardKillTimer = setTimeout(() => {
+        try {
+          proc.kill("SIGKILL");
+        } catch {
+          // Already gone.
+        }
+      }, TYPECHECK_KILL_GRACE_MS);
+    }, limit);
+  }
+  // Start the reads BEFORE awaiting exit, or a chatty command fills the pipe
+  // buffer and deadlocks waiting for us to drain it.
+  const stdoutP = new Response(proc.stdout).text().catch(() => "");
+  const stderrP = new Response(proc.stderr).text().catch(() => "");
+  try {
+    const exitCode = await proc.exited;
+    // Killing the process does NOT necessarily close these pipes: a grandchild
+    // that inherited them (`sh -c` leaving a `sleep` behind, `cargo` leaving a
+    // `rustc`) keeps the write end open, so awaiting the reads would hang
+    // forever on exactly the runs we just killed to avoid hanging. Bound it and
+    // accept truncated output — the exit code and `timedOut` are what matter.
+    const [stdout, stderr] = await Promise.race([
+      Promise.all([stdoutP, stderrP]),
+      new Promise<[string, string]>((resolve) => {
+        const t = setTimeout(() => resolve(["", ""]), OUTPUT_DRAIN_MS);
+        if (typeof t.unref === "function") t.unref();
+      }),
+    ]);
+    return { exitCode, stdout, stderr, timedOut };
+  } finally {
+    if (killTimer) clearTimeout(killTimer);
+    if (hardKillTimer) clearTimeout(hardKillTimer);
+  }
 };
 
 /**
@@ -362,16 +425,32 @@ export function defaultTypecheck(opts: {
   root: string;
   spawn?: SpawnFn | undefined;
   logger?: Logger | undefined;
+  /** Wall-clock ceiling per typecheck subprocess. Default
+   *  {@link TYPECHECK_TIMEOUT_MS}; the process is SIGTERM'd then SIGKILL'd. */
+  timeoutMs?: number | undefined;
 }): TypecheckFn {
-  const spawn = opts.spawn ?? bunSpawn;
+  const spawn = opts.spawn ?? spawnWithTimeout;
+  const timeoutMs = opts.timeoutMs ?? TYPECHECK_TIMEOUT_MS;
   const has = (p: string): boolean => existsSync(join(opts.root, p));
+  /**
+   * A killed typecheck proves nothing about the code, so it must NOT be
+   * reported as a type error (that would flag `merge_rejected` on files that
+   * may be perfectly fine). It is a GATE failure: thrown, so the daemon routes
+   * it to the ingest breaker instead of logging and moving on.
+   */
+  const throwIfTimedOut = (r: { timedOut?: boolean }, cmd: string): void => {
+    if (r.timedOut === true) {
+      throw new Error(`typecheck \`${cmd}\` exceeded ${timeoutMs}ms and was killed`);
+    }
+  };
 
   return async (language: string, files: string[]): Promise<TypecheckOutcome> => {
     switch (language) {
       case "typescript":
       case "tsx": {
         if (!has("tsconfig.json")) return { configured: false, ok: true };
-        const r = await spawn(["tsc", "--noEmit"], { cwd: opts.root });
+        const r = await spawn(["tsc", "--noEmit"], { cwd: opts.root, timeoutMs });
+        throwIfTimedOut(r, "tsc --noEmit");
         if (r.exitCode === 0) return { configured: true, ok: true };
         // tsc not on PATH → exit code is platform-specific; treat a spawn-level
         // failure (127/ENOENT surfaced as nonzero with empty stdout) as
@@ -383,14 +462,16 @@ export function defaultTypecheck(opts: {
         const configured =
           has("mypy.ini") || has("setup.cfg") || has("pyproject.toml");
         if (!configured) return { configured: false, ok: true };
-        const r = await spawn(["mypy", ...files], { cwd: opts.root });
+        const r = await spawn(["mypy", ...files], { cwd: opts.root, timeoutMs });
+        throwIfTimedOut(r, "mypy");
         if (r.exitCode === 0) return { configured: true, ok: true };
         if (isMissingTool(r)) return { configured: false, ok: true };
         return { configured: true, ok: false, reason: tail(r.stdout || r.stderr) };
       }
       case "rust": {
         if (!has("Cargo.toml")) return { configured: false, ok: true };
-        const r = await spawn(["cargo", "check", "--quiet"], { cwd: opts.root });
+        const r = await spawn(["cargo", "check", "--quiet"], { cwd: opts.root, timeoutMs });
+        throwIfTimedOut(r, "cargo check");
         if (r.exitCode === 0) return { configured: true, ok: true };
         if (isMissingTool(r)) return { configured: false, ok: true };
         return { configured: true, ok: false, reason: tail(r.stderr || r.stdout) };

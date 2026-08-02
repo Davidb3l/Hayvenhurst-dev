@@ -16,6 +16,13 @@ import { applyLww, makeLwwOp, type LwwOp, type LwwState } from "./lww.ts";
 import { OpLog, type CrdtType } from "./oplog.ts";
 import { OrSetState, type OrAddOp, type OrOp, type OrRemoveOp } from "./orset.ts";
 import {
+  addOpCountViolations,
+  CRDT_LIMITS,
+  inspectRetention,
+  warnRetention,
+  type CrdtLimits,
+} from "./retention.ts";
+import {
   gsetToWire,
   lwwToWire,
   orToWire,
@@ -32,6 +39,12 @@ export interface CrdtStateOptions {
   now?: () => number;
   /** Skip hydrate-from-disk in tests where it would slow things down. */
   skipHydrate?: boolean;
+  /**
+   * Growth bounds used by the hydrate-time health check (F2). Defaults to
+   * {@link CRDT_LIMITS}; injectable so a test can drive the warning path
+   * without having to build a half-gigabyte op log first.
+   */
+  limits?: CrdtLimits;
 }
 
 /**
@@ -70,14 +83,29 @@ export class CrdtState {
    */
   private readonly opsListeners = new Set<LocalOpsListener>();
 
+  /** Growth bounds for the hydrate-time health check (F2). */
+  private readonly limits: CrdtLimits;
+
   constructor(opts: CrdtStateOptions) {
     this.writer = loadOrCreateWriterId(opts.configFile);
     this.clock = new HlcGenerator({ now: opts.now });
     this.oplog = new OpLog(opts.crdtRoot, { now: opts.now });
+    this.limits = opts.limits ?? CRDT_LIMITS;
     if (!opts.skipHydrate) this.hydrate();
   }
 
-  /** Replay every persisted op into the in-memory states. */
+  /**
+   * Replay every persisted op into the in-memory states.
+   *
+   * F2: this is the moment the op log's unbounded growth actually bills the
+   * user — every segment is read in full and every op ever recorded is
+   * materialized into a Map that lives for the daemon's lifetime. Nothing in
+   * `crdt/` prunes, so the cost only ever rises, and it used to do so with no
+   * signal whatsoever. We now measure the log (via `stat`, never a read) and
+   * shout on stderr when it crosses a bound. See `retention.ts` for why this
+   * warns instead of deleting: pruning a segment diverges our Merkle root
+   * from every peer that kept it, and they would push it straight back.
+   */
   hydrate(): { lww: number; gset: number; orset: number } {
     const counts = { lww: 0, gset: 0, orset: 0 };
     for (const wireOp of this.oplog.hydrate("gset")) {
@@ -88,6 +116,13 @@ export class CrdtState {
     }
     for (const wireOp of this.oplog.hydrate("lww")) {
       if (this.applyWireOpInMemory(wireOp)) counts.lww += 1;
+    }
+    try {
+      warnRetention(
+        addOpCountViolations(inspectRetention(this.oplog, this.limits), counts, this.limits),
+      );
+    } catch {
+      // A diagnostic must never be able to stop a daemon from starting.
     }
     return counts;
   }

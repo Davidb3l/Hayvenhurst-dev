@@ -4,6 +4,7 @@
 import { existsSync } from "node:fs";
 
 import { loadConfig } from "../config/load.ts";
+import { isRegistrableRoot } from "../daemon/registry.ts";
 import { resolveReadIndex } from "../db/branch_index.ts";
 import { Db } from "../db/queries.ts";
 import { canonicalRoot, detectRepoRoot, hayvenPathsFor, type HayvenPaths } from "../util/paths.ts";
@@ -21,6 +22,20 @@ export interface ProjectContext {
  */
 export function requireProject(cwd: string = process.cwd()): ProjectContext {
   const { root, reason } = detectRepoRoot(cwd);
+  // The REGISTRY guard only stops a bad root from being PERSISTED. It does not
+  // stop the damage: in `$HOME`, `detectRepoRoot` falls through to
+  // `cwd-fallback`, `paths.hayvenDir` resolves to `~/.hayven` — which exists,
+  // because it is the global config dir — and the `existsSync` below passes.
+  // Every daemonless command (`ingest`, `reindex`, `view`, `mcp`, `proxy`, …)
+  // funnels through here, so without this check they would each happily walk
+  // and re-index the user's ENTIRE home tree. This is the real chokepoint for
+  // the CPU/disk blowup; the registry is the chokepoint for persistence.
+  if (!isRegistrableRoot(root)) {
+    throw new Error(
+      `Refusing to operate on ${root} as a project — \`~/.hayven\` is the global\n` +
+        "config dir, not a project marker. cd into a repository and run this there.\n",
+    );
+  }
   const paths = hayvenPathsFor(root);
   if (!existsSync(paths.hayvenDir)) {
     throw new Error(
@@ -82,6 +97,14 @@ export type HotAddResult =
  * to `no-daemon`, and the caller falls back to "loads on next start".
  */
 export async function hotAddToRunningDaemon(root: string, base: string, alias?: string): Promise<HotAddResult> {
+  // Guard CLIENT-side too, not just in the daemon's `addProjectLive`. This is
+  // the path a `daemon start` takes when a daemon is ALREADY up, and that
+  // daemon may be an older build with no guard — in which case an un-upgraded
+  // process would happily accept `$HOME` and index the user's whole tree.
+  // Refusing here means the new CLI cannot re-arm the bug through an old daemon.
+  if (!isRegistrableRoot(root)) {
+    return { kind: "error", message: `refusing to serve ${root} as a project (see \`hayven daemon register --help\`)` };
+  }
   let res: Response;
   try {
     res = await fetch(`${base}/api/projects`, {

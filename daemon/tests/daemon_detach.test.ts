@@ -17,6 +17,7 @@ import {
   probeDaemon,
   waitForDaemon,
 } from "../src/daemon/detach.ts";
+import { VERSION } from "../src/version.ts";
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -88,9 +89,13 @@ describe("looksLikeHayvenHealth", () => {
 });
 
 describe("probeDaemon", () => {
+  // NB: these payloads must report a version this CLI accepts — `probeDaemon`
+  // now runs the CLI↔daemon handshake, so a stale version string would make the
+  // probe answer `foreign` and these shape assertions would be testing the
+  // handshake by accident. Pin them to our own VERSION so they cannot drift.
   it("classifies a hayven health payload as `hayven`", async () => {
     const probe = await probeDaemon("http://x", (async () =>
-      jsonResponse({ ok: true, version: "0.0.5", root: "/repo" })) as unknown as typeof fetch);
+      jsonResponse({ ok: true, version: VERSION, root: "/repo" })) as unknown as typeof fetch);
     expect(probe.kind).toBe("hayven");
     if (probe.kind === "hayven") expect(probe.health.root).toBe("/repo");
   });
@@ -127,7 +132,7 @@ describe("waitForDaemon", () => {
     const fetchImpl = (async () => {
       calls++;
       if (calls < 3) throw new Error("ECONNREFUSED"); // still starting
-      return jsonResponse({ ok: true, version: "0.0.5", root: "/repo" });
+      return jsonResponse({ ok: true, version: VERSION, root: "/repo" });
     }) as unknown as typeof fetch;
     const health = await waitForDaemon("http://x", {
       timeoutMs: 5_000,

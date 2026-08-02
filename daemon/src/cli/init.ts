@@ -19,16 +19,107 @@ import { join, relative } from "node:path";
 
 import { DEFAULT_CONFIG } from "../config/defaults.ts";
 import { loadConfig, writeConfig } from "../config/load.ts";
-import { registerProject } from "../daemon/registry.ts";
+import { isRegistrableRoot, registerProject } from "../daemon/registry.ts";
 import { hotAddToRunningDaemon } from "./_shared.ts";
 import { Db } from "../db/queries.ts";
-import { detectRepoRoot, hayvenPathsFor, rootConfirmDecision } from "../util/paths.ts";
+import {
+  countIndexableFiles,
+  detectRepoRoot,
+  hayvenPathsFor,
+  rootConfirmDecision,
+  type BoundedFileCount,
+} from "../util/paths.ts";
 import type { ParsedArgs } from "../cli.ts";
 import { runIngest } from "./ingest.ts";
+
+/**
+ * Default `--max-files` ceiling for a first ingest.
+ *
+ * Sized to be far above any single repo an agent realistically navigates
+ * (Hayvenhurst's own bench corpus tops out in the low thousands; the largest
+ * mainstream OSS monorepos are tens of thousands) and far BELOW the trees that
+ * caused the incident — a Mac home dir or `~/Library` runs to hundreds of
+ * thousands of files. A genuinely huge single repo trips it, which is the
+ * intended trade: a loud, one-flag-overridable refusal beats six hours of
+ * silent 98%-CPU indexing.
+ */
+export const DEFAULT_MAX_INIT_FILES = 50_000;
+
+/**
+ * Parse `--max-files`: a positive integer ceiling, `null` for "no ceiling"
+ * (`off`/`none`/`0`), or an `Error` describing a bad value. Never silently
+ * falls back to the default on a typo — `--max-files=1O000` (letter O) must not
+ * quietly re-arm the unbounded walk.
+ */
+export function parseMaxFiles(flag: string | boolean | undefined): number | null | Error {
+  if (flag === undefined) return DEFAULT_MAX_INIT_FILES;
+  if (flag === true) return new Error("--max-files needs a value, e.g. --max-files=200000 or --max-files=off");
+  const raw = String(flag).trim().toLowerCase();
+  if (raw === "off" || raw === "none" || raw === "0") return null;
+  if (!/^[0-9]+$/.test(raw)) {
+    return new Error(`--max-files must be a positive integer, "off" or "none" (got ${JSON.stringify(String(flag))})`);
+  }
+  const n = Number(raw);
+  // Normalize AFTER parsing, not just on the literal "0": `--max-files=00` is
+  // still zero, and a ceiling of zero would reject every directory on earth
+  // with a nonsensical "contains 1 files, above the ceiling of 0".
+  return n === 0 ? null : n;
+}
+
+/**
+ * The refusal message for a pre-flight scan, or `null` to proceed.
+ *
+ * FAILS CLOSED on an incomplete scan. `exact: false` means the counter hit its
+ * own cap or time budget, so `count` is a LOWER BOUND and `exceeded: false`
+ * means "did not prove it is over", not "is under". A ceiling that waves
+ * through the case it could not measure is not a ceiling — and a tree too slow
+ * to finish counting (a cold `~/Library`, a network mount) is exactly the one
+ * worth refusing.
+ *
+ * Separate from {@link runInit} so the verdict is testable without a filesystem
+ * big or slow enough to hit the counter's own bounds.
+ */
+export function ceilingVerdict(root: string, scan: BoundedFileCount, ceiling: number): string | null {
+  if (!scan.exceeded && scan.exact) return null;
+  const found = scan.exact
+    ? `${scan.count.toLocaleString()} files`
+    : `at least ${scan.count.toLocaleString()} files (the count did not finish)`;
+  // Naming `ceiling * 10` would be useless when the scan stopped AT that cap:
+  // the re-run counts higher and fails identically. Only suggest a number when
+  // we actually know one.
+  const raise = scan.exact
+    ? `  hayven init --max-files=${scan.count}   # accept this tree's ${scan.count.toLocaleString()} files\n`
+    : "";
+  return (
+    `error: refusing to initialize ${root} — it contains ${found},\n` +
+    `at or above the --max-files ceiling of ${ceiling.toLocaleString()}.\n\n` +
+    "The first ingest walks and parses every one of them. A count this large\n" +
+    "almost always means this root is not a single project — a home dir,\n" +
+    "/Users, ~/Library, or a mounted volume. Indexing one of those pegs a\n" +
+    "core for hours and writes a multi-hundred-MB index.\n\n" +
+    "If it really is one project, re-run with an explicit ceiling:\n" +
+    raise +
+    "  hayven init --max-files=off   # no ceiling at all\n"
+  );
+}
 
 export async function runInit(args: ParsedArgs): Promise<number> {
   const cwd = (typeof args.flags["cwd"] === "string" ? args.flags["cwd"] : undefined) ?? process.cwd();
   const { root, reason } = detectRepoRoot(cwd);
+
+  // Reject `$HOME` BEFORE creating anything. The `registerProject` call in
+  // step 5d is deliberately best-effort (a registry failure must not fail an
+  // otherwise-good init), so its throw is swallowed — meaning without this
+  // check, `hayven init` in the home dir would build the project tree and then
+  // run step 6's first ingest across the user's ENTIRE home directory.
+  if (!isRegistrableRoot(root)) {
+    process.stderr.write(
+      `error: refusing to initialize ${root} as a project — \`~/.hayven\` is the\n` +
+        "global config dir, not a project marker. cd into a repository first.\n",
+    );
+    return 1;
+  }
+
   const paths = hayvenPathsFor(root);
 
   if (existsSync(paths.hayvenDir)) {
@@ -37,6 +128,28 @@ export async function runInit(args: ParsedArgs): Promise<number> {
         "Use `hayven reindex` to rebuild the index, or `rm -rf .hayven/` to start fresh.\n",
     );
     return 1;
+  }
+
+  // Bound the work BEFORE creating anything.
+  //
+  // `isRegistrableRoot` above is a two-item denylist: it blocks `$HOME` and
+  // `/`, and nothing else. `~/Library`, `~/Documents`, `/Users`, `/Volumes`
+  // and `/System` all pass it today, and `hayven init` in any of them creates
+  // the project and then walks it — `~/Library/Python/site-packages` is the
+  // tree that produced most of the incident's 195 GB. The lesson of that
+  // incident was not "home is special", it was "an unbounded walk with no
+  // ceiling and no warning". So: count first, and refuse loudly.
+  const ceiling = parseMaxFiles(args.flags["max-files"]);
+  if (ceiling instanceof Error) {
+    process.stderr.write(`error: ${ceiling.message}\n`);
+    return 1;
+  }
+  if (ceiling !== null) {
+    const verdict = ceilingVerdict(root, countIndexableFiles(root, ceiling), ceiling);
+    if (verdict !== null) {
+      process.stderr.write(verdict);
+      return 1;
+    }
   }
 
   if (reason === "cwd-fallback") {
@@ -91,8 +204,26 @@ export async function runInit(args: ParsedArgs): Promise<number> {
   writeConfig(paths.configFile, DEFAULT_CONFIG);
 
   // 4. SQLite schema.
+  //
+  // `migrate()` refuses an index written by a NEWER hayven (`SchemaTooNewError`
+  // from db/migrations.ts) rather than migrating it DOWN and discarding the
+  // newer schema's tables. That refusal is deliberate — surface it as a clean
+  // error, not a stack trace. Same shape as the `--max-files` ceiling above:
+  // stop before doing damage, and say exactly what to do about it.
   const db = new Db(paths.sqliteFile);
-  const migration = db.migrate();
+  let migration;
+  try {
+    migration = db.migrate();
+  } catch (err) {
+    db.close(); // release the handle before bailing — no double close below
+    process.stderr.write(
+      `error: ${(err as Error).message}\n` +
+        // We already created the tree above, so a bare retry would hit
+        // "`.hayven/` already exists" and look like a different problem.
+        `Remove the partially created ${paths.hayvenDir} before retrying.\n`,
+    );
+    return 1;
+  }
   db.close();
 
   // 5. Skill copy (graceful). Resolve the skill SOURCE from beside the binary

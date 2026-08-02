@@ -4,9 +4,9 @@
  * Centralizes repo-root detection (walk up looking for `.git/` then `.hayven/`)
  * and the canonical sub-paths inside `.hayven/`.
  */
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 
 /**
  * Canonical, symlink-resolved absolute path — the identity key for a served
@@ -144,24 +144,38 @@ export function detectRepoRoot(
   root: string;
   reason: "hayven" | "git" | "cwd-fallback";
 } {
-  const home = resolve(opts.homeDir ?? homedir());
+  // BOTH notions of "home" are off-limits, and they are NOT the same thing:
+  // `homedir()` is the user's actual home, `hayvenHomeDir()` is where global
+  // state lives. They coincide in production (nobody sets `$HAYVEN_HOME`).
+  // Checking only the latter would mean a user who legitimately relocates state
+  // (`HAYVEN_HOME=/opt/hayven`) loses this boundary on their REAL home and
+  // re-arms the whole-home-tree indexing bug; checking only the former makes a
+  // sandbox's global `.hayven` look like a project root. So: check both.
+  const homes = (opts.homeDir !== undefined ? [opts.homeDir] : [homedir(), hayvenHomeDir()]).map((h) =>
+    resolve(h),
+  );
+  const isHome = (p: string): boolean => homes.includes(resolve(p));
   // BL-15: bound BOTH marker walks at `$HOME`, but only when the start dir is
   // at/below home. A start ABOVE home (e.g. a system path outside the user's
-  // tree) keeps an unbounded walk so out-of-home repos resolve normally.
+  // tree) keeps an unbounded walk so out-of-home repos resolve normally. With
+  // two candidate homes, bound at the DEEPEST one that contains the start, so
+  // the tighter boundary wins.
   const startResolved = resolve(start);
-  const withinHome = startResolved === home || startResolved.startsWith(home + sep);
-  const stopAt = withinHome ? { stopAt: home } : {};
+  const containing = homes
+    .filter((h) => startResolved === h || startResolved.startsWith(h + sep))
+    .sort((a, b) => b.length - a.length);
+  const stopAt = containing.length > 0 ? { stopAt: containing[0] as string } : {};
 
   const hayven = findUp(startResolved, HAYVEN_DIR_NAME, stopAt);
   // Treat the home dir's `.hayven` as the global config dir, not a project
   // root: skip it and fall through to `.git` / cwd.
-  if (hayven && resolve(hayven) !== home) return { root: hayven, reason: "hayven" };
+  if (hayven && !isHome(hayven)) return { root: hayven, reason: "hayven" };
   const git = findUp(startResolved, ".git", stopAt);
   // BL-15: `$HOME` itself is never a project root. A stray `~/.git` (or a home
   // dir under version control) must not make every uninitialized project under
   // `$HOME` resolve its root to home; skip it like the `~/.hayven` case and
   // fall through to the cwd fallback.
-  if (git && resolve(git) !== home) return { root: git, reason: "git" };
+  if (git && !isHome(git)) return { root: git, reason: "git" };
   return { root: startResolved, reason: "cwd-fallback" };
 }
 
@@ -323,9 +337,31 @@ export function resolveSkillSource(): string {
   return resolve(process.cwd(), "skill", "hayvenhurst.md");
 }
 
+/**
+ * The home directory Hayvenhurst anchors its global state to.
+ *
+ * `$HAYVEN_HOME` overrides it. Two reasons: it lets a user relocate global
+ * state, and it is the ONLY way to sandbox this in a test — Bun resolves
+ * `os.homedir()` once per process, so mutating `process.env.HOME` at runtime
+ * does nothing and a test that tried would silently read and rewrite the
+ * developer's real `~/.hayven/projects.json`.
+ */
+export function hayvenHomeDir(): string {
+  const override = process.env["HAYVEN_HOME"];
+  if (!override || override.trim().length === 0) return homedir();
+  // Must be ABSOLUTE. `resolve()` on a relative value is cwd-relative, so a
+  // daemon started in repo A and a CLI run in repo B would silently use
+  // different registries, writer ids, and logs — global state that moves with
+  // the working directory is worse than no override at all.
+  if (!isAbsolute(override)) {
+    throw new Error(`HAYVEN_HOME must be an absolute path (got ${JSON.stringify(override)}).`);
+  }
+  return resolve(override);
+}
+
 /** Global Hayvenhurst directory under the user's home. */
 export function globalHayvenDir(): string {
-  return join(homedir(), HAYVEN_DIR_NAME);
+  return join(hayvenHomeDir(), HAYVEN_DIR_NAME);
 }
 
 export function globalConfigFile(): string {
@@ -342,4 +378,106 @@ export function isDirectory(path: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Directory names the pre-flight count skips, mirroring `ALWAYS_SKIP_DIRS` +
+ * `VENDORED_DIRS` in `native/src/parse/walker.rs`. This is a pre-flight
+ * ESTIMATE, not a second implementation of the walker: it does not read
+ * `.gitignore`, so it can only ever over-count relative to what the native
+ * walker would parse. Over-counting is the safe direction for a ceiling whose
+ * job is to catch "this root is not a project at all".
+ */
+const PREFLIGHT_SKIP_DIRS: ReadonlySet<string> = new Set([
+  "node_modules",
+  "target",
+  "dist",
+  "build",
+  ".venv",
+  "venv",
+  "__pycache__",
+  ".hayven",
+  ".git",
+  ".next",
+  ".turbo",
+  ".cache",
+  "vendor",
+  "Godeps",
+  "third_party",
+]);
+
+export interface BoundedFileCount {
+  /** Files seen. A LOWER BOUND when `exact` is false. */
+  readonly count: number;
+  /** True when the tree holds more than `ceiling` countable files. */
+  readonly exceeded: boolean;
+  /** False when the scan stopped at its own hard cap or time budget. */
+  readonly exact: boolean;
+}
+
+/**
+ * Count the files a first ingest would walk under `root`, with hard bounds.
+ *
+ * WHY THIS EXISTS: the home-directory incident (98% CPU for 6h, 195 GB read, a
+ * 593 MB index) was NOT caused by home being special. It was caused by an
+ * UNBOUNDED walk with no ceiling — home merely happened to be the one root that
+ * had a guard. `~/Library`, `~/Documents`, `/Users` and `/Volumes` all still
+ * pass `isRegistrableRoot`, and `~/Library/Python/site-packages` is the tree
+ * that produced most of that 195 GB. So callers get a cheap number they can
+ * refuse on BEFORE any of the expensive work starts.
+ *
+ * The counter is itself bounded, or it would just be the same unbounded walk
+ * one step earlier: it stops at `scanCap` files or `budgetMs` of wall clock and
+ * reports `exact: false`, so the caller can still say "more than N". It reads
+ * directory entries only — never file contents — and never follows symlinks
+ * (matching the native walker, and closing the directory-cycle hazard).
+ */
+export function countIndexableFiles(
+  root: string,
+  ceiling: number,
+  opts: { scanCap?: number; budgetMs?: number } = {},
+): BoundedFileCount {
+  // Keep counting past the ceiling so the error message can name a real number
+  // instead of "more than N" — but only to a hard multiple of it, so a truly
+  // enormous tree still terminates quickly.
+  const scanCap = opts.scanCap ?? Math.max(ceiling * 10, ceiling + 1);
+  const budgetMs = opts.budgetMs ?? 10_000;
+  const deadline = Date.now() + budgetMs;
+  const stack: string[] = [resolve(root)];
+  let count = 0;
+  let checked = 0;
+
+  while (stack.length > 0) {
+    const dir = stack.pop() as string;
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue; // unreadable dir (perms, a vanished path) — not a reason to fail
+    }
+    for (const e of entries) {
+      // Symlinks are neither counted nor descended into: the native walker does
+      // not follow them either, and descending would let a single `~/x -> ~`
+      // link make this scan non-terminating. Belt-and-braces — `readdirSync`
+      // dirents already carry lstat semantics, so `isDirectory()` is false for
+      // a link — but stated explicitly so a later switch to `stat` cannot
+      // quietly reintroduce the cycle.
+      if (e.isSymbolicLink()) continue;
+      if (e.isDirectory()) {
+        if (e.name.startsWith(".") || PREFLIGHT_SKIP_DIRS.has(e.name)) continue;
+        stack.push(join(dir, e.name));
+        continue;
+      }
+      if (!e.isFile()) continue;
+      if (e.name.startsWith(".")) continue; // the walker runs with hidden(true)
+      count++;
+      if (count >= scanCap) return { count, exceeded: count > ceiling, exact: false };
+    }
+    // Check the clock per directory, not per file — `Date.now()` in the inner
+    // loop would dominate the cost of the scan it is supposed to bound.
+    if (++checked % 64 === 0 && Date.now() > deadline) {
+      return { count, exceeded: count > ceiling, exact: false };
+    }
+  }
+  return { count, exceeded: count > ceiling, exact: true };
 }

@@ -126,6 +126,15 @@ CREATE TABLE IF NOT EXISTS call_sites (
 
 CREATE INDEX IF NOT EXISTS call_sites_dst ON call_sites(dst);
 CREATE INDEX IF NOT EXISTS call_sites_dst_loc ON call_sites(dst, file, line, col);
+-- \`deleteCallSitesByFile\` (the per-file purge on the incremental ingest path)
+-- filters on \`file\`, which no index covered — every purge FULL-SCANNED the
+-- table, once per changed file. The existing \`(dst, file, …)\` index cannot
+-- serve it: \`dst\` is the leading column. Deliberately NOT a SCHEMA_VERSION
+-- bump — it is a pure \`CREATE INDEX IF NOT EXISTS\` that every \`migrate()\`
+-- applies to fresh and existing DBs alike, with no data migration. Bumping
+-- would make an index touched by this build unreadable to the previous one for
+-- no reason (see \`assertSchemaCompatible\`).
+CREATE INDEX IF NOT EXISTS call_sites_file ON call_sites(file);
 
 CREATE TABLE IF NOT EXISTS claims (
   id          TEXT PRIMARY KEY,

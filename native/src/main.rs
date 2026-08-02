@@ -117,6 +117,19 @@ enum Cmd {
         /// honored as a no-op today.
         #[arg(long)]
         max_event_rate: Option<u64>,
+
+        /// Also emit change events for dependency-SOURCE directories
+        /// (`vendor/`, `Godeps/`, `third_party/`). Default OFF, matching
+        /// `parse`. Set it whenever the daemon ingests with the same flag, or
+        /// the watch and ingest paths disagree about the graph's contents.
+        #[arg(long)]
+        include_vendored: bool,
+
+        /// Also emit change events for test-fixture / example / benchmark
+        /// directories. Default OFF, matching `parse`. Pair it with
+        /// `parse --include-fixtures`.
+        #[arg(long)]
+        include_fixtures: bool,
     },
 
     /// Encode/decode CRDT wire records (the daemon's subprocess transport
@@ -188,7 +201,15 @@ fn main() -> ExitCode {
             root,
             debounce_ms: _,
             max_event_rate: _,
-        } => ExitCode::from(watch::run(root) as u8),
+            include_vendored,
+            include_fixtures,
+        } => ExitCode::from(watch::run(
+            root,
+            watch::WatchOptions {
+                include_vendored,
+                include_fixtures,
+            },
+        ) as u8),
         Cmd::Serialize { subcmd } => ExitCode::from(serialize::run(subcmd) as u8),
         Cmd::Infer {
             model,

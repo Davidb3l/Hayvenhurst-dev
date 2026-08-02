@@ -18,6 +18,7 @@ import {
   resolveReadIndex,
 } from "../src/db/branch_index.ts";
 import { Db } from "../src/db/queries.ts";
+import { registryFile } from "../src/daemon/registry.ts";
 import { hayvenPathsFor } from "../src/util/paths.ts";
 
 function findBinary(): string | null {
@@ -64,9 +65,44 @@ function hasNode(path: string, name: string): boolean {
 
 maybe("branch-aware ingest (E2E, native binary)", () => {
   let repo: string;
+  let sandboxHome: string;
+  let priorHayvenHome: string | undefined;
+  let priorPort: string | undefined;
+
+  /**
+   * A port nothing listens on, so `runInit`'s best-effort hot-add cannot reach a
+   * real daemon. See the two-channel note in `beforeEach`.
+   */
+  const DEAD_PORT = "7914";
 
   beforeEach(() => {
     if (bin) process.env["HAYVEN_NATIVE_BIN"] = bin;
+
+    // THIS SUITE USED TO WRITE THE DEVELOPER'S REAL STATE. It calls `runInit`
+    // five times, and that leaks through TWO separate channels — sandboxing
+    // only the first is not enough:
+    //
+    //  1. The registry FILE. `registerProject` writes `~/.hayven/projects.json`.
+    //     Unsandboxed, every run left a permanent entry pointing at a `mktemp`
+    //     dir that is deleted moments later in `afterEach`. This is exactly how
+    //     the user's registry accumulated 123 dead `/tmp/hayven-branch-e2e-*`
+    //     roots — the daemon then tried to load every one of them at startup.
+    //
+    //  2. The LIVE DAEMON. On success `runInit` hot-adds the new project by
+    //     POSTing to the port in the project's own config — 7777 by default. A
+    //     running daemon accepts it and registers the temp repo using ITS OWN
+    //     `HAYVEN_HOME`, so channel 1's sandbox does not help here at all.
+    //     `$HAYVEN_PORT` redirects that POST at nothing.
+    priorHayvenHome = process.env["HAYVEN_HOME"];
+    priorPort = process.env["HAYVEN_PORT"];
+    sandboxHome = mkdtempSync(join(tmpdir(), "hayven-branch-e2e-home-"));
+    process.env["HAYVEN_HOME"] = sandboxHome;
+    process.env["HAYVEN_PORT"] = DEAD_PORT;
+    // Tripwire: a silent leak becomes a loud failure. Never delete this.
+    if (!registryFile().startsWith(sandboxHome)) {
+      throw new Error(`registry sandbox escaped: ${registryFile()} is not under ${sandboxHome}`);
+    }
+
     repo = mkdtempSync(join(tmpdir(), "hayven-branch-e2e-"));
     git(repo, ["init", "-q", "-b", "main"]);
     git(repo, ["config", "user.email", "t@t.t"]);
@@ -79,6 +115,11 @@ maybe("branch-aware ingest (E2E, native binary)", () => {
 
   afterEach(() => {
     rmSync(repo, { recursive: true, force: true });
+    rmSync(sandboxHome, { recursive: true, force: true });
+    if (priorHayvenHome === undefined) delete process.env["HAYVEN_HOME"];
+    else process.env["HAYVEN_HOME"] = priorHayvenHome;
+    if (priorPort === undefined) delete process.env["HAYVEN_PORT"];
+    else process.env["HAYVEN_PORT"] = priorPort;
   });
 
   test("first ingest populates the branch index; reads resolve to it", async () => {

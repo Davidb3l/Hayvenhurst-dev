@@ -19,6 +19,7 @@ import {
   reresolveAllEdges,
   runIngest as drainIngest,
 } from "../graph/ingest.ts";
+import { removeNodeMarkdowns } from "../graph/nodeWriter.ts";
 import { locateNativeBinary, NativeBinaryNotFound } from "../native/locate.ts";
 import { startParse } from "../native/process.ts";
 import { rootLogger } from "../util/log.ts";
@@ -79,8 +80,25 @@ export async function runIngest(args: ParsedArgs): Promise<number> {
   // returns the legacy `.hayven/index.sqlite` and behaves exactly as before.
   const forceFull = args.flags["full"] === true || args.flags["full"] === "true";
   const writeIndex = resolveWriteIndex(paths, config, { seed: !forceFull });
-  const db = new Db(writeIndex.path);
-  db.migrate(); // safe to call repeatedly.
+  // The OPEN is inside the try, not just `migrate()`. The schema guard moved
+  // into `Db`'s constructor so it covers the daemonless writers and all the
+  // readonly paths that never migrate — which means `new Db(...)` is now the
+  // throw site, and a catch wrapped around `migrate()` alone misses it. That
+  // gap was live for exactly one test run.
+  let db: Db;
+  try {
+    db = new Db(writeIndex.path);
+    db.migrate(); // safe to call repeatedly.
+  } catch (err) {
+    // `SchemaTooNewError`: an old binary opening an index a NEWER daemon wrote.
+    // Migrating DOWN would silently discard the newer schema's tables and
+    // corrupt what that daemon stored, so the refusal is intentional and must
+    // not be defeated. Print it as an actionable error instead of stack-tracing
+    // out of the ingest; the message already names both versions and says to
+    // upgrade.
+    process.stderr.write(`ingest aborted: ${(err as Error).message}\n`);
+    return 1;
+  }
 
   // INCREMENTAL re-parse — the cheap path, for BOTH a branch switch AND a
   // same-branch refresh. `git diff <fromRef>` (no second ref) compares the
@@ -102,7 +120,30 @@ export async function runIngest(args: ParsedArgs): Promise<number> {
   if (!forceFull && pathArg === undefined) {
     const fromRef = db.getStat("last_ingest_git_head");
     const hasExistingGraph = db.counts().nodes > 0;
-    const eligible = fromRef !== null && (writeIndex.seededFrom !== null || hasExistingGraph);
+    // The incremental path re-parses ONLY the git diff, so it is correct only
+    // when the index it is amending actually holds the rest of the graph.
+    //
+    // This used to accept `writeIndex.seededFrom !== null` — "we copied a file"
+    // — as proof of that, which is not the same claim at all. A seed copied from
+    // an index emptied by an interrupted ingest satisfied it at 0 nodes, and
+    // because the seed also carried `last_ingest_git_head`, the branch then
+    // re-parsed only the diff forever: permanently partial, permanently
+    // self-certifying. Ask the graph directly instead. (`freshestSeed` now
+    // refuses empty/broken seeds too, so a genuinely-seeded index reaches here
+    // WITH content and still takes the fast path — this only removes the case
+    // where the copy was worthless.)
+    //
+    // A half-written index is likewise ineligible: amending a graph we know is
+    // incomplete would bake the damage in. Fall through to the full rebuild,
+    // which is the authoritative repair.
+    const integrity = db.checkIndexIntegrity();
+    if (!integrity.ok) {
+      process.stderr.write(
+        `note: index integrity check failed (${integrity.reason}: ${integrity.detail}) ` +
+          "— doing a FULL rebuild instead of an incremental re-parse.\n",
+      );
+    }
+    const eligible = fromRef !== null && hasExistingGraph && integrity.ok;
     const diff = eligible ? gitDiffSince(paths.repoRoot, fromRef!) : null;
     if (diff !== null) {
       // Only SOURCE files matter for the re-parse. Filtering out non-source paths
@@ -121,11 +162,33 @@ export async function runIngest(args: ParsedArgs): Promise<number> {
         });
       } else {
         incrementalFiles = changed;
+        // Flag the index BEFORE the destructive purge below. `drainIngest` marks
+        // it too, but only once it is entered — and the purge + `startParse`
+        // happen first, so a kill in that window would otherwise leave rows
+        // deleted with nothing recording that a rebuild was underway.
+        db.beginIngest();
         // Purge stale rows for every affected file FIRST (handles entities removed
         // from a modified file + outright deletions), mirroring the watcher's
         // incremental reconcile, so the re-parse is authoritative, not additive.
-        for (const f of deleted) db.deleteNodesByFile(f);
-        for (const f of changed) db.deleteNodesByFile(f);
+        // Capture each file's node ids BEFORE the delete so their markdown can be
+        // unlinked: `deleteNodesByFile` touches SQLite only, so without this every
+        // renamed or removed symbol leaves a permanent orphan under
+        // `.hayven/nodes/` and that directory grows monotonically forever.
+        const orphanIds: string[] = [];
+        for (const f of [...deleted, ...changed]) {
+          orphanIds.push(...db.nodeIdsForFile(f));
+          db.deleteNodesByFile(f);
+        }
+        // Unlink now; the re-parse immediately rewrites the ids that still exist.
+        // Best-effort — disk hygiene must never fail an ingest.
+        try {
+          const reclaimed = removeNodeMarkdowns(paths.nodesDir, orphanIds);
+          if (reclaimed > 0) logger.info("reclaimed node markdown", { removed: reclaimed });
+        } catch (err) {
+          logger.warn("node-markdown reclaim failed (non-fatal)", {
+            error: (err as Error).message,
+          });
+        }
         logger.info("incremental ingest", {
           branch: writeIndex.branchKey,
           seeded: writeIndex.seededFrom !== null,
@@ -136,19 +199,20 @@ export async function runIngest(args: ParsedArgs): Promise<number> {
     }
   }
 
-  // Clear nodes+edges before a whole-repo re-parse so the rebuild is idempotent
-  // (edges accumulate `weight += ` on conflict, so without a clear a repeated
-  // `hayven ingest` doubles every edge weight). A whole-repo ingest re-derives
-  // everything anyway; `--full` forces the same clear for a path-scoped ingest.
+  // Whether this run rebuilds the WHOLE graph, and therefore needs the
+  // nodes+edges clear that keeps a rebuild idempotent (edges accumulate
+  // `weight +=` on conflict, so without a clear a repeated `hayven ingest`
+  // doubles every edge weight). `--full` forces it for a path-scoped ingest;
   // SKIPPED on the incremental branch-switch path (we purge per-file above).
+  //
+  // We do NOT clear here. The clear is delegated to `drainIngest` via
+  // `clearBeforeIngest` so it happens AFTER the native `start` record has
+  // cleared the file-count cap. Clearing at this point destroyed a perfectly
+  // good index whenever the run was then refused for scope — and every retry
+  // re-destroyed it, since the emptied index is ineligible for the incremental
+  // path and takes the full path again. A scope refusal must be non-destructive.
   const wholeRepoRebuild = pathArg === undefined;
-  if (incrementalFiles === null && (forceFull || wholeRepoRebuild)) {
-    // Clears nodes+edges+FTS while BYPASSING the per-row FTS delete trigger — a
-    // plain `DELETE FROM nodes` fires that trigger once per node (each a full
-    // scan of the trigram FTS table, `id UNINDEXED`), which made a `--full`
-    // re-ingest over an already-populated large index take 30min+ at scale.
-    db.clearGraph();
-  }
+  const fullRebuild = incrementalFiles === null && (forceFull || wholeRepoRebuild);
 
   // Incremental ingest with NOTHING to re-parse (the working tree matches the
   // commit the index was built against — a no-op refresh, or a branch seed that
@@ -158,9 +222,21 @@ export async function runIngest(args: ParsedArgs): Promise<number> {
   // incremental set").
   if (incrementalFiles !== null && incrementalFiles.length === 0) {
     const now = Date.now();
-    db.setStat("last_ingest_at", String(now));
     const head = readGitHead(paths.repoRoot);
-    if (head) db.setStat("last_ingest_git_head", head);
+    // Nothing was re-parsed, so nothing is half-written — but we DID stamp the
+    // in-progress marker before the per-file purge above, and returning without
+    // clearing it would leave the index flagged BROKEN forever. Record success
+    // and clear the marker in one transaction, exactly as `drainIngest` does.
+    db.transaction(() => {
+      db.setStat("last_ingest_at", String(now));
+      if (head) db.setStat("last_ingest_git_head", head);
+      // NOT authoritative: this run re-parsed nothing, so its live `counts()` is
+      // not its own output and must never LOWER the watermark — a concurrent
+      // process holding the graph cleared would otherwise have us commit 0 and
+      // disarm the empty-but-claims-content detector.
+      db.recordNodeWatermark(db.counts().nodes, false);
+      db.endIngest(); // retracts only OUR token
+    });
     db.close();
     const graph0 = new Db(writeIndex.path, { readonly: true });
     const counts = graph0.counts();
@@ -227,6 +303,22 @@ export async function runIngest(args: ParsedArgs): Promise<number> {
       run,
       logger,
       repoRoot: paths.repoRoot,
+      // Declare an authoritative whole-repo rebuild: the run's output IS the
+      // complete graph, so `drainIngest` may do the O(1) call-site clear and may
+      // lower the node watermark. A scoped/incremental run leaves this false and
+      // replaces only what it parsed.
+      fullRebuild,
+      // Let the ingest perform the destructive clear itself, once the scope cap
+      // has passed (see the comment where `fullRebuild` is computed).
+      clearBeforeIngest: fullRebuild,
+      // The orphan-markdown sweep is only safe when this index is the ONLY
+      // writer of `paths.nodesDir`. That directory is per-PROJECT and shared by
+      // every per-branch index, so under per-branch caching "not in THIS
+      // branch's node set" is not the same as "orphaned" — sweeping there
+      // deletes other branches' markdown. Opt in only for a single-index
+      // (legacy, non-per-branch) project. The sweep additionally refuses to
+      // delete anything it cannot prove hayven wrote.
+      sweepOrphanMarkdown: fullRebuild && writeIndex.branchKey === null,
     });
 
     // After an INCREMENTAL re-parse, only the changed files' edges were
@@ -275,7 +367,23 @@ export async function runIngest(args: ParsedArgs): Promise<number> {
     }
     return 0;
   } catch (err) {
-    process.stderr.write(`ingest failed: ${(err as Error).message}\n`);
+    // BE LOUD. A failed ingest does not leave the index untouched: the graph was
+    // cleared (full path) or the changed files' rows were purged (incremental),
+    // and node rows flush in batches BEFORE the native exit-code gate while
+    // edges, call sites and stats are written after it. So the index is now
+    // empty or structurally partial, and it used to keep reporting itself FRESH
+    // off the surviving `last_ingest_at` — every subsequent query answered "No
+    // matches", which reads as a fact about the user's code rather than as this
+    // failure. The in-progress marker is deliberately LEFT SET so readers see a
+    // broken index; say so here rather than only in a log.
+    const detail = (err as Error).message;
+    process.stderr.write(
+      `ingest failed: ${detail}\n` +
+        "WARNING: the index is now EMPTY or PARTIAL and has been marked broken. " +
+        "Reads will warn and may return zero or too few hits until you re-run " +
+        "`hayven ingest --full`.\n",
+    );
+    logger.error("ingest failed — index left marked in-progress", { error: detail });
     return 1;
   } finally {
     db.close();

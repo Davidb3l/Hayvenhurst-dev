@@ -6,19 +6,167 @@
  * unrefs the child so it survives the launching shell/session. `--foreground`
  * keeps the v1 behavior for CI, tests, and external supervisors. The PID file
  * lets `hayven daemon status` and supervisors check liveness.
+ *
+ * A bare pid is NOT an identity. `process.kill(pid, 0)` only proves SOMETHING
+ * with that number is alive, and pids recycle — a stale pidfile pointing at a
+ * recycled number made `hayven daemon stop` willing to SIGTERM an unrelated
+ * process, and made `daemon start` refuse forever ("pidfile reports a live
+ * daemon (pid 1800)") with no way to self-heal. So every pidfile now gets a
+ * SIDECAR identity file (`daemon.pid.json`) recording the pid, its start time
+ * and its `ps` command, and {@link verifyDaemonIdentity} checks the live process
+ * against it. The pidfile itself keeps its plain-integer format so older
+ * readers are unaffected; a missing sidecar degrades to the old behavior.
  */
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { hostname } from "node:os";
 
 export type DaemonStatus =
   | { state: "running"; pid: number }
   | { state: "stopped" }
   | { state: "stale"; pid: number };
 
+/**
+ * What we record about OURSELVES next to a pidfile so a later `stop`/`status`
+ * can tell our daemon from an unrelated process that recycled the pid.
+ */
+export interface DaemonIdentity {
+  pid: number;
+  /** Epoch ms this process started (`now - uptime`). The strongest cheap signal:
+   *  a recycled pid is a process that started at a DIFFERENT time. */
+  startedAtMs: number;
+  /** `ps -o comm=` at write time, or null when `ps` was unavailable. */
+  comm: string | null;
+  /** Guards a pidfile that reached another machine (synced dotfiles, NFS home). */
+  host: string;
+}
+
+/**
+ * - `ours`    — the live pid verifiably IS the daemon that wrote this pidfile.
+ * - `foreign` — the live pid is verifiably NOT it (recycled number, other host).
+ * - `unknown` — no sidecar / `ps` unavailable. Callers must fall back to the
+ *   pre-identity behavior (treat a live pid as the daemon) rather than guess.
+ */
+export type IdentityVerdict = "ours" | "foreign" | "unknown";
+
+/**
+ * `ps` reports elapsed time truncated to whole seconds and our own start-time
+ * estimate has sub-second error, so compare with slack. A recycled pid would
+ * have to have started within this window of the original daemon AND run the
+ * same command to slip through.
+ */
+export const IDENTITY_START_TOLERANCE_MS = 10_000;
+
+/** Absolute path of the sidecar identity file for a pidfile. */
+export function identityFileFor(pidFile: string): string {
+  return `${pidFile}.json`;
+}
+
+function psFields(pid: number, fields: string): string | null {
+  try {
+    const r = Bun.spawnSync({
+      cmd: ["ps", "-p", String(pid), "-o", fields],
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    if (r.exitCode !== 0) return null;
+    const out = new TextDecoder().decode(r.stdout).trim();
+    return out.length > 0 ? out : null;
+  } catch {
+    // No `ps` (unusual container, restricted sandbox) — identity is unavailable,
+    // never a hard failure.
+    return null;
+  }
+}
+
+/** Parse `ps -o etime=`'s `[[dd-]hh:]mm:ss` into milliseconds. */
+export function parseEtime(raw: string): number | null {
+  const m = raw.trim().match(/^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/);
+  if (!m) return null;
+  const days = Number(m[1] ?? 0);
+  const hours = Number(m[2] ?? 0);
+  const minutes = Number(m[3]);
+  const seconds = Number(m[4]);
+  return ((days * 24 + hours) * 3600 + minutes * 60 + seconds) * 1000;
+}
+
+function currentIdentity(): DaemonIdentity {
+  return {
+    pid: process.pid,
+    startedAtMs: Math.round(Date.now() - process.uptime() * 1000),
+    comm: psFields(process.pid, "comm="),
+    host: hostname(),
+  };
+}
+
+export function readIdentityFile(pidFile: string): DaemonIdentity | null {
+  const file = identityFileFor(pidFile);
+  if (!existsSync(file)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(file, "utf8")) as Partial<DaemonIdentity>;
+    if (typeof parsed.pid !== "number" || typeof parsed.startedAtMs !== "number") return null;
+    return {
+      pid: parsed.pid,
+      startedAtMs: parsed.startedAtMs,
+      comm: typeof parsed.comm === "string" ? parsed.comm : null,
+      host: typeof parsed.host === "string" ? parsed.host : "",
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Is the live process `pid` actually the daemon that wrote `pidFile`?
+ *
+ * Answers `unknown` — never a guess — whenever the evidence is missing, so a
+ * pidfile written by a pre-upgrade daemon keeps behaving exactly as before.
+ */
+export function verifyDaemonIdentity(pidFile: string, pid: number): IdentityVerdict {
+  const id = readIdentityFile(pidFile);
+  // A sidecar naming a DIFFERENT pid describes a previous daemon, not this pid;
+  // it proves nothing either way.
+  if (id === null || id.pid !== pid) return "unknown";
+  if (id.host.length > 0 && id.host !== hostname()) return "foreign";
+  const observed = psFields(pid, "etime=,comm=");
+  if (observed === null) return "unknown";
+  const m = observed.trim().match(/^(\S+)\s+(.*)$/);
+  if (!m) return "unknown";
+  const elapsedMs = parseEtime(m[1]!);
+  if (elapsedMs === null) return "unknown";
+  if (id.comm !== null && m[2]!.trim() !== id.comm) return "foreign";
+  if (Math.abs(Date.now() - elapsedMs - id.startedAtMs) > IDENTITY_START_TOLERANCE_MS) return "foreign";
+  return "ours";
+}
+
 export function writePidFile(path: string, pid: number = process.pid): void {
+  // Plain integer, unchanged: `readPidFile` in older builds does `Number(trim)`,
+  // so anything richer here would make every pre-upgrade reader see "stopped".
   writeFileSync(path, String(pid) + "\n", "utf8");
+  if (pid === process.pid) {
+    try {
+      writeFileSync(identityFileFor(path), JSON.stringify(currentIdentity()) + "\n", "utf8");
+    } catch {
+      // The sidecar is an optimization — a daemon must still start without it.
+    }
+  } else {
+    // Recording someone else's pid: we cannot describe that process, and a
+    // LEFTOVER sidecar from a previous daemon would mis-verify it as foreign.
+    removeIdentityFile(path);
+  }
+}
+
+function removeIdentityFile(path: string): void {
+  const file = identityFileFor(path);
+  if (!existsSync(file)) return;
+  try {
+    unlinkSync(file);
+  } catch {
+    // Already gone.
+  }
 }
 
 export function removePidFile(path: string): void {
+  removeIdentityFile(path);
   if (existsSync(path)) {
     try {
       unlinkSync(path);
@@ -50,8 +198,12 @@ export function isAlive(pid: number): boolean {
 export function daemonStatus(pidFile: string): DaemonStatus {
   const pid = readPidFile(pidFile);
   if (pid === null) return { state: "stopped" };
-  if (isAlive(pid)) return { state: "running", pid };
-  return { state: "stale", pid };
+  if (!isAlive(pid)) return { state: "stale", pid };
+  // A live pid is not proof: report `stale` when the sidecar says this process
+  // is demonstrably NOT our daemon, so every caller's existing stale-handling
+  // (remove the file and proceed) self-heals a recycled pid instead of wedging.
+  if (verifyDaemonIdentity(pidFile, pid) === "foreign") return { state: "stale", pid };
+  return { state: "running", pid };
 }
 
 /**
@@ -63,27 +215,77 @@ export function daemonStatus(pidFile: string): DaemonStatus {
 export const SHUTDOWN_SIGNALS: readonly NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGHUP"];
 
 /**
- * Install signal handlers that remove the PID file on shutdown.
+ * Hard ceiling on a graceful shutdown. `daemon stop` waits 10 s for the process
+ * to die; a drain that outlives that leaves the user with a daemon that is
+ * neither running nor stopped and no signal that will end it. After this we
+ * exit regardless.
+ */
+export const FORCE_EXIT_AFTER_MS = 12_000;
+
+export interface ShutdownHandlerOptions {
+  /** Extra pidfiles to remove on exit (the non-primary served projects). */
+  extraPidFiles?: () => string[];
+  /** Override the hard force-exit ceiling. Tests only. */
+  forceExitAfterMs?: number;
+  /** Injected exit, for tests. */
+  exit?: (code: number) => never;
+  /** Injected stderr writer, for tests. */
+  write?: (msg: string) => void;
+}
+
+/**
+ * Install signal handlers that remove the PID file(s) on shutdown.
  * Returns an uninstall function (used by tests; the daemon never calls it).
+ *
+ * A SECOND signal during shutdown ESCALATES to an immediate exit. Previously it
+ * was swallowed by the `shuttingDown` latch, so a wedged drain could only be
+ * ended with `kill -9`. A watchdog enforces the same ceiling when no second
+ * signal ever arrives.
  */
 export function installShutdownHandlers(
   pidFile: string,
   onShutdown?: () => void | Promise<void>,
+  opts: ShutdownHandlerOptions = {},
 ): () => void {
+  const exit = opts.exit ?? ((code: number) => process.exit(code));
+  const write = opts.write ?? ((msg: string) => void process.stderr.write(msg));
+  const forceExitAfterMs = opts.forceExitAfterMs ?? FORCE_EXIT_AFTER_MS;
+
+  const cleanupPidFiles = (): void => {
+    removePidFile(pidFile);
+    for (const extra of opts.extraPidFiles?.() ?? []) {
+      if (extra !== pidFile) removePidFile(extra);
+    }
+  };
+
   let shuttingDown = false;
   const handler = async (signal: NodeJS.Signals): Promise<void> => {
-    if (shuttingDown) return;
+    if (shuttingDown) {
+      write(`\n${signal} received while already shutting down — forcing exit\n`);
+      cleanupPidFiles();
+      exit(signal === "SIGINT" ? 130 : 1);
+      return;
+    }
     shuttingDown = true;
+    // Watchdog: unref'd so it never keeps an otherwise-finished process alive,
+    // but the daemon holds its server open, so a hung drain WILL hit this.
+    const watchdog = setTimeout(() => {
+      write(`shutdown exceeded ${Math.round(forceExitAfterMs / 1000)}s — forcing exit\n`);
+      cleanupPidFiles();
+      exit(1);
+    }, forceExitAfterMs);
+    if (typeof watchdog.unref === "function") watchdog.unref();
     try {
       await onShutdown?.();
     } finally {
-      removePidFile(pidFile);
+      clearTimeout(watchdog);
+      cleanupPidFiles();
       // Re-raise the signal to get a normal exit code.
-      process.exit(signal === "SIGINT" ? 130 : 0);
+      exit(signal === "SIGINT" ? 130 : 0);
     }
   };
   for (const sig of SHUTDOWN_SIGNALS) process.on(sig, handler);
-  const onBeforeExit = (): void => removePidFile(pidFile);
+  const onBeforeExit = (): void => cleanupPidFiles();
   process.on("beforeExit", onBeforeExit);
   return () => {
     for (const sig of SHUTDOWN_SIGNALS) process.removeListener(sig, handler);

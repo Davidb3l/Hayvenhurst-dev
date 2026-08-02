@@ -14,6 +14,7 @@ import { existsSync } from "node:fs";
 import { tryLocateNativeBinary } from "../native/locate.ts";
 import { Db } from "../db/queries.ts";
 import { ftsAvailable } from "../db/migrations.ts";
+import { resolveReadIndex } from "../db/branch_index.ts";
 import { detectRepoRoot, hayvenPathsFor } from "../util/paths.ts";
 import { loadConfig } from "../config/load.ts";
 import { detectHardware, recommendTier3Model } from "../hardware/detect.ts";
@@ -121,6 +122,60 @@ function collect(): DoctorReport {
       ok: false,
       detail: `probe failed: ${(err as Error).message}`,
       gating: true,
+    });
+  }
+
+  // Index integrity — is this project's graph actually USABLE?
+  //
+  // Everything above probes the ENVIRONMENT (bun, native binary, FTS). Nothing
+  // looked at the index itself, so `doctor` reported a clean bill of health on
+  // an index with zero nodes — the exact state an interrupted ingest leaves
+  // behind, and the one that makes every query answer "No matches" while the
+  // user reads that as a fact about their code. `doctor` is where someone looks
+  // when results seem wrong, so it is precisely where this must surface.
+  //
+  // NON-GATING and never throws: a missing/unreadable index is a normal state
+  // (not inside a project, never ingested), and the SUITE_CONTRACTS §3 envelope
+  // requires `doctor --json` to exit 0 no matter what.
+  try {
+    // Self-contained: the shared `root` is not resolved until further down, and
+    // this check must not depend on that ordering.
+    const projectRoot = detectRepoRoot().root;
+    const projectPaths = hayvenPathsFor(projectRoot);
+    const indexPath = resolveReadIndex(projectPaths, loadConfig(projectRoot).config).path;
+    if (!existsSync(indexPath)) {
+      checks.push({
+        name: "index_integrity",
+        ok: true,
+        detail: "no index yet — run `hayven ingest`",
+        gating: false,
+      });
+    } else {
+      const idb = new Db(indexPath, { readonly: true });
+      try {
+        const integrity = idb.checkIndexIntegrity();
+        checks.push({
+          name: "index_integrity",
+          ok: integrity.ok,
+          detail: integrity.ok
+            ? `${integrity.nodes} nodes`
+            : `${integrity.reason}: ${integrity.detail} — run \`hayven ingest --full\` to rebuild`,
+          // NON-gating deliberately: the suite envelope's `ok` means "is this
+          // TOOL usable", and peers treat ok:false as "hayven is absent". A
+          // corrupt index is a project problem, so it surfaces as a failed ROW
+          // with an actionable detail — same treatment as tier3_model.
+          gating: false,
+        });
+      } finally {
+        idb.close();
+      }
+    }
+  } catch (err) {
+    checks.push({
+      name: "index_integrity",
+      ok: true,
+      detail: `could not probe the index: ${(err as Error).message}`,
+      gating: false,
     });
   }
 
@@ -329,4 +384,14 @@ export function compareSemver(a: string, b: string): number {
     if (x > y) return 1;
   }
   return 0;
+}
+
+/**
+ * Test seam. `collect()` is deliberately private (neither output path prints
+ * from it), but the checks it produces are the thing worth pinning — asserting
+ * on rendered stdout would pass for the wrong reasons the moment the formatting
+ * changes.
+ */
+export function collectForTest(): DoctorReport {
+  return collect();
 }

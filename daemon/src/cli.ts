@@ -9,6 +9,7 @@
  * (name + group + help line + handler), not a separate import-list edit, a
  * `switch` case, AND a hand-maintained help block that can silently drift.
  */
+import { SchemaTooNewError } from "./db/migrations.ts";
 import { runAffectedTests } from "./cli/affected_tests.ts";
 import { runBranches } from "./cli/branches.ts";
 import { runClaim } from "./cli/claim.ts";
@@ -62,7 +63,14 @@ interface Command {
   run: (args: ParsedArgs) => Promise<number>;
 }
 
-const COMMANDS: readonly Command[] = [
+/**
+ * Exported so a test can swap one command's `run` and drive `main`'s
+ * dispatch/error handling directly. Testing the top-level catch through a REAL
+ * subcommand would silently start passing the day that subcommand grew its own
+ * catch — the failure is user-visible either way, so the test would look green
+ * while the thing it claims to cover was dead.
+ */
+export const COMMANDS: readonly Command[] = [
   { name: "init", group: "common", run: runInit,
     help: "init                       Initialize .hayven/ in the current project and run a first ingest" },
   { name: "ingest", group: "common", run: runIngest,
@@ -202,7 +210,21 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 
   const command = BY_NAME.get(cmd);
   if (command) {
-    return command.run({ positionals: rest, flags: parsed.flags });
+    try {
+      return await command.run({ positionals: rest, flags: parsed.flags });
+    } catch (err) {
+      // A schema we are too old to read is a USER-actionable condition, not a
+      // crash. Without this, all 18 readonly `openProjectDb` sites surfaced it
+      // as a raw `SQLiteError: no such column: kind` with internal file:line
+      // (and the MCP server relayed it to the agent as `-32603 internal
+      // error`). Every other error still propagates untouched — swallowing
+      // those would hide real bugs.
+      if (err instanceof SchemaTooNewError) {
+        console.error(`error: ${err.message}`);
+        return 1;
+      }
+      throw err;
+    }
   }
 
   console.error(`Unknown command: ${cmd}\n`);

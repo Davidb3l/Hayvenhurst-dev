@@ -34,10 +34,17 @@ set -eu
 
 REPO="${HAYVEN_REPO:-Davidb3l/Hayvenhurst-dev}"
 TAG="${HAYVEN_RELEASE_TAG:-}"
+# HOME may be unset or empty (launchd/systemd, some CI runners, slim
+# containers). Under `set -u` a bare `$HOME` ABORTS the script at expansion
+# time — so this hook, which SessionStart runs in every repo, died before
+# printing anything instead of reporting install status. Resolve it ONCE and
+# tolerate absence; only the install path genuinely needs a real home, and it
+# says so below rather than silently installing into `/.local/bin`.
+HOME_DIR="${HOME:-}"
 # Default install prefix: ${CLAUDE_PLUGIN_DATA} when invoked by the plugin
 # (persists across plugin updates), else ~/.local. We install binaries into
 # <prefix>/bin.
-DEFAULT_PREFIX="${HAYVEN_INSTALL_PREFIX:-${CLAUDE_PLUGIN_DATA:-$HOME/.local}}"
+DEFAULT_PREFIX="${HAYVEN_INSTALL_PREFIX:-${CLAUDE_PLUGIN_DATA:-${HOME_DIR:+$HOME_DIR/.local}}}"
 PREFIX="$DEFAULT_PREFIX"
 MODE="install"
 
@@ -59,10 +66,19 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-BIN_DIR="$PREFIX/bin"
-
 log()  { printf '%s\n' "$*" >&2; }
 fail() { log "install-hayven: error: $*"; exit 1; }
+
+# With no HOME and no explicit prefix there is no defensible install location.
+# Say so instead of letting BIN_DIR resolve to `/bin` and writing there.
+if [ -z "$PREFIX" ]; then
+  [ "$MODE" = "check" ] || fail "cannot determine an install prefix (HOME is unset/empty). Pass --prefix <dir> or set HAYVEN_INSTALL_PREFIX."
+  # --check has nothing to inspect, but `have hayven` still answers the real
+  # question. A path that cannot exist keeps the `-x` tests false without
+  # printing a plausible-looking but wrong location at the user.
+  PREFIX="/nonexistent-hayven-prefix"
+fi
+BIN_DIR="$PREFIX/bin"
 
 # ---- platform detection → release asset name -------------------------------
 # Mirrors the matrix in .github/workflows/release.yml:
@@ -102,6 +118,23 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # --check runs in EVERY repo; the nudge stays quiet outside suite repos so it
 # never nags unrelated projects.
 suite_repo() {
+  # HOME IS NEVER A SUITE REPO. `$HOME/.hayven` is the GLOBAL config dir
+  # (registry, writer id, logs), so a bare `[ -d .hayven ]` answers "yes, a
+  # project" whenever a session starts in the home dir. That exact conflation,
+  # in this same SessionStart hook family, is what let a daemon index the user's
+  # entire home tree for six hours. Here it currently only gates a stderr nudge
+  # — but it is one behavior change away from being load-bearing again, so it
+  # gets the same guard as `ensure-daemon.sh`.
+  #
+  # Guard on HOME being set AND non-empty first: under `set -u` an unset HOME
+  # aborts at expansion time, and `cd ""` SUCCEEDS and stays put, so an empty
+  # HOME would make `$(cd "$HOME" && pwd -P)` return the CURRENT dir and the
+  # equality hold everywhere. Empty/unset HOME shows up under launchd/systemd,
+  # some CI runners, and slim containers; there we cannot identify home, so skip
+  # the home check rather than disabling the function everywhere.
+  if [ -n "$HOME_DIR" ] && [ -d "$HOME_DIR" ]; then
+    [ "$(pwd -P)" != "$(cd "$HOME_DIR" && pwd -P)" ] || return 1
+  fi
   # .docs/ alone is too generic a name; require Catryna's index file.
   [ -d .sirius ] || [ -d .ametrite ] || [ -d .hayven ] || [ -f .docs/_index.json ]
 }
@@ -113,7 +146,7 @@ suite_hint() {
   # Prefix match: catryna installs as `catryna@<marketplace>` and there are two
   # legitimate marketplaces (its own `catryna-wikinelli`, and the Sothis bundle
   # `sirius-forester`). Pinning one key nags bundle users forever.
-  grep -qs '"catryna@' "$HOME/.claude/plugins/installed_plugins.json" \
+  grep -qs '"catryna@' "${HOME_DIR:-/nonexistent}/.claude/plugins/installed_plugins.json" \
     || s_missing="$s_missing Catryna"
   if [ -z "$s_missing" ]; then return 0; fi
   log ""

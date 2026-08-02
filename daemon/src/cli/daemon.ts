@@ -14,6 +14,7 @@ import {
   buildMultiProjectApp,
   wireBranchAwareDb,
   type DbRef,
+  type IngestHealth,
   type ProjectAddResult,
   type ServerDependencies,
 } from "../daemon/server.ts";
@@ -23,6 +24,7 @@ import {
   isAlive,
   readPidFile,
   removePidFile,
+  verifyDaemonIdentity,
   writePidFile,
 } from "../daemon/lifecycle.ts";
 import type { IngestController } from "../daemon/routes/ingest.ts";
@@ -35,11 +37,12 @@ import {
   nativeParseRunner,
   verifyMerge,
 } from "../conflict/verify.ts";
-import { startWatch, type WatchEvent, type WatchSupervisor } from "../native/watcher.ts";
+import { startWatch, type WatchEvent, type WatchStats, type WatchSupervisor } from "../native/watcher.ts";
 import { emitCodeChanged } from "../spine.ts";
-import { rootLogger } from "../util/log.ts";
+import { rootLogger, rotateLogFile } from "../util/log.ts";
 import type { ParsedArgs } from "../cli.ts";
 import { Db } from "../db/queries.ts";
+import { SchemaTooNewError } from "../db/migrations.ts";
 import { activeBranchKey, resolveWriteIndex, resolveWriteIndexForKey } from "../db/branch_index.ts";
 import type { HayvenConfig } from "../config/defaults.ts";
 import { closeSync, existsSync, mkdirSync, openSync } from "node:fs";
@@ -57,7 +60,9 @@ import type { Logger } from "../util/log.ts";
 import { loadConfig } from "../config/load.ts";
 import {
   readRegistry,
+  pruneStaleProjects,
   registerProject,
+  sameProjectRoot,
   unregisterProject,
   type ProjectEntry,
 } from "../daemon/registry.ts";
@@ -72,6 +77,88 @@ const MAX_LIVE_PROJECTS = 64;
  *  handle. Bounded — a long in-flight query beyond this still races (rare; a
  *  closed-Db read throws → a clean 500, never corruption). */
 const REMOVE_GRACE_MS = 250;
+
+/**
+ * Watcher-path equivalent of `cli/ingest.ts`'s `INCREMENTAL_FILE_CAP`.
+ *
+ * The CLI has always fallen back to a full ingest above 2000 touched files; the
+ * WATCHER path had no such bound, which is how the incident's 3,078- and
+ * 4,453-file "incremental" batches went straight through — each one a per-file
+ * delete loop plus a parse of thousands of files, dispatched every 200 ms. Above
+ * this we do ONE coalesced full rebuild instead, which is both faster and more
+ * correct (it re-derives call sites and sweeps orphans).
+ */
+export const WATCH_INCREMENTAL_FILE_CAP = 2000;
+
+/**
+ * How a watcher batch of `touched` files should be ingested.
+ *
+ * Extracted so the THRESHOLD is directly testable — the call site lives inside
+ * `startForegroundDaemon`'s `onBatch` closure, which cannot be reached without
+ * binding a port. Mirrors `cli/ingest.ts`'s identically-named cap.
+ */
+export function watchBatchStrategy(
+  touched: number,
+  cap: number = WATCH_INCREMENTAL_FILE_CAP,
+): "incremental" | "full" {
+  return touched > cap ? "full" : "incremental";
+}
+
+/**
+ * Consecutive AUTOMATIC ingest failures before a project's breaker trips and
+ * automatic re-ingest STOPS.
+ *
+ * The incident ran 11,600 ingest cycles. Nothing counted failures, nothing ever
+ * gave up, and every attempt wrote another line into an unrotated log. Five in a
+ * row is well past "a transient parse timeout" and squarely in "this will not
+ * succeed by being retried".
+ */
+const INGEST_BREAKER_THRESHOLD = 5;
+
+/**
+ * Minimum wall time between AUTOMATIC whole-repo re-ingests for one project.
+ *
+ * This is the bound that actually stops the incident. An overflow record means
+ * "events were lost, re-scan"; it does not mean "re-scan RIGHT NOW", and the
+ * native watcher can re-emit that condition every 500 ms indefinitely when the
+ * OS watch-registration limit is exceeded. Waiting between rescans costs a
+ * bounded amount of index staleness and removes an unbounded amount of work.
+ */
+const AUTO_INGEST_MIN_INTERVAL_MS = 30_000;
+/** Operator/test override for {@link AUTO_INGEST_MIN_INTERVAL_MS}. */
+function autoIngestMinIntervalMs(): number {
+  const raw = process.env["HAYVEN_AUTO_INGEST_MIN_INTERVAL_MS"];
+  if (raw === undefined) return AUTO_INGEST_MIN_INTERVAL_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : AUTO_INGEST_MIN_INTERVAL_MS;
+}
+/** Automatic whole-repo re-ingests allowed inside {@link AUTO_INGEST_RATE_WINDOW_MS}. */
+const AUTO_INGEST_MAX_PER_WINDOW = 30;
+/** Window for the work-rate trip. */
+const AUTO_INGEST_RATE_WINDOW_MS = 60 * 60_000;
+
+/** Wall-clock ceiling on ONE Layer B typecheck spawned from the watcher path. */
+const VERIFY_TYPECHECK_TIMEOUT_MS = 60_000;
+
+/** First retry delay after a branch re-point aborts, doubling per failure. */
+const REPOINT_RETRY_BASE_MS = 5_000;
+/** Ceiling on the branch re-point retry backoff. */
+const REPOINT_RETRY_MAX_MS = 5 * 60_000;
+
+/**
+ * Total budget for shutting EVERY project down, enforced across the parallel
+ * shutdown. Must stay below {@link STOP_WAIT_MS} so `daemon stop` reports a
+ * clean stop rather than timing out on a daemon that is behaving correctly.
+ */
+export const SHUTDOWN_TOTAL_MS = 8_000;
+
+/** Daemon-wide automatic-ingest concurrency, overridable for big machines. */
+function maxConcurrentAutoIngests(): number {
+  const raw = process.env["HAYVEN_MAX_CONCURRENT_INGESTS"];
+  if (raw === undefined) return 1;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 1;
+}
 
 /**
  * How often the daemon polls `.git/HEAD` (via {@link activeBranchKey}) to detect
@@ -112,6 +199,359 @@ export async function drainIngestChain(
 }
 
 /**
+ * Daemon-wide ceiling on CONCURRENT automatic whole-repo ingests.
+ *
+ * Every bound in {@link createIngestGuard} is PER PROJECT — the guard, the
+ * ingest chain and the watcher are all created inside `initProject`. With
+ * `parse_jobs` defaulting to 0 (rayon takes every core), 64 served projects each
+ * doing one full re-ingest means 64 simultaneous all-core parses plus 64 `tsc`
+ * runs. One at a time is the conservative default: a full rescan is throughput
+ * work, not latency work, and serializing it across projects costs nothing a
+ * user notices while removing the fork-bomb entirely.
+ */
+const DEFAULT_MAX_CONCURRENT_AUTO_INGESTS = 1;
+
+/** A counting semaphore for daemon-wide work. */
+export interface WorkLimiter {
+  run<T>(fn: () => Promise<T>): Promise<T>;
+  active(): number;
+  waiting(): number;
+}
+
+export function createWorkLimiter(
+  maxConcurrent: number = DEFAULT_MAX_CONCURRENT_AUTO_INGESTS,
+): WorkLimiter {
+  const limit = Math.max(1, Math.floor(maxConcurrent));
+  let active = 0;
+  const waiters: Array<() => void> = [];
+  return {
+    active: () => active,
+    waiting: () => waiters.length,
+    run: async <T>(fn: () => Promise<T>): Promise<T> => {
+      // A `while`, not an `if`: on release we wake ONE waiter, but a brand-new
+      // caller can win the slot before that waiter resumes. Re-checking on wake
+      // makes over-admission impossible.
+      while (active >= limit) {
+        await new Promise<void>((resolve) => waiters.push(resolve));
+      }
+      active += 1;
+      try {
+        return await fn();
+      } finally {
+        active -= 1;
+        waiters.shift()?.();
+      }
+    },
+  };
+}
+
+/** Why a project's automatic ingest is stopped. */
+export type IngestTripReason = "failures" | "rate";
+
+/** Injected dependencies for {@link createIngestGuard}. */
+export interface IngestGuardDeps {
+  /** Alias of the project this guard protects (used in the trip message). */
+  readonly alias: string;
+  readonly logger: Logger;
+  /** The project's serialized ingest chain (`runIngestExclusive`). */
+  readonly runExclusive: <T>(fn: () => Promise<T>) => Promise<T>;
+  /** A whole-repo re-ingest of the currently served index. */
+  readonly fullIngest: () => Promise<unknown>;
+  /** Live watcher backlog counters, when a watcher is running. */
+  readonly watchStats?: () => WatchStats | undefined;
+  /** Daemon-wide concurrency limiter shared by every project. */
+  readonly limiter?: WorkLimiter;
+  /** Consecutive automatic failures that trip. Default
+   *  {@link INGEST_BREAKER_THRESHOLD}. */
+  readonly threshold?: number;
+  /** Minimum wall time between automatic whole-repo re-ingests. Default
+   *  {@link AUTO_INGEST_MIN_INTERVAL_MS}. */
+  readonly minIntervalMs?: number;
+  /** Automatic whole-repo re-ingests allowed per {@link rateWindowMs} before the
+   *  work-rate trip fires. Default {@link AUTO_INGEST_MAX_PER_WINDOW}. */
+  readonly maxRunsPerWindow?: number;
+  /** Work-rate window. Default {@link AUTO_INGEST_RATE_WINDOW_MS}. */
+  readonly rateWindowMs?: number;
+  /** Injectable clock, for deterministic tests. */
+  readonly now?: () => number;
+  /** Injectable sleep, for deterministic tests. */
+  readonly sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * The bounds the daemon's AUTOMATIC ingest path was missing, and whose absence
+ * turned one bad `daemon start` into a six-hour, 98%-CPU, 195 GB-read runaway.
+ *
+ * THE INCIDENT WAS NOT DEFINED BY FAILURE. Counted from the user's own log:
+ * 11,600 ingest cycles and 10 parse timeouts — a 0.09% failure rate, never five
+ * in a row. A consecutive-failure breaker would not have tripped once. What
+ * actually happened was SUCCESSFUL work at an impossible rate, and there is a
+ * trigger that needs no synthetic help: `native/src/watch/mod.rs` maps a watch
+ * REGISTRATION limit (Linux `inotify max_user_watches`, and FSEvents
+ * `MUST_SCAN_SUBDIRS`) onto an `overflow` record. That is a PERSISTENT
+ * condition, re-emitted once per 500 ms loop pass forever — so exceeding the
+ * watch limit once makes the daemon full-re-ingest continuously and
+ * successfully until it is killed.
+ *
+ * Hence four bounds, not one:
+ *
+ * 1. RATE LIMIT ({@link IngestGuardDeps.minIntervalMs}) — the load-bearing one.
+ *    A minimum interval between automatic whole-repo re-ingests, waited out
+ *    OUTSIDE the ingest chain so a pending rescan never blocks incremental
+ *    batches. Requests arriving during the wait coalesce into the one already
+ *    pending, so an overflow storm collapses to one run per interval. A probe of
+ *    the unfixed code (overflow every 25 ms, always-succeeding 150 ms full
+ *    ingest) measured 95.4% duty and extrapolated to ~86,000 full re-ingests
+ *    over six hours.
+ * 2. WORK-RATE TRIP — more than `maxRunsPerWindow` automatic whole-repo runs
+ *    within `rateWindowMs` stops automatic ingest REGARDLESS OF OUTCOME. This is
+ *    the backstop that would actually have caught the incident, and it is what
+ *    catches a legitimately alternating branch key (`git bisect run`, an
+ *    interactive rebase) whose every re-point SUCCEEDS.
+ * 3. CONSECUTIVE-FAILURE TRIP — the original breaker, kept for the case it does
+ *    cover: work that cannot succeed being retried forever.
+ * 4. GLOBAL CONCURRENCY ({@link WorkLimiter}) — every other bound here is
+ *    per-project; without this, N projects each obeying their own limits still
+ *    add up to N concurrent all-core parses.
+ *
+ * MANUAL vs AUTOMATIC are accounted SEPARATELY. A manual `POST /api/ingest` is
+ * never gated (it is the user's explicit instruction) but it also may not clear
+ * an automatic trip: sharing one counter meant any periodic external trigger
+ * held the breaker permanently at zero. Clearing a trip requires the explicit
+ * reset endpoint.
+ */
+export interface IngestGuard {
+  /** May the daemon start AUTOMATIC ingest work right now? */
+  allowed(): boolean;
+  /** Record an AUTOMATIC ingest outcome (`null` = success). */
+  note(err: Error | null): void;
+  /** Record a MANUAL ingest outcome. Never clears an automatic trip. */
+  noteManual(err: Error | null): void;
+  /**
+   * Admit an automatic whole-repo ingest that this guard does not itself run —
+   * the branch re-point's freshen. Applies the SAME rate limit, work-rate trip
+   * and accounting. Returns false when it must not proceed.
+   */
+  admitWholeRepoRun(reason: string): boolean;
+  /** Run `fn` under the daemon-wide concurrency limiter. */
+  withLimiter<T>(fn: () => Promise<T>): Promise<T>;
+  /** Queue a coalesced, rate-limited full re-ingest. Never rejects — the
+   *  outcome goes through {@link note}. */
+  requestFull(reason: string): Promise<void>;
+  /** Clear a tripped breaker so automatic re-ingest resumes. */
+  reset(): void;
+  health(): IngestHealth;
+}
+
+export function createIngestGuard(deps: IngestGuardDeps): IngestGuard {
+  const threshold = deps.threshold ?? INGEST_BREAKER_THRESHOLD;
+  const minIntervalMs = deps.minIntervalMs ?? AUTO_INGEST_MIN_INTERVAL_MS;
+  const maxRunsPerWindow = deps.maxRunsPerWindow ?? AUTO_INGEST_MAX_PER_WINDOW;
+  const rateWindowMs = deps.rateWindowMs ?? AUTO_INGEST_RATE_WINDOW_MS;
+  const limiter = deps.limiter ?? createWorkLimiter();
+  const now = deps.now ?? ((): number => Date.now());
+  const sleep = deps.sleep ?? ((ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms)));
+  const { logger, alias } = deps;
+
+  let consecutiveFailures = 0;
+  let trippedAt: number | null = null;
+  let tripReason: IngestTripReason | null = null;
+  let lastError: string | null = null;
+  let lastManualError: string | null = null;
+  let coalesced = 0;
+  let rateLimitedWaits = 0;
+  /** Start times of recent AUTOMATIC whole-repo runs, oldest first. */
+  const recentRunStarts: number[] = [];
+  let lastRunStartMs = Number.NEGATIVE_INFINITY;
+
+  /** The single QUEUED-or-running full re-ingest. Identified by a NUMBER, never
+   *  by promise identity — see `requestFull` for why that matters. */
+  let queued: { id: number; promise: Promise<void> } | null = null;
+  let runSeq = 0;
+
+  function trip(reason: IngestTripReason, detail: string): void {
+    if (trippedAt !== null) return; // announce ONCE, however many attempts follow
+    trippedAt = now();
+    tripReason = reason;
+    logger.error(
+      `ingest: CIRCUIT BREAKER TRIPPED (${reason}) — automatic re-ingest is STOPPED for this ` +
+        `project. ${detail} Fix the cause, then reset with ` +
+        `\`curl -X POST '<daemon>/api/ingest/health/reset?project=${alias}'\`; ` +
+        "check state at `GET /api/ingest/health`.",
+      { reason, detail },
+    );
+  }
+
+  const note = (err: Error | null): void => {
+    if (err === null) {
+      consecutiveFailures = 0;
+      // Deliberately does NOT clear a trip. A `rate` trip means the daemon is
+      // doing too much work SUCCESSFULLY, so success is not evidence of health;
+      // and clearing a `failures` trip on the first success is what let a flaky
+      // repo oscillate. Recovery is the explicit reset.
+      lastError = null;
+      return;
+    }
+    consecutiveFailures += 1;
+    lastError = err.message;
+    if (trippedAt !== null) return;
+    if (consecutiveFailures >= threshold) {
+      trip("failures", `${consecutiveFailures} consecutive automatic ingest failures.`);
+      return;
+    }
+    logger.warn("ingest: automatic run failed", {
+      consecutiveFailures,
+      tripsAt: threshold,
+      error: err.message,
+    });
+  };
+
+  /**
+   * Account for an automatic whole-repo run that is about to START, and decide
+   * whether it may. Counts SUCCESSES too — that is the whole point.
+   */
+  const admitWholeRepoRun = (reason: string): boolean => {
+    if (trippedAt !== null) return false;
+    const t = now();
+    while (recentRunStarts.length > 0 && t - recentRunStarts[0]! > rateWindowMs) {
+      recentRunStarts.shift();
+    }
+    if (recentRunStarts.length >= maxRunsPerWindow) {
+      trip(
+        "rate",
+        `${recentRunStarts.length} automatic whole-repo re-ingests in the last ` +
+          `${Math.round(rateWindowMs / 60_000)} minutes (limit ${maxRunsPerWindow}), most recently for: ${reason}. ` +
+          "This is the runaway-loop signature: the work was SUCCEEDING, just far too often " +
+          "(a persistent watcher-overflow condition, or a branch key that keeps alternating).",
+      );
+      return false;
+    }
+    if (t - lastRunStartMs < minIntervalMs) return false;
+    recentRunStarts.push(t);
+    lastRunStartMs = t;
+    return true;
+  };
+
+  const clearSlot = (id: number): void => {
+    if (queued?.id === id) queued = null;
+  };
+
+  async function runFull(id: number, reason: string): Promise<void> {
+    if (trippedAt !== null) {
+      clearSlot(id);
+      return;
+    }
+    // RATE LIMIT, waited out BEFORE entering the ingest chain: holding the
+    // per-project chain for the cooldown would stall incremental batches behind
+    // a rescan that is deliberately doing nothing. Every request that arrives
+    // during this wait coalesces into THIS one — that is what turns an
+    // overflow storm into a single run per interval.
+    const wait = minIntervalMs - (now() - lastRunStartMs);
+    if (wait > 0 && Number.isFinite(wait)) {
+      rateLimitedWaits += 1;
+      logger.debug("ingest: full re-ingest rate-limited; waiting", { waitMs: wait, reason });
+      await sleep(wait);
+    }
+    if (trippedAt !== null) {
+      clearSlot(id);
+      return;
+    }
+    let ran = false;
+    try {
+      await deps.runExclusive(async () => {
+        // The coalescing slot clears when the run genuinely BEGINS — inside the
+        // ingest chain, so callers in the SAME TICK still collapse into it —
+        // never when it ends: a change arriving mid-run is not covered by this
+        // run and must be able to queue exactly one more.
+        clearSlot(id);
+        if (!admitWholeRepoRun(reason)) return;
+        ran = true;
+        logger.info("ingest: full re-ingest starting", { reason });
+        await limiter.run(() => deps.fullIngest());
+      });
+      if (ran) note(null);
+    } catch (err) {
+      note(err as Error);
+    } finally {
+      clearSlot(id);
+    }
+  }
+
+  return {
+    allowed: () => trippedAt === null,
+    note,
+    noteManual: (err: Error | null): void => {
+      // Tracked for visibility only. A manual success must not zero the shared
+      // automatic counter — with one counter, any periodic external `POST
+      // /api/ingest` kept the automatic breaker permanently disarmed.
+      lastManualError = err === null ? null : err.message;
+    },
+    admitWholeRepoRun,
+    withLimiter: <T,>(fn: () => Promise<T>): Promise<T> => limiter.run(fn),
+    requestFull: (reason: string): Promise<void> => {
+      const pending = queued;
+      if (pending) {
+        coalesced += 1;
+        return pending.promise;
+      }
+      const id = ++runSeq;
+      let settle!: () => void;
+      const promise = new Promise<void>((resolve) => {
+        settle = resolve;
+      });
+      // Publish the slot BEFORE any work can start. The previous version
+      // referenced `p` from inside its own initializer, which was safe only
+      // because the real `runExclusive` happens to defer — an injected
+      // `runExclusive` that calls back synchronously threw a TDZ ReferenceError.
+      queued = { id, promise };
+      void runFull(id, reason).then(settle, settle);
+      return promise;
+    },
+    reset: (): void => {
+      if (trippedAt !== null) {
+        logger.warn("ingest: failure breaker RESET by request — automatic re-ingest resumes", {
+          wasTrippedAt: new Date(trippedAt).toISOString(),
+          reason: tripReason,
+          consecutiveFailures,
+        });
+      }
+      consecutiveFailures = 0;
+      trippedAt = null;
+      tripReason = null;
+      lastError = null;
+      recentRunStarts.length = 0;
+      lastRunStartMs = Number.NEGATIVE_INFINITY;
+    },
+    health: (): IngestHealth => {
+      const w = deps.watchStats?.();
+      const t = now();
+      const runsInWindow = recentRunStarts.filter((s) => t - s <= rateWindowMs).length;
+      return {
+        consecutiveFailures,
+        tripped: trippedAt !== null,
+        tripReason,
+        trippedAt: trippedAt === null ? null : new Date(trippedAt).toISOString(),
+        lastError,
+        lastManualError,
+        autoRunsInWindow: runsInWindow,
+        autoRunLimitPerWindow: maxRunsPerWindow,
+        rateWindowMs,
+        minIntervalMs,
+        rateLimitedWaits,
+        limiterActive: limiter.active(),
+        limiterWaiting: limiter.waiting(),
+        fullIngestQueued: queued !== null,
+        fullIngestsCoalesced: coalesced,
+        pendingWatchEvents: w?.pendingEvents ?? 0,
+        watchBatchInFlight: w?.batchInFlight ?? false,
+        watchOverflowInFlight: w?.overflowInFlight ?? false,
+        watchOverflowsCoalesced: w?.overflowsCoalesced ?? 0,
+      };
+    },
+  };
+}
+
+/**
  * Dependencies for {@link repointToBranch} — the LIVE branch re-point. Factored
  * out of `startDaemon` so it is deterministically testable WITHOUT a real
  * long-lived HTTP server (the test drives this function directly).
@@ -147,6 +587,13 @@ export interface RepointDeps {
 export interface RepointResult {
   readonly path: string;
   readonly branchKey: string | null;
+  /**
+   * True when the re-point gave up and kept serving the OLD index. The poller
+   * MUST back off on this: `branchKey` is then the still-served key, so the very
+   * next 2 s tick re-detects the same transition and retries — an unbounded
+   * full-freshen-ingest loop, the same failure shape as the overflow storm.
+   */
+  readonly aborted?: boolean;
 }
 
 /**
@@ -163,11 +610,13 @@ export interface RepointResult {
  * `branchKey` is what the poller writes back to `lastBranchKey`, so all three
  * (poller tracker, `dbRef.branchKey`, served index) stay in lockstep.
  *
- * (B) Never serve an EMPTY index: if `freshen` throws AND the new index was not
- * seeded (no sibling / no legacy → a freshly-migrated empty Db with no nodes),
- * we do NOT swap — we keep serving the OLD index, discard `next`, and warn. A
- * seeded index (has content) or a successful freshen swaps as before. A later
- * tick reconciles once the tree yields records.
+ * (B) Never serve an EMPTY or BROKEN index. The swap requires either a freshen
+ * that actually completed, or an index that demonstrably holds nodes AND passes
+ * `checkIndexIntegrity()`. It deliberately does NOT trust `seeded`: that flag
+ * only means "we copied a file", never "the file had content", so a copy of an
+ * empty/half-written index used to satisfy the guard and get served. On failure
+ * we keep serving the OLD index, discard `next`, and warn; a later tick
+ * reconciles once the tree yields records.
  *
  * (C) Eviction safety: resolution protects BOTH `newKey` and the currently-
  * served (old) branch key, so the still-open OLD branch dir is never the LRU
@@ -198,7 +647,22 @@ export async function repointToBranch(deps: RepointDeps, newKey: string | null):
     }
 
     const next = new Db(resolved.path);
-    next.migrate();
+    try {
+      next.migrate();
+    } catch (err) {
+      // A branch index written by a NEWER hayven must not be migrated DOWN.
+      // Keep serving the current branch rather than failing the poller loop.
+      if (err instanceof SchemaTooNewError) {
+        logger.error("watch: branch re-point ABORTED — " + err.message, { branchKey: resolved.branchKey });
+        try {
+          next.close();
+        } catch {
+          /* nothing useful to do with a close failure on a db we are discarding */
+        }
+        return { path: dbRef.path, branchKey: dbRef.branchKey, aborted: true };
+      }
+      throw err;
+    }
     const seeded = resolved.seededFrom !== null;
     let freshenOk = false;
     try {
@@ -212,16 +676,38 @@ export async function repointToBranch(deps: RepointDeps, newKey: string | null):
       });
     }
 
-    // (B) Only swap when the new index has real content: it freshened OK, OR it
-    // was seeded (from a sibling/legacy), OR — belt-and-suspenders — it happens
-    // to hold nodes already. If freshen failed on a NON-seeded (empty) index,
-    // keep serving the OLD index rather than swapping in an empty one.
-    const hasContent = freshenOk || seeded || next.counts().nodes > 0;
+    // (B) Only swap when the new index is actually SERVABLE.
+    //
+    // The old test was `freshenOk || seeded || nodes > 0`, and `seeded` short-
+    // circuited it. `seeded` means "we copied a file" — it says nothing about
+    // whether the file had content, so a copy of an empty (or half-written)
+    // index satisfied the guard and the daemon swapped in and served an EMPTY
+    // graph, exactly the premise the comment above it claimed was true. Consult
+    // the graph itself instead: a completed freshen, or real nodes backed by an
+    // integrity check that catches a wiped/interrupted index.
+    const integrity = next.checkIndexIntegrity();
+    const hasContent = freshenOk || (integrity.ok && integrity.nodes > 0);
+    if (freshenOk && integrity.nodes === 0) {
+      // Not an abort — an empty branch is a legitimate (if surprising) state.
+      // Say so out loud, because "the daemon serves nothing" otherwise looks
+      // identical to "the daemon is broken".
+      logger.warn("watch: branch re-point is swapping in an index with ZERO nodes", {
+        branchKey: resolved.branchKey,
+        path: resolved.path,
+        seeded,
+      });
+    }
     if (!hasContent) {
       logger.warn(
-        "watch: branch re-point ABORTED — freshen failed on an empty (unseeded) index; " +
+        "watch: branch re-point ABORTED — the new index is empty or unusable; " +
           `keeping the current branch ${dbRef.branchKey ?? "(legacy)"} (${dbRef.path})`,
-        { detectedKey: newKey },
+        {
+          detectedKey: newKey,
+          seeded,
+          freshenOk,
+          nodes: integrity.nodes,
+          integrity: integrity.reason,
+        },
       );
       try {
         next.close();
@@ -231,9 +717,9 @@ export async function repointToBranch(deps: RepointDeps, newKey: string | null):
         });
       }
       // Served index unchanged; report the still-served key so the poller
-      // reconciles `lastBranchKey` back to what is ACTUALLY served (a later tick
-      // re-attempts once the tree yields records).
-      return { path: dbRef.path, branchKey: dbRef.branchKey };
+      // reconciles `lastBranchKey` back to what is ACTUALLY served, and flag the
+      // abort so it retries on a BACKOFF instead of every 2 s tick.
+      return { path: dbRef.path, branchKey: dbRef.branchKey, aborted: true };
     }
 
     const old = dbRef.current;
@@ -262,6 +748,9 @@ const DAEMON_USAGE = `hayven daemon <subcommand>
                            the port, registers this project with it instead.
                            --foreground runs it in this terminal (CI/supervisors);
                            --port/--host override the primary's bind address.
+                           Binds 127.0.0.1 only. A non-loopback --host ALSO
+                           requires --allow-remote-access: the daemon has NO
+                           authentication and serves your whole code graph.
   stop                     Send SIGTERM to the running daemon (via its pidfile).
   status                   Report whether the daemon is running.
   restart                  Alias for stop + start.
@@ -386,6 +875,19 @@ interface ProjectRuntime {
 }
 
 /**
+ * Thrown by `initProject` when a project's index was written by a NEWER hayven.
+ * Carries the alias so the loader can name it while skipping it.
+ */
+class ProjectSchemaTooNew extends Error {
+  readonly alias: string;
+  constructor(alias: string, schemaError: SchemaTooNewError) {
+    super(schemaError.message);
+    this.alias = alias;
+    this.name = "ProjectSchemaTooNew";
+  }
+}
+
+/**
  * Apply validated `--port`/`--host` overrides onto a copy of `config`.
  * Returns the effective config, or an exit code (2) after printing a usage
  * error. Shared by the detached parent (to know where to probe/poll) and the
@@ -401,7 +903,7 @@ function applyBindOverrides(
   if (typeof hostFlag === "string" && hostFlag.length > 0) {
     effective.daemon_host = hostFlag;
   } else if (hostFlag === true) {
-    process.stderr.write("error: --host requires a value, e.g. --host 0.0.0.0\n");
+    process.stderr.write("error: --host requires a value, e.g. --host 127.0.0.1\n");
     return { exitCode: 2 };
   }
 
@@ -418,7 +920,65 @@ function applyBindOverrides(
     }
     effective.daemon_port = port;
   }
+
+  // NETWORK EXPOSURE GATE.
+  //
+  // The daemon has NO authentication of any kind — no bearer token, no Origin
+  // check, nothing — and it serves the entire code graph, file contents via
+  // `/api/context`, fleet memory, claims, and MUTATING POST/DELETE routes for
+  // EVERY registered project. Before this, `--host` (and `HAYVEN_HOST`, and
+  // `daemon_host` in config.json) was taken verbatim into `app.listen`, so
+  // `--host 0.0.0.0` silently published all of that to the LAN with no warning
+  // whatsoever — and the flag's own usage hint used to suggest exactly that
+  // value. A binary that ships an unauthenticated service must not make
+  // exposing it a one-word change.
+  //
+  // So a non-loopback bind now needs a SECOND, unambiguous opt-in. Requiring an
+  // extra flag rather than just warning is deliberate: a warning printed by a
+  // process that then keeps running is not a decision point, and this one is
+  // irreversible in the sense that matters (the data is already reachable).
+  if (!isLoopbackHost(effective.daemon_host)) {
+    if (!remoteAccessAllowed(args)) {
+      process.stderr.write(
+        `error: refusing to bind ${effective.daemon_host} — that is not a loopback address, and\n` +
+          "the hayven daemon has NO authentication. Binding it publishes, to anyone who can\n" +
+          "reach this machine:\n" +
+          "  - the full code graph and file contents of EVERY registered project\n" +
+          "  - fleet memory, claims and traces\n" +
+          "  - mutating endpoints (ingest, claims, project add/remove)\n" +
+          "If you genuinely intend that, re-run with --allow-remote-access (or set\n" +
+          "HAYVEN_ALLOW_REMOTE_ACCESS=1), and put it behind something that authenticates.\n" +
+          "Otherwise drop --host/HAYVEN_HOST/daemon_host and it will bind 127.0.0.1.\n",
+      );
+      return { exitCode: 2 };
+    }
+    process.stderr.write(
+      "\n" +
+        "  ****************************************************************\n" +
+        `  *  WARNING: binding ${effective.daemon_host}:${effective.daemon_port} — NOT loopback.\n` +
+        "  *  This daemon has NO AUTHENTICATION. Anyone who can reach this\n" +
+        "  *  address can read every registered project's source graph and\n" +
+        "  *  file contents, and can mutate them.\n" +
+        "  ****************************************************************\n\n",
+    );
+  }
   return { config: effective };
+}
+
+/** True for addresses that are only reachable from this machine. */
+export function isLoopbackHost(host: string): boolean {
+  const h = host.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  if (h === "localhost" || h === "::1" || h === "::ffff:127.0.0.1") return true;
+  // The whole 127.0.0.0/8 block is loopback, not just 127.0.0.1.
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
+}
+
+/** The explicit second opt-in required to publish an unauthenticated daemon. */
+function remoteAccessAllowed(args: ParsedArgs): boolean {
+  const flag = args.flags["allow-remote-access"];
+  if (flag === true || flag === "true") return true;
+  const env = process.env["HAYVEN_ALLOW_REMOTE_ACCESS"];
+  return env === "1" || env === "true";
 }
 
 /** Render the "serving N project(s): a, b" line from a health payload. */
@@ -460,9 +1020,15 @@ async function startDetachedDaemon(args: ParsedArgs): Promise<number> {
   // Is something already answering on the target address?
   const probe = await probeDaemon(base);
   if (probe.kind === "foreign") {
+    // `foreign` covers BOTH "not a hayven daemon at all" and "a hayven daemon we
+    // are version-incompatible with". Only the former can be fixed by picking a
+    // free port, so when the probe supplies a specific reason, print THAT — the
+    // generic advice is actively wrong (and harmful) for the version case.
     process.stderr.write(
-      `error: ${config.daemon_host}:${config.daemon_port} is in use by something that is NOT a hayven daemon.\n` +
-        "Stop it, or start with a free port (`hayven daemon start --port <N>`).\n",
+      probe.reason !== undefined
+        ? `error: ${probe.reason}\n`
+        : `error: ${config.daemon_host}:${config.daemon_port} is in use by something that is NOT a hayven daemon.\n` +
+            "Stop it, or start with a free port (`hayven daemon start --port <N>`).\n",
     );
     return 1;
   }
@@ -474,12 +1040,26 @@ async function startDetachedDaemon(args: ParsedArgs): Promise<number> {
   // bound elsewhere (config/port drift) — refuse rather than start a duplicate.
   const existing = daemonStatus(ctx.paths.pidFile);
   if (existing.state === "running") {
+    // SELF-HEAL before refusing. `daemonStatus` already downgrades a verifiably-
+    // foreign pid to `stale`, so reaching here means the pid is alive AND either
+    // provably ours or unverifiable. Only the provably-ours case is a real
+    // wedge; an unverifiable one (no sidecar — a pre-upgrade daemon, or a
+    // pidfile that outlived a reboot) used to lock `daemon start` out FOREVER
+    // with no recovery path. That is the `pid 1800` wedge from the autostart log.
+    const verdict = verifyDaemonIdentity(ctx.paths.pidFile, existing.pid);
+    if (verdict === "ours") {
+      process.stderr.write(
+        `error: pidfile reports a live daemon (pid ${existing.pid}) but ${base} is unreachable — ` +
+          "it may be bound to a different host/port.\n" +
+          "Stop it first (`hayven daemon stop`) or check `hayven config daemon_port`.\n",
+      );
+      return 1;
+    }
     process.stderr.write(
-      `error: pidfile reports a live daemon (pid ${existing.pid}) but ${base} is unreachable — ` +
-        "it may be bound to a different host/port.\n" +
-        "Stop it first (`hayven daemon stop`) or check `hayven config daemon_port`.\n",
+      `note: pidfile named pid ${existing.pid}, which is alive but cannot be confirmed as this ` +
+        `daemon and is not answering at ${base} — treating the pidfile as stale and starting.\n`,
     );
-    return 1;
+    removePidFile(ctx.paths.pidFile);
   }
   if (existing.state === "stale") {
     removePidFile(ctx.paths.pidFile); // dead pid — clean and proceed
@@ -489,6 +1069,10 @@ async function startDetachedDaemon(args: ParsedArgs): Promise<number> {
   const extraArgs: string[] = [];
   if (typeof args.flags["host"] === "string") extraArgs.push("--host", args.flags["host"]);
   if (typeof args.flags["port"] === "string") extraArgs.push("--port", args.flags["port"]);
+  // The child re-runs `applyBindOverrides`, so the exposure opt-in must travel
+  // with it — otherwise a deliberate remote bind fails in the background with
+  // the parent reporting only "did not become healthy".
+  if (remoteAccessAllowed(args)) extraArgs.push("--allow-remote-access");
   const cmd = buildDetachedCommand({
     execPath: process.execPath,
     entryScript: process.argv[1],
@@ -499,6 +1083,11 @@ async function startDetachedDaemon(args: ParsedArgs): Promise<number> {
   let child;
   try {
     mkdirSync(globalLogsDir(), { recursive: true });
+    // The fd below is handed to the detached child as BOTH stdout and stderr for
+    // its entire lifetime, so nothing can rotate this file underneath it. Spawn
+    // time is therefore the only place the size can be bounded — the incident
+    // left a 576 MB `daemon.out.log` that nothing would ever have truncated.
+    rotateLogFile(logPath);
     const fd = openSync(logPath, "a");
     try {
       child = spawn(cmd[0]!, cmd.slice(1), {
@@ -636,6 +1225,11 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
    *
    * Does NOT build an Elysia app: the daemon builds ONE app over ALL projects.
    */
+  // ONE limiter for the whole daemon. Every other bound is per-project, so
+  // without this N projects each obeying their own limits still add up to N
+  // concurrent all-core parses (plus N `tsc` runs from the verify gate).
+  const autoIngestLimiter = createWorkLimiter(maxConcurrentAutoIngests());
+
   function initProject(alias: string, paths: HayvenPaths, config: HayvenConfig): ProjectRuntime {
     const plog = logger.child(alias);
 
@@ -661,7 +1255,21 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
       branchKey: resolvedIndex.branchKey,
     };
     let lastBranchKey: string | null = resolvedIndex.branchKey;
-    const migration = dbRef.current.migrate();
+    let migration;
+    try {
+      migration = dbRef.current.migrate();
+    } catch (err) {
+      // An index written by a NEWER hayven must not be migrated DOWN. Close the
+      // handle we just opened and let the loader decide: ONE unreadable project
+      // must not take the whole daemon (and every OTHER repo it serves) down.
+      try {
+        dbRef.current.close();
+      } catch {
+        /* discarding this handle either way */
+      }
+      if (err instanceof SchemaTooNewError) throw new ProjectSchemaTooNew(alias, err);
+      throw err;
+    }
     if (migration.crdtCutover) {
       plog.warn(
         `crdt_migration: dropped legacy v0.0.1 SQL state (traces=${migration.crdtCutover.droppedObservations}, claims=${migration.crdtCutover.droppedClaims}) — pre-MVP, intentional per ARCHITECTURE.md §13.4`,
@@ -716,14 +1324,68 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
       });
       // Read the CURRENT served db so a post-swap ingest writes the new branch's
       // index, not the one captured at startup.
-      return drainIngest({ db: dbRef.current, nodesDir: paths.nodesDir, run, logger: plog, repoRoot: paths.repoRoot });
+      const db = dbRef.current;
+      // IDEMPOTENCE. A whole-repo re-parse must clear the graph first, exactly as
+      // `cli/ingest.ts` has always done. Without it a long-lived daemon's repeated
+      // full re-ingests left DELETED symbols in the index forever (nothing else
+      // ever removes a node whose file the parse no longer reports), so the served
+      // graph drifted further from truth the longer the daemon ran.
+      //
+      // Ordered AFTER `startParse` on purpose: locating/spawning the native binary
+      // is the most likely failure, and clearing first would leave the index empty
+      // for a run that never even started. The parse streams into a buffer, so
+      // nothing is written between here and `drainIngest`. `clearGraph()` also
+      // stamps the in-progress marker, which `drainIngest` clears on success — so
+      // a crash in between leaves the index flagged BROKEN rather than silently
+      // empty, which is the outcome we want.
+      db.clearGraph();
+      return drainIngest({
+        db,
+        nodesDir: paths.nodesDir,
+        run,
+        logger: plog,
+        repoRoot: paths.repoRoot,
+        // This run's output IS the complete graph, so the O(1) call-site clear
+        // and the orphan-markdown sweep are safe (and necessary — otherwise the
+        // deleted files' markdown accumulates forever).
+        fullRebuild: true,
+      });
     }
+
+    // The failure breaker + full-re-ingest coalescer for this project. See
+    // {@link createIngestGuard} for why both exist.
+    const guard = createIngestGuard({
+      alias,
+      logger: plog,
+      runExclusive: runIngestExclusive,
+      fullIngest,
+      watchStats: () => watcher?.stats(),
+      limiter: autoIngestLimiter,
+      minIntervalMs: autoIngestMinIntervalMs(),
+    });
 
     const ingest: IngestController = {
       current: () => inFlight,
       // Queues behind any in-flight ingest rather than throwing — callers get
-      // serialized execution, not a "already running" error.
-      start: (_options): Promise<IngestResult> => runIngestExclusive(fullIngest),
+      // serialized execution, not a "already running" error. A MANUAL ingest is
+      // never gated by the breaker (it is the user's explicit instruction) and a
+      // successful one resets it.
+      // A MANUAL ingest is never gated by the breaker (it is the user's explicit
+      // instruction) and its outcome is recorded SEPARATELY: letting a manual
+      // success zero the automatic counter meant any periodic external trigger
+      // held the automatic breaker permanently disarmed. It still runs under the
+      // daemon-wide limiter so it cannot stack with automatic work.
+      start: (_options): Promise<IngestResult> =>
+        runIngestExclusive(() => guard.withLimiter(fullIngest)).then(
+          (result) => {
+            guard.noteManual(null);
+            return result;
+          },
+          (err) => {
+            guard.noteManual(err as Error);
+            throw err;
+          },
+        ),
     };
 
     // Start the long-lived native file watcher (ARCHITECTURE.md §16). Skipped
@@ -754,8 +1416,36 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
             }
           }
           for (const f of changed) deleted.delete(f); // changed wins over a stale delete
+
+          if (!guard.allowed()) {
+            // Breaker tripped. Drop the batch rather than queue work that will
+            // fail again — and do NOT log per attempt (the trip was announced
+            // once, loudly; `GET /api/ingest/health` is the live state).
+            plog.debug("watch: batch dropped — ingest breaker tripped", {
+              changed: changed.size,
+              deleted: deleted.size,
+            });
+            return;
+          }
+
+          // E2: bound the INCREMENTAL path, mirroring `cli/ingest.ts`'s
+          // INCREMENTAL_FILE_CAP. The incident's 3,078- and 4,453-file batches
+          // went through here as "incremental" work; above the cap a single
+          // coalesced full rebuild is both cheaper and more correct.
+          const touched = changed.size + deleted.size;
+          if (watchBatchStrategy(touched) === "full") {
+            plog.warn("watch: batch exceeds the incremental cap — doing ONE full re-ingest instead", {
+              touched,
+              cap: WATCH_INCREMENTAL_FILE_CAP,
+            });
+            await guard.requestFull(`watch batch of ${touched} files`);
+            return;
+          }
+
           plog.info("watch: incremental re-ingest", { changed: changed.size, deleted: deleted.size });
-          await runIngestExclusive(async () => {
+          // The batch RETURNS its failure rather than only logging it, so
+          // repeated failures reach the breaker instead of retrying forever.
+          const batchError = await runIngestExclusive(async (): Promise<Error | null> => {
             // Snapshot the CURRENT served db. The swap is serialized through this
             // same chain, so within one batch the db never changes underfoot; a
             // post-swap batch writes the new branch's index.
@@ -798,8 +1488,11 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
               // Delete-only batch: nodes already purged above and durable, so the
               // deletion is real — emit before returning (no re-parse).
               emitSpine();
-              return;
+              return null;
             }
+            // Set when the Layer B gate itself fails (a killed/hung typecheck),
+            // as opposed to the files failing to typecheck.
+            let verifyError: Error | null = null;
             try {
               const run = startParse({
                 binary: watcherBinary,
@@ -839,7 +1532,8 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
               // set; the API full-ingest path re-walks the whole repo and has no
               // "merge" semantics, so it is deliberately not gated.
               try {
-                const verify = await verifyMerge([...changed], {
+                const verify = await guard.withLimiter(() =>
+                  verifyMerge([...changed], {
                   root: paths.repoRoot,
                   native: nativeParseRunner({
                     binary: watcherBinary,
@@ -849,9 +1543,17 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
                     timeoutMs: config.ingest_timeout_seconds * 1000,
                     logger: plog.child("verify.parse"),
                   }),
-                  typecheck: defaultTypecheck({ root: paths.repoRoot, logger: plog.child("verify.type") }),
+                  typecheck: defaultTypecheck({
+                    root: paths.repoRoot,
+                    logger: plog.child("verify.type"),
+                    // Bounded + killed. `tsc --noEmit` is a whole-project check
+                    // on the watcher's hot path; unbounded it wedges the ingest
+                    // chain and the shutdown drain closes the Db under it.
+                    timeoutMs: VERIFY_TYPECHECK_TIMEOUT_MS,
+                  }),
                   logger: plog.child("verify"),
-                });
+                  }),
+                );
                 if (!verify.ok) {
                   db.recordMergeRejections(
                     verify.failures.map((f) => ({
@@ -868,10 +1570,16 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
                   });
                 }
               } catch (verr) {
-                // The gate is advisory; a gate error must never break ingest.
-                plog.warn("verify: gate errored — skipping (merge already materialized)", {
+                // The gate is ADVISORY for the merge — it never rolls the CRDT
+                // back — but it is NOT free, so its failures must reach the
+                // breaker. This block spawns a whole-PROJECT `tsc`/`mypy`/`cargo
+                // check`; swallowing every error here meant a typecheck that
+                // hung or was killed never reached `guard.note()` and so could
+                // never trip anything, however often it recurred.
+                plog.warn("verify: gate errored — flagged to the ingest breaker", {
                   error: (verr as Error).message,
                 });
+                verifyError = verr as Error;
               }
 
               // Re-ingest is durable (drainIngest returned) — emit the spine
@@ -879,17 +1587,26 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
               // emits a `code.changed` for a change that didn't land.
               emitSpine();
             } catch (err) {
-              plog.warn("watch: incremental re-ingest failed", { error: (err as Error).message });
+              return err as Error;
             }
+            return verifyError;
           });
+          guard.note(batchError);
+          if (batchError !== null) {
+            plog.warn("watch: incremental re-ingest failed", { error: batchError.message });
+          }
         },
         onOverflow: async ({ dropped, sinceMs }) => {
-          plog.warn("watch: overflow — full re-ingest", { dropped, sinceMs });
-          try {
-            await runIngestExclusive(fullIngest);
-          } catch (err) {
-            plog.warn("watch: full re-ingest after overflow failed", { error: (err as Error).message });
+          if (!guard.allowed()) {
+            plog.debug("watch: overflow ignored — ingest breaker tripped", { dropped, sinceMs });
+            return;
           }
+          plog.warn("watch: overflow — full re-ingest", { dropped, sinceMs });
+          // COALESCED: `guard.requestFull` collapses concurrent requests into a
+          // single queued run, and the supervisor already awaits this callback,
+          // so overflows cannot stack up into N sequential full re-ingests.
+          // Never rejects (it records the outcome through `guard.note`).
+          await guard.requestFull(`watch overflow (${dropped} dropped)`);
         },
       });
     } else {
@@ -924,16 +1641,36 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
           includeVendored: config.index?.includeVendored ?? false,
           includeFixtures: config.index?.includeFixtures ?? false,
         });
-        await drainIngest({
-          db: freshDb,
-          nodesDir: paths.nodesDir,
-          run,
-          logger: plog.child("watch.repoint"),
-          repoRoot: paths.repoRoot,
-        });
+        // Same idempotence requirement as `fullIngest`: this is a whole-repo
+        // re-parse, and the target index was very likely SEEDED by copying a
+        // sibling branch's index — so without a clear it carries that branch's
+        // deleted-elsewhere nodes forever. Clearing after `startParse` for the
+        // same reason (don't empty an index for a run that never started); if the
+        // freshen then fails, guard (B) refuses to swap it in.
+        freshDb.clearGraph();
+        await guard.withLimiter(() =>
+          drainIngest({
+            db: freshDb,
+            nodesDir: paths.nodesDir,
+            run,
+            logger: plog.child("watch.repoint"),
+            repoRoot: paths.repoRoot,
+            fullRebuild: true,
+          }),
+        );
       },
     };
     let repointing = false;
+    /**
+     * RETRY BACKOFF for a re-point that gave up. Guard (B) reports the
+     * still-served key, so the very next tick re-detects the same transition —
+     * an unbounded "full freshen ingest every 2 seconds" loop, the same shape as
+     * the overflow storm. Keyed by the branch we failed to reach, so an actual
+     * checkout to a DIFFERENT branch is never delayed.
+     */
+    let repointFailKey: string | null = null;
+    let repointFailures = 0;
+    let repointRetryAfterMs = 0;
     const branchPoll = setInterval(() => {
       // Skip while a prior re-point is still resolving (poll faster than a full
       // freshen ingest takes). `activeBranchKey` is a cheap one-file fs read.
@@ -946,10 +1683,24 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
         return;
       }
       if (currentKey === lastBranchKey) return;
+      if (currentKey === repointFailKey && Date.now() < repointRetryAfterMs) return;
+      // A re-point IS a whole-repo ingest — it does a `clearGraph()` plus a full
+      // freshen — so it must obey the SAME rate limit, work-rate trip and
+      // accounting as any other automatic full run. Without this, a
+      // legitimately alternating branch key (`git bisect run`, an interactive
+      // rebase, a script checking out branches in a loop) produced one full
+      // rebuild every 2 s indefinitely and NOTHING noticed, because every single
+      // one of them SUCCEEDED. The existing `repointRetryAfterMs` backoff only
+      // ever applied to FAILED attempts, which is exactly the wrong half.
+      //
+      // Checked BEFORE `lastBranchKey` is claimed, so a rate-limited tick is a
+      // true no-op and the transition is simply re-detected once admitted.
+      if (!guard.admitWholeRepoRun(`branch re-point to ${currentKey ?? "(legacy)"}`)) return;
       const from = lastBranchKey;
       lastBranchKey = currentKey; // claim the transition so we don't double-fire
       repointing = true;
       plog.info("watch: branch change detected", { from, to: currentKey });
+      const attemptedKey = currentKey;
       void repointToBranch(repointDeps, currentKey)
         .then((result) => {
           // (A) Reconcile `lastBranchKey` to the key that was ACTUALLY swapped in
@@ -958,14 +1709,43 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
           // on ONE key. Prevents desync / flip-flop when the resolved-or-served
           // key differs from the detected one.
           lastBranchKey = result.branchKey;
+          if (result.aborted === true) {
+            noteRepointFailure(attemptedKey);
+            // An abort is a failed automatic ingest — route it to the breaker so
+            // a branch that can never be freshened eventually stops being tried.
+            guard.note(new Error(`branch re-point to ${attemptedKey ?? "(legacy)"} aborted`));
+          } else {
+            clearRepointFailure();
+            guard.note(null);
+          }
         })
         .catch((err) => {
           plog.warn("watch: branch re-point failed", { error: (err as Error).message });
+          noteRepointFailure(attemptedKey);
+          guard.note(err as Error);
         })
         .finally(() => {
           repointing = false;
         });
     }, BRANCH_POLL_INTERVAL_MS);
+
+    function noteRepointFailure(key: string | null): void {
+      repointFailures = key === repointFailKey ? repointFailures + 1 : 1;
+      repointFailKey = key;
+      const delay = Math.min(REPOINT_RETRY_BASE_MS * 2 ** (repointFailures - 1), REPOINT_RETRY_MAX_MS);
+      repointRetryAfterMs = Date.now() + delay;
+      plog.warn("watch: branch re-point backing off before the next attempt", {
+        branchKey: key,
+        consecutiveFailures: repointFailures,
+        retryInMs: delay,
+      });
+    }
+
+    function clearRepointFailure(): void {
+      repointFailKey = null;
+      repointFailures = 0;
+      repointRetryAfterMs = 0;
+    }
     // Don't let the poll timer keep the event loop alive on its own.
     if (typeof branchPoll.unref === "function") branchPoll.unref();
 
@@ -984,6 +1764,10 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
       // Native version is populated on first `ingest` from the `start` record;
       // until then we just surface whether the binary was located.
       nativeVersion: tryLocateNativeBinary({ repoRoot: paths.repoRoot }) ? "present" : undefined,
+      // Backlog + breaker state over HTTP (`GET /api/ingest/health`). The
+      // incident's runaway loop was invisible to every interface the user had.
+      ingestHealth: guard.health,
+      resetIngestBreaker: guard.reset,
     };
     wireBranchAwareDb(deps);
 
@@ -1003,9 +1787,29 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
     return { alias, deps, shutdown };
   }
 
+  // Drop registry entries whose root has been deleted (ephemeral test dirs,
+  // moved checkouts) BEFORE deciding what to serve — they cost a failed open
+  // on every start and otherwise accumulate without bound.
+  try {
+    const stale = pruneStaleProjects();
+    if (stale.length > 0) {
+      // Name every root. A bare count leaves the user unable to tell WHAT was
+      // dropped or re-add it — and this removes real registrations (a checkout
+      // gone for over a week), so it must never be silent.
+      process.stdout.write(`pruned ${stale.length} registered project(s):\n`);
+      for (const e of stale) process.stdout.write(`  ${e.alias} -> ${e.root}\n`);
+      process.stdout.write("re-add any of these with `hayven daemon register <path>`.\n");
+    }
+  } catch {
+    /* non-fatal — pruning is hygiene, never a reason to fail a daemon start */
+  }
+
   // Auto-register the cwd project so it's in the registry, and capture its alias
   // as the primary. Every project defaults to the same port, so the primary is
   // the one this process binds + writes a pidfile for.
+  //
+  // Refuses `$HOME` (see `assertRegistrableRoot`): starting here from the home
+  // dir used to register the user's whole tree as one project and index it.
   let primaryAlias: string;
   try {
     primaryAlias = registerProject(primaryPaths.repoRoot).alias;
@@ -1015,22 +1819,45 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
   }
 
   // Build a de-duplicated, ordered project list: primary first, then each
-  // registry entry whose root differs from the primary root.
-  const primaryRoot = primaryPaths.repoRoot;
+  // registry entry naming a DIFFERENT repo.
+  //
+  // The dedupe compares CANONICAL roots, never raw strings. `registerProject`
+  // stores the realpath'd spelling while `detectRepoRoot` returns a `resolve`d
+  // but NOT realpath'd one, so for one repo under a symlinked path component
+  // (`/tmp` → `/private/tmp`, autofs/NFS homes — i.e. macOS by default) the two
+  // strings DIFFER. A raw `===` misses, the repo lands in `toLoad` twice, and
+  // `initProject` runs twice on it: two `Db` handles and two `hayven-native
+  // watch` children on ONE `.hayven/index.sqlite` WAL, with the first runtime
+  // orphaned in the map. `util/paths.ts` states the stakes — two writers on one
+  // WAL is corruption — and this is the exact bug class that passes on Linux CI
+  // and destroys data on a developer's Mac.
   const toLoad: Array<{ alias: string; paths: HayvenPaths; config: HayvenConfig }> = [
     { alias: primaryAlias, paths: primaryPaths, config: primaryConfig },
   ];
   for (const entry of readRegistry()) {
-    if (entry.root === primaryRoot) continue;
+    // Guard against a duplicate spelling ANYWHERE in the list, not just against
+    // the primary: two registry entries could also name one repo differently.
+    if (toLoad.some((p) => sameProjectRoot(p.paths.repoRoot, entry.root))) continue;
     toLoad.push({ alias: entry.alias, paths: hayvenPathsFor(entry.root), config: loadConfig(entry.root).config });
   }
 
   // Init each project. A broken registry entry (missing `.hayven/` or a throwing
   // initProject) must NOT crash startup — log a warning and skip it.
   const runtimes = new Map<string, ProjectRuntime>();
+  const overCap: string[] = [];
   for (const p of toLoad) {
     if (!existsSync(p.paths.hayvenDir)) {
       logger.warn("skipping project — no .hayven/ directory", { alias: p.alias, root: p.paths.repoRoot });
+      continue;
+    }
+    // MAX_LIVE_PROJECTS was enforced only on hot-add; the startup loader walked
+    // the whole registry with no bound. Every project opens a Db, spawns a
+    // long-lived `hayven-native watch` child and installs a 2 s branch poller,
+    // and the registry only ever grows — so a dev who once started a daemon in
+    // 200 repos got 200 watcher processes on the next start, with no warning.
+    // The primary is first in `toLoad`, so it is never the one dropped.
+    if (runtimes.size >= MAX_LIVE_PROJECTS) {
+      overCap.push(`${p.alias} -> ${p.paths.repoRoot}`);
       continue;
     }
     try {
@@ -1038,12 +1865,38 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
       // others got theirs from loadConfig when the list was built above.
       runtimes.set(p.alias, initProject(p.alias, p.paths, p.config));
     } catch (err) {
+      if (err instanceof ProjectSchemaTooNew) {
+        // ONE project's too-new index must not take the daemon (and every OTHER
+        // repo it serves) down — skip it loudly and keep going. The primary is
+        // handled separately below: if IT is the one that failed, the daemon
+        // refuses to start, because there would be nothing to be primary.
+        logger.error("skipping project — its index was written by a NEWER hayven", {
+          alias: p.alias,
+          root: p.paths.repoRoot,
+        });
+        process.stderr.write(`error: cannot serve ${p.alias} (${p.paths.repoRoot}):\n${err.message}\n`);
+        continue;
+      }
       logger.warn("skipping project — initProject failed", {
         alias: p.alias,
         root: p.paths.repoRoot,
         error: (err as Error).message,
       });
     }
+  }
+  if (overCap.length > 0) {
+    // Never silent: these repos will NOT be served, and the only way a user can
+    // tell is if we say so and name them.
+    process.stderr.write(
+      `warning: ${overCap.length} registered project(s) were NOT loaded — the live cap of ` +
+        `${MAX_LIVE_PROJECTS} is already reached:\n` +
+        overCap.map((e) => `  ${e}\n`).join("") +
+        "Drop projects you no longer need with `hayven daemon unregister <alias>`.\n",
+    );
+    logger.warn("project cap reached at startup — projects skipped", {
+      cap: MAX_LIVE_PROJECTS,
+      skipped: overCap.length,
+    });
   }
 
   // The primary MUST have loaded (requireProject already proved its .hayven/
@@ -1055,6 +1908,42 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
   }
 
   const primaryRuntime = runtimes.get(primaryAlias)!;
+
+  /**
+   * Pidfiles this process owns — ONE PER SERVED PROJECT, not just the primary.
+   *
+   * `hayven daemon stop`/`status` read the CWD project's `.hayven/daemon.pid`.
+   * Writing only the primary's meant that from any OTHER served repo, `stop`
+   * printed "daemon is not running" and exited 0 while the daemon was actively
+   * serving that repo, `status` said `stopped` and exited 1, and the
+   * duplicate-spawn guard at `startDetachedDaemon` was permanently dead there
+   * (its `daemonStatus` was always `stopped`). Verified live: of the running
+   * daemon's 5 served projects, only 2 had a pidfile at all.
+   */
+  const ownedPidFiles = new Set<string>();
+  const claimPidFile = (file: string): void => {
+    const existing = daemonStatus(file);
+    if (existing.state === "running" && existing.pid !== process.pid) {
+      // Another live daemon already owns this repo. Overwriting would point its
+      // `stop` at US and leave that daemon unstoppable.
+      logger.warn("not claiming pidfile — another live daemon owns it", { file, pid: existing.pid });
+      return;
+    }
+    try {
+      writePidFile(file);
+      ownedPidFiles.add(file);
+    } catch (err) {
+      // A read-only/missing `.hayven/` must not stop the daemon serving the repo.
+      logger.warn("could not write pidfile (stop/status will not work from that repo)", {
+        file,
+        error: (err as Error).message,
+      });
+    }
+  };
+  const releasePidFile = (file: string): void => {
+    if (!ownedPidFiles.delete(file)) return;
+    removePidFile(file);
+  };
 
   // The LIVE served-projects map — the SAME Map object the multi-project facade
   // reads on every request (routing + `/api/health` listing), so mutating it here
@@ -1111,6 +2000,7 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
       const runtime = initProject(entry.alias, paths, cfg);
       runtimes.set(entry.alias, runtime);
       servedProjects.set(entry.alias, runtime.deps);
+      claimPidFile(paths.pidFile); // so `stop`/`status` work from THIS repo too
       logger.info("project added live", { alias: entry.alias, root });
       notifyProjectsChanged();
       return { alias: entry.alias, root, added: true };
@@ -1131,18 +2021,40 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
       //    finish before its Db is closed.
       await new Promise((r) => setTimeout(r, REMOVE_GRACE_MS));
       // 3. Shut the runtime down (drains ingest, stops watcher/poller, closes Db).
-      //    Only AFTER a clean shutdown do we drop ownership + persist + notify, so a
-      //    shutdown FAILURE leaves it in `runtimes` (still owned by shutdownAll) and
-      //    in the registry rather than orphaning a live Db.
+      let shutdownError: Error | null = null;
       try {
         await runtime.shutdown();
       } catch (err) {
-        throw new Error(`failed to shut down ${runtime.alias}: ${(err as Error).message}`);
+        shutdownError = err as Error;
       }
+      // 4. Drop ownership UNCONDITIONALLY, even when the shutdown failed.
+      //
+      // The old code returned early on a shutdown error, leaving the project in
+      // `runtimes` but already gone from `servedProjects`. That is the worst of
+      // both: every READ with that alias fell through to the PRIMARY project and
+      // answered from a DIFFERENT repo's index with no error at all, while
+      // `addProjectLive` (which matches on `runtimes` by canonical root) kept
+      // reporting "already served" forever, so the project could not be
+      // recovered without restarting the daemon. The comment there claimed this
+      // avoided "orphaning a live Db" — but it orphaned it from the ROUTING map,
+      // which is the half that produces silent wrong answers. A possibly-leaked
+      // Db until the next restart is strictly the lesser failure, and unlike the
+      // old behavior it is logged.
       runtimes.delete(runtime.alias);
-      unregisterProject(runtime.alias);
+      releasePidFile(runtime.deps.paths.pidFile);
       notifyProjectsChanged();
-      logger.info("project removed live", { alias: runtime.alias });
+      if (shutdownError !== null) {
+        logger.error("project removed live but its shutdown FAILED — its Db/watcher may leak until restart", {
+          alias: runtime.alias,
+          error: shutdownError.message,
+        });
+        throw new Error(`failed to shut down ${runtime.alias}: ${shutdownError.message}`);
+      }
+      // NOTE: deliberately NOT `unregisterProject`. `DELETE /api/projects/:alias`
+      // is documented as "stop serving it live", and an unauthenticated localhost
+      // call permanently FORGETTING a registration is not something it should be
+      // able to do. `hayven daemon unregister` remains the explicit way to forget.
+      logger.info("project removed live (registration kept)", { alias: runtime.alias });
       return true;
     });
 
@@ -1169,23 +2081,51 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
     // Let any in-flight add/remove settle first so we snapshot a quiescent map and
     // don't race a mutation that's mid-`initProject`/`shutdown`.
     await mutationChain.catch(() => undefined);
-    for (const rt of runtimes.values()) {
-      try {
-        await rt.shutdown();
-      } catch (err) {
-        logger.warn("shutdown: project shutdown failed (non-fatal)", {
-          alias: rt.alias,
-          error: (err as Error).message,
-        });
-      }
+    // PARALLEL, and bounded as a WHOLE. Sequentially, each project could cost
+    // SHUTDOWN_DRAIN_MS (5 s) plus the watcher's SIGTERM→SIGKILL escalation
+    // (2 s) — ~7 s each, so 5 projects took ~35 s and 64 took ~450 s, against a
+    // `daemon stop` that gives up at STOP_WAIT_MS (10 s). The user then saw a
+    // failure from a daemon that was shutting down entirely correctly.
+    const all = Promise.allSettled(
+      [...runtimes.values()].map(async (rt) => {
+        try {
+          await rt.shutdown();
+        } catch (err) {
+          logger.warn("shutdown: project shutdown failed (non-fatal)", {
+            alias: rt.alias,
+            error: (err as Error).message,
+          });
+        }
+      }),
+    );
+    let budget: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<"timeout">((resolve) => {
+      budget = setTimeout(() => resolve("timeout"), SHUTDOWN_TOTAL_MS);
+    });
+    const outcome = await Promise.race([all.then(() => "done" as const), timeout]);
+    if (budget) clearTimeout(budget);
+    if (outcome === "timeout") {
+      logger.warn("shutdown: exceeded the total budget; exiting with projects still draining", {
+        budgetMs: SHUTDOWN_TOTAL_MS,
+        projects: runtimes.size,
+      });
     }
   };
 
-  writePidFile(primaryPaths.pidFile);
-  installShutdownHandlers(primaryPaths.pidFile, async () => {
-    logger.info("shutting down");
-    await shutdownAll();
-  });
+  // Claim a pidfile for EVERY served project (see `claimPidFile`), not just the
+  // primary — that asymmetry is why `stop`/`status` were no-ops in non-primary
+  // repos.
+  for (const rt of runtimes.values()) claimPidFile(rt.deps.paths.pidFile);
+  installShutdownHandlers(
+    primaryPaths.pidFile,
+    async () => {
+      logger.info("shutting down");
+      await shutdownAll();
+    },
+    // Every project's pidfile must be cleaned up, including on the escalated
+    // second-signal and watchdog paths inside the handler.
+    { extraPidFiles: () => [...ownedPidFiles] },
+  );
 
   // Bind. `app.listen` calls `Bun.serve` synchronously, which THROWS on
   // EADDRINUSE — without this guard a second `daemon start` on a port already
@@ -1196,7 +2136,7 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
     app.listen({ hostname: config.daemon_host, port: config.daemon_port });
   } catch (err) {
     const e = err as NodeJS.ErrnoException;
-    removePidFile(primaryPaths.pidFile);
+    for (const file of [...ownedPidFiles]) releasePidFile(file);
     await shutdownAll();
     if (e.code === "EADDRINUSE" || /in use|EADDRINUSE/i.test(e.message ?? "")) {
       process.stderr.write(
@@ -1218,6 +2158,12 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
   process.stdout.write(
     `hayvend listening on http://${boundHost}:${boundPort}/ (pid ${process.pid})\n` +
       `hayvend: serving ${served.length} project(s): ${served.join(", ")}\n` +
+      // Report the ACTUAL bind, not the configured string: if anything ever
+      // routes around `applyBindOverrides`, the banner is still truthful about
+      // what is reachable.
+      (isLoopbackHost(String(boundHost))
+        ? ""
+        : `hayvend: REACHABLE FROM THE NETWORK on ${boundHost} — NO AUTHENTICATION.\n`) +
       "Press Ctrl-C to stop.\n",
   );
 
@@ -1249,6 +2195,19 @@ async function stopDaemon(): Promise<number> {
   if (!isAlive(pid)) {
     removePidFile(ctx.paths.pidFile);
     process.stdout.write("stale pidfile removed; daemon is not running\n");
+    return 0;
+  }
+  // NEVER signal a pid we can prove is not ours. Pids recycle: the live daemon
+  // on this machine is 72718 while one served repo's pidfile still named 29264,
+  // a DEAD pid — had the OS handed 29264 to something else, `hayven daemon stop`
+  // would have SIGTERM'd an unrelated process. `unknown` (no sidecar, e.g. a
+  // pre-upgrade daemon) keeps the old behavior rather than refusing to stop.
+  if (verifyDaemonIdentity(ctx.paths.pidFile, pid) === "foreign") {
+    removePidFile(ctx.paths.pidFile);
+    process.stdout.write(
+      `stale pidfile removed — pid ${pid} is alive but is NOT this daemon (recycled pid); ` +
+        "refusing to signal it. The daemon is not running.\n",
+    );
     return 0;
   }
   try {

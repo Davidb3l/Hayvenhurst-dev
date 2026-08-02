@@ -22,10 +22,11 @@
  * the fallback oracle. This module throws / returns null rather than guessing.
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { MAX_PACK_FILE_BYTES, resolveWithinRepo } from "../db/context_pack.ts";
 import type { Signature, SignatureExtractor, EntityResolver, EdgeIndex } from "./contract_diff_oracle.ts";
 
 /** Map a language id to a source file extension the native walker recognizes. */
@@ -287,11 +288,23 @@ export function dbEntityResolver(db: DbLike, repoRoot: string): EntityResolver {
   const read = (rel: string): string | null => {
     if (fileCache.has(rel)) return fileCache.get(rel)!;
     let txt: string | null = null;
-    try {
-      const abs = join(repoRoot, rel);
-      if (existsSync(abs)) txt = readFileSync(abs, "utf8");
-    } catch {
-      txt = null;
+    // SECURITY — `rel` comes off a graph row, and this resolver is HTTP-reachable
+    // (`db/impact_preview.ts` → `routes/impact_preview.ts`) as well as reachable
+    // from `conflict/oracle.ts`. It used to be a bare
+    // `join(repoRoot, rel)` + `readFileSync`: the same ungated pattern that let
+    // the MCP surface read `/etc/passwd`. Today it is safe only because the Rust
+    // producer canonicalizes paths and does not follow symlinks — i.e. the
+    // guarantee lives in another language, in another crate, held by people who
+    // do not know it is load-bearing here. `resolveWithinRepo` also refuses
+    // FIFOs (which would block this read forever) and oversized files.
+    const abs = resolveWithinRepo(repoRoot, rel);
+    if (abs !== null) {
+      try {
+        const st = statSync(abs);
+        if (st.isFile() && st.size <= MAX_PACK_FILE_BYTES) txt = readFileSync(abs, "utf8");
+      } catch {
+        txt = null;
+      }
     }
     fileCache.set(rel, txt);
     return txt;

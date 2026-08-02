@@ -31,6 +31,7 @@ import { isAbsolute, join } from "node:path";
 import {
   buildContextPack,
   estimateTokens,
+  resolveWithinRepo,
   type ContextPack,
   type ContextSlice,
   type ContextPackOptions,
@@ -201,13 +202,19 @@ export function buildEscalatingContext(
     for (const file of rungFiles(twoHopSlices)) {
       let content: string;
       try {
-        // Resolve the path EXACTLY as the packer's `makeFileReader` does — an
-        // absolute `file` is read as-is, only a relative one is joined to
-        // `repoRoot`. Joining an already-absolute path would double the root
-        // (`repoRoot + "/abs/path"`) and the read would ENOENT, silently
-        // dropping a file the pack rung read fine — yielding an empty
-        // whole-file rung that the recommendation logic would then prefer.
-        content = readFileSync(isAbsolute(file) ? file : join(repoRoot, file), "utf8");
+        // Resolve the path EXACTLY as the packer's `makeFileReader` does — which
+        // now means CONTAINMENT-CHECKED, not "read an absolute path verbatim".
+        // The old behaviour would read any file on disk, and an in-repo symlink
+        // was enough to reach one. Staying in lockstep with the packer still
+        // matters for the original reason: resolving differently would ENOENT on
+        // a file the pack rung read fine, silently yielding an empty whole-file
+        // rung that the recommendation logic would then prefer.
+        const abs = resolveWithinRepo(repoRoot, file);
+        if (abs === null) {
+          notes.push(`refused to read \`${file}\` for the whole-file rung: outside the repository`);
+          continue;
+        }
+        content = readFileSync(abs, "utf8");
       } catch (err) {
         notes.push(
           `could not read \`${file}\` for the whole-file rung: ${

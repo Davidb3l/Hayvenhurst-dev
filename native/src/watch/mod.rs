@@ -15,12 +15,22 @@
 //! should stay below 0.1% CPU at idle by doing as little as possible
 //! per event.
 //!
-//! Path filtering matches the parse walker's skip list (target/,
-//! node_modules/, .git/, …) so the daemon never has to debounce noise
-//! from build caches.
+//! Path filtering goes through `parse::scope::ScopeFilter` — the SAME
+//! decision function the full ingest walk uses.
+//!
+//! F5: this module used to carry its own hand-copied `ALWAYS_SKIP_DIRS`
+//! constant, and it had drifted: no `vendor`/`Godeps`/`third_party`, no
+//! `examples`/`benchmark(s)`/`fixtures`, and it never read `.gitignore` at
+//! all. So any build writing into a gitignored output dir that is not on the
+//! hard list (`.output/`, `coverage/`, `htmlcov/`, `storybook-static/`,
+//! `__generated__/`, …) produced a burst of change events, each burst queued
+//! an incremental ingest, and the generated artifacts were written
+//! permanently into the graph — files a full `hayven ingest` deliberately
+//! excludes. Two paths disagreeing about what belongs in the graph was the
+//! defect; one shared decision function is the fix.
 
 use std::io::{self, BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -29,6 +39,8 @@ use notify::event::{CreateKind, EventKind, Flag, ModifyKind, RemoveKind, RenameM
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
 
+use crate::parse::scope::ScopeFilter;
+use crate::parse::walker::WalkOptions;
 use crate::version_record;
 
 // EXIT_OK is structurally implied (the watcher never returns 0 by design —
@@ -37,23 +49,15 @@ const EXIT_FATAL: i32 = 1;
 /// Heartbeat cadence per §16.2 — every 15 seconds.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
-/// Directories whose contents are never useful to watch. Mirrors
-/// `parse::walker::ALWAYS_SKIP_DIRS` so the daemon never has to debounce
-/// noise from a Cargo rebuild or an npm install.
-const ALWAYS_SKIP_DIRS: &[&str] = &[
-    "node_modules",
-    "target",
-    "dist",
-    "build",
-    ".venv",
-    "venv",
-    "__pycache__",
-    ".hayven",
-    ".git",
-    ".next",
-    ".turbo",
-    ".cache",
-];
+/// Watch-scope opt-ins. Mirror the `parse` flags of the same name so a daemon
+/// that ingests vendored or fixture code can also watch it. Defaults are OFF,
+/// matching `hayven ingest`'s defaults: if the two disagreed we would be back
+/// to the F5 divergence, just pointing the other way.
+#[derive(Debug, Clone, Default)]
+pub struct WatchOptions {
+    pub include_vendored: bool,
+    pub include_fixtures: bool,
+}
 
 /// One NDJSON record on the watcher's stdout. Internally tagged so the
 /// daemon's parser dispatches by `type`.
@@ -87,7 +91,7 @@ enum WatchRecord {
 }
 
 /// Entry point for `hayven-native watch --root <abs-path>`.
-pub fn run(root: PathBuf) -> i32 {
+pub fn run(root: PathBuf, opts: WatchOptions) -> i32 {
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
 
@@ -112,6 +116,19 @@ pub fn run(root: PathBuf) -> i32 {
             return EXIT_FATAL;
         }
     };
+
+    // The shared scope decision, anchored at the canonical root. Built once:
+    // it caches the per-directory gitignore matchers and refreshes them when
+    // an ignore file's mtime changes, so a long-lived watcher stays correct
+    // across `.gitignore` edits without re-reading them per event.
+    let scope = ScopeFilter::new(
+        &root,
+        &WalkOptions {
+            include_vendored: opts.include_vendored,
+            include_fixtures: opts.include_fixtures,
+            ..WalkOptions::default()
+        },
+    );
 
     // Build a notify watcher. The channel buffers raw events while the
     // main thread translates and writes them.
@@ -194,7 +211,7 @@ pub fn run(root: PathBuf) -> i32 {
                         overflow_since_ms = now_ms();
                     }
                     overflow_count += 1;
-                } else if let Some(record) = translate(&event, &root) {
+                } else if let Some(record) = translate(&event, &scope) {
                     if let Err(e) = write_record(&mut out, &record) {
                         eprintln!("hayven-native watch: stdout write failed: {e}");
                         return EXIT_FATAL;
@@ -265,10 +282,11 @@ pub fn run(root: PathBuf) -> i32 {
     }
 }
 
-/// Map a single `notify::Event` to a `WatchRecord::Change`, applying our
-/// skip-list filter. Returns `None` when the event should be dropped
-/// (build-cache directory, non-file, unsupported kind).
-fn translate(event: &Event, root: &Path) -> Option<WatchRecord> {
+/// Map a single `notify::Event` to a `WatchRecord::Change`, applying the
+/// SHARED scope filter. Returns `None` when the event should be dropped
+/// (out-of-scope directory, gitignored, hidden, non-file, unsupported kind).
+fn translate(event: &Event, scope: &ScopeFilter) -> Option<WatchRecord> {
+    let root = scope.root();
     let kind = match &event.kind {
         EventKind::Create(CreateKind::File | CreateKind::Any) => "create",
         EventKind::Modify(ModifyKind::Data(_)) | EventKind::Modify(ModifyKind::Any) => "modify",
@@ -282,28 +300,57 @@ fn translate(event: &Event, root: &Path) -> Option<WatchRecord> {
         _ => return None,
     };
 
-    let path = event.paths.first()?;
-    if is_under_skipped_dir(path, root) {
-        return None;
-    }
-
-    // For rename events with both endpoints (RenameMode::Both), notify
-    // reports source in paths[0] and dest in paths[1]. Surface dst as
-    // `file` and src as `from`. For single-path rename events (just
-    // From or just To), we report the one path we have and omit `from`.
+    // Two-endpoint rename (RenameMode::Both): notify puts the source in
+    // paths[0] and the destination in paths[1]. Scope has to be evaluated on
+    // BOTH, and the two answers mean different things — this is the one place
+    // where "out of scope" must not simply mean "drop the event", because the
+    // daemon reconciles DELETIONS from these records
+    // (`cli/daemon.ts`: rename => changed(file) + deleted(from)).
     if kind == "rename" && event.paths.len() >= 2 {
         let from_path = &event.paths[0];
         let to_path = &event.paths[1];
-        let from_rel = from_path.strip_prefix(root).unwrap_or(from_path);
-        let to_rel = to_path.strip_prefix(root).unwrap_or(to_path);
-        return Some(WatchRecord::Change {
-            file: to_rel.to_string_lossy().replace('\\', "/"),
-            kind,
-            ts_ms: now_ms(),
-            from: Some(from_rel.to_string_lossy().replace('\\', "/")),
-        });
+        let to_ok = scope.accepts(to_path, false);
+        let from_ok = scope.accepts(from_path, false);
+        if to_ok {
+            // Landed in scope. `from` is reported only when it was in scope
+            // too: a file moved IN from outside the repo (or out of a
+            // gitignored dir) has no prior graph entry to delete, and its
+            // path may not even be repo-relative.
+            let to_rel = to_path.strip_prefix(root).unwrap_or(to_path);
+            return Some(WatchRecord::Change {
+                file: to_rel.to_string_lossy().replace('\\', "/"),
+                kind,
+                ts_ms: now_ms(),
+                from: from_ok.then(|| {
+                    from_path
+                        .strip_prefix(root)
+                        .unwrap_or(from_path)
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                }),
+            });
+        }
+        if from_ok {
+            // Moved OUT of scope — into a gitignored dir, or out of the repo.
+            // From the graph's point of view the source file is GONE, so this
+            // is a delete. Dropping the record instead (which is what a
+            // destination-only scope check does) leaves the source's nodes in
+            // the index forever.
+            let from_rel = from_path.strip_prefix(root).unwrap_or(from_path);
+            return Some(WatchRecord::Change {
+                file: from_rel.to_string_lossy().replace('\\', "/"),
+                kind: "delete",
+                ts_ms: now_ms(),
+                from: None,
+            });
+        }
+        return None; // both ends out of scope: nothing the graph cares about
     }
 
+    let path = event.paths.first()?;
+    if !scope.accepts(path, false) {
+        return None;
+    }
     let rel = path.strip_prefix(root).unwrap_or(path);
     let file = rel.to_string_lossy().replace('\\', "/");
     Some(WatchRecord::Change {
@@ -312,25 +359,6 @@ fn translate(event: &Event, root: &Path) -> Option<WatchRecord> {
         ts_ms: now_ms(),
         from: None,
     })
-}
-
-/// Walk up `path` from the file toward `root`, returning true if any
-/// directory along the way matches a skip-list name. Anchored at `root`
-/// so a project literally named `node_modules/` doesn't self-exclude.
-fn is_under_skipped_dir(path: &Path, root: &Path) -> bool {
-    let mut cur = path.parent();
-    while let Some(dir) = cur {
-        if dir == root {
-            return false;
-        }
-        if let Some(name) = dir.file_name().and_then(|s| s.to_str()) {
-            if ALWAYS_SKIP_DIRS.contains(&name) {
-                return true;
-            }
-        }
-        cur = dir.parent();
-    }
-    false
 }
 
 fn write_record<T: Serialize>(out: &mut impl Write, rec: &T) -> io::Result<()> {
@@ -401,6 +429,137 @@ fn is_overflow_err(err: &notify::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use notify::event::DataChange;
+    use std::path::Path;
+
+    /// A `ScopeFilter` over a fresh temp repo, returned with the tempdir so the
+    /// caller keeps it alive for the test's duration.
+    fn scope_for(dir: &tempfile::TempDir) -> (ScopeFilter, PathBuf) {
+        let root = dir.path().canonicalize().expect("canonicalize");
+        // Repo-shaped: the ingest walk only applies .gitignore inside a git
+        // repo (`require_git`), and the watcher must match it exactly.
+        std::fs::create_dir_all(root.join(".git")).expect("mkdir .git");
+        std::fs::write(root.join(".git/HEAD"), b"ref: refs/heads/main\n").expect("write HEAD");
+        let sf = ScopeFilter::new(&root, &WalkOptions::default());
+        (sf, root)
+    }
+
+    fn modify_event(path: &Path) -> Event {
+        let mut ev = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)));
+        ev.paths.push(path.to_path_buf());
+        ev
+    }
+
+    /// F5: the watcher must drop exactly what the full ingest walk drops.
+    /// Before the shared filter these all produced `change` records, each one
+    /// queueing an ingest that wrote a generated/vendored artifact into the
+    /// graph.
+    #[test]
+    fn watcher_scope_matches_the_ingest_walk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (scope, root) = scope_for(&dir);
+        std::fs::write(root.join(".gitignore"), b"out/\ncoverage/\n").expect("write gitignore");
+
+        for out_of_scope in [
+            "vendor/dep/v.ts",       // dependency source
+            "third_party/tp.go",     // dependency source
+            "examples/demo.ts",      // fixture-like
+            "benchmark/b.ts",        // fixture-like
+            "pkg/test/fixtures/a/x.ts", // test fixture app
+            "out/bundle.js",         // gitignored build output
+            "coverage/lcov.js",      // gitignored build output
+            ".output/server.js",     // hidden build output
+            "node_modules/pkg/i.js", // already on the hard list
+        ] {
+            assert!(
+                translate(&modify_event(&root.join(out_of_scope)), &scope).is_none(),
+                "{out_of_scope} must NOT produce a change record"
+            );
+        }
+
+        for in_scope in ["src/app.ts", "lib/mod.rs", "src/fixtures/keep.ts"] {
+            assert!(
+                translate(&modify_event(&root.join(in_scope)), &scope).is_some(),
+                "{in_scope} MUST produce a change record"
+            );
+        }
+    }
+
+    /// A rename whose DESTINATION is out of scope must become a DELETE for the
+    /// source, not a dropped event. The daemon reconciles removals from these
+    /// records, so dropping one leaves the moved-away file's nodes in the graph
+    /// forever — the exact "silent wrongness" class this pass exists to kill.
+    #[test]
+    fn rename_out_of_scope_becomes_a_delete_for_the_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (scope, root) = scope_for(&dir);
+        std::fs::write(root.join(".gitignore"), b"out/\n").expect("write gitignore");
+
+        let mut ev = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)));
+        ev.paths.push(root.join("src/tmp.ts"));
+        ev.paths.push(root.join("out/tmp.ts"));
+        match translate(&ev, &scope) {
+            Some(WatchRecord::Change { file, kind, from, .. }) => {
+                assert_eq!(kind, "delete", "moving out of scope is a deletion");
+                assert_eq!(file, "src/tmp.ts", "the SOURCE is what disappeared");
+                assert!(from.is_none());
+            }
+            other => panic!("expected a delete record, got {other:?}"),
+        }
+    }
+
+    /// A file moved IN from outside the repo must still be indexed. The source
+    /// is not repo-relative, so it is reported without a `from` rather than
+    /// causing the whole event to be dropped.
+    #[test]
+    fn rename_into_scope_from_outside_the_repo_is_reported() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (scope, root) = scope_for(&dir);
+
+        let mut ev = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)));
+        ev.paths.push(PathBuf::from("/tmp/elsewhere/new.ts"));
+        ev.paths.push(root.join("src/new.ts"));
+        match translate(&ev, &scope) {
+            Some(WatchRecord::Change { file, kind, from, .. }) => {
+                assert_eq!(kind, "rename");
+                assert_eq!(file, "src/new.ts");
+                assert!(from.is_none(), "an out-of-repo source has nothing to delete");
+            }
+            other => panic!("expected a rename record, got {other:?}"),
+        }
+    }
+
+    /// An ordinary in-scope rename still carries `from` so the daemon can
+    /// retire the old path.
+    #[test]
+    fn in_scope_rename_still_reports_both_endpoints() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (scope, root) = scope_for(&dir);
+
+        let mut ev = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)));
+        ev.paths.push(root.join("src/a.ts"));
+        ev.paths.push(root.join("src/b.ts"));
+        match translate(&ev, &scope) {
+            Some(WatchRecord::Change { file, from, .. }) => {
+                assert_eq!(file, "src/b.ts");
+                assert_eq!(from.as_deref(), Some("src/a.ts"));
+            }
+            other => panic!("expected a rename record, got {other:?}"),
+        }
+    }
+
+    /// Both endpoints out of scope: nothing the graph cares about.
+    #[test]
+    fn rename_wholly_outside_scope_is_dropped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (scope, root) = scope_for(&dir);
+        std::fs::write(root.join(".gitignore"), b"out/\n").expect("write gitignore");
+
+        let mut ev = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)));
+        ev.paths.push(root.join("out/a.ts"));
+        ev.paths.push(root.join("out/b.ts"));
+        assert!(translate(&ev, &scope).is_none());
+    }
 
     #[test]
     fn rescan_flagged_event_is_overflow() {
@@ -422,7 +581,9 @@ mod tests {
     #[test]
     fn rescan_event_is_not_translated_as_a_change() {
         // It must NOT also produce a Change record (would double-report).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (scope, _root) = scope_for(&dir);
         let ev = Event::new(EventKind::Other).set_flag(Flag::Rescan);
-        assert!(translate(&ev, std::path::Path::new("/")).is_none());
+        assert!(translate(&ev, &scope).is_none());
     }
 }

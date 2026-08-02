@@ -12,10 +12,32 @@
 import { Elysia } from "elysia";
 
 import { computeMerkle, computeRoots, type SegmentLeaf } from "../../crdt/merkle.ts";
-import type { CrdtType } from "../../crdt/oplog.ts";
+import {
+  assertAcceptableSegmentDay,
+  SegmentRejectedError,
+  type CrdtType,
+} from "../../crdt/oplog.ts";
+import { CRDT_LIMITS } from "../../crdt/retention.ts";
 import type { ServerDependencies } from "../server.ts";
 
 const TYPES: readonly CrdtType[] = ["lww", "gset", "orset"];
+
+/**
+ * Largest window `/api/sync/batch` will return in one response, regardless of
+ * the caller's `max_bytes` (F1/F4). The endpoint is unauthenticated and local:
+ * without a ceiling a peer asks for `max_bytes: 2**31` and we allocate and
+ * serialize the entire segment in one go, which is the read-amplification hole
+ * we just closed on the disk side. 8 MiB is 8x the default page.
+ */
+const MAX_BATCH_RESPONSE_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Largest base64 `batch` field `/api/sync/push` will even look at (F4). Base64
+ * inflates by 4/3, so this is the wire-side sibling of
+ * `CRDT_LIMITS.maxPushBatchBytes`; checking it BEFORE `Buffer.from` means a
+ * hostile body is rejected without materializing its decoded form too.
+ */
+const MAX_PUSH_BASE64_CHARS = Math.ceil((CRDT_LIMITS.maxPushBatchBytes * 4) / 3) + 4;
 
 function isCrdtType(s: unknown): s is CrdtType {
   return typeof s === "string" && (s === "lww" || s === "gset" || s === "orset");
@@ -76,21 +98,22 @@ export function syncRoutes(deps: ServerDependencies) {
         return { error: "body.max_bytes must be a positive integer if present" };
       }
 
-      const all = deps.crdt.oplog.readSegmentBytes(raw.type, raw.path);
-      if (all === null) {
+      // F1: read ONLY the requested window off disk. Reading the whole
+      // segment and slicing turned a paginated pull of a large segment into
+      // O(pages x segment_size) read I/O. The response is additionally
+      // clamped to MAX_BATCH_RESPONSE_BYTES so `max_bytes` cannot be used to
+      // demand an arbitrarily large allocation.
+      const window = Math.min(cap, MAX_BATCH_RESPONSE_BYTES);
+      const chunk = deps.crdt.oplog.readSegmentRange(raw.type, raw.path, offset, window);
+      if (chunk === null) {
         set.status = 404;
         return { error: "segment not found", type: raw.type, path: raw.path };
       }
-      const size = all.length;
       set.headers["content-type"] = "application/octet-stream";
-      set.headers["x-segment-size"] = String(size);
-      if (offset >= size) {
-        set.headers["x-segment-eof"] = "1";
-        return new Uint8Array(0);
-      }
-      const end = Math.min(offset + cap, size);
-      set.headers["x-segment-eof"] = end >= size ? "1" : "0";
-      return all.subarray(offset, end);
+      set.headers["x-segment-size"] = String(chunk.size);
+      set.headers["x-segment-eof"] =
+        offset + chunk.bytes.length >= chunk.size ? "1" : "0";
+      return chunk.bytes;
     })
     .post("/api/sync/push", ({ body, set }) => {
       const raw = body as { type?: unknown; path?: unknown; batch?: unknown } | null;
@@ -102,9 +125,33 @@ export function syncRoutes(deps: ServerDependencies) {
         set.status = 400;
         return { error: "body.path must be a YYYY-MM-DD segment name" };
       }
+      // F4: `isSafeSegmentName` only proves the date is on the calendar, so
+      // `9999-12-31` used to be a legal push target — and segments are never
+      // pruned, so a peer with a broken clock could mint millions of segment
+      // files that every later hydrate/diskUsage/Merkle pass walks. Check the
+      // acceptance window HERE, before we spend a subprocess decode on the
+      // payload; `appendRawBatchToDate` re-checks it for every other caller.
+      try {
+        assertAcceptableSegmentDay(raw.path, Date.now());
+      } catch (err) {
+        set.status = 400;
+        return { error: (err as Error).message, type: raw.type, path: raw.path };
+      }
       if (typeof raw.batch !== "string" || raw.batch.length === 0) {
         set.status = 400;
         return { error: "body.batch must be a base64-encoded §13 batch" };
+      }
+      // F4: bound the payload BEFORE decoding it. `appendRawBatchToDate`
+      // enforces the same cap on the decoded bytes as a backstop for every
+      // caller (the WS path included); this check just avoids materializing a
+      // huge decode first.
+      if (raw.batch.length > MAX_PUSH_BASE64_CHARS) {
+        set.status = 413;
+        return {
+          error:
+            `body.batch is ${raw.batch.length} base64 chars, over the ` +
+            `${MAX_PUSH_BASE64_CHARS}-char cap (${CRDT_LIMITS.maxPushBatchBytes} decoded bytes)`,
+        };
       }
       let bytes: Uint8Array;
       try {
@@ -127,7 +174,23 @@ export function syncRoutes(deps: ServerDependencies) {
       // Persist to the peer-specified day (NOT today) so cross-day sync
       // converges, then apply each op in-memory. Both are guarded — a bad op
       // is skipped, never crashes the handler.
-      deps.crdt.oplog.appendRawBatchToDate(raw.type, raw.path, bytes);
+      //
+      // F4: the append can now REFUSE (segment day outside the acceptance
+      // window, batch too large, segment at its hard cap). Translate that into
+      // a 413 the peer can see, rather than an opaque 500 — and crucially do
+      // NOT apply the ops in memory, so refused bytes leave no trace.
+      try {
+        deps.crdt.oplog.appendRawBatchToDate(raw.type, raw.path, bytes);
+      } catch (err) {
+        if (err instanceof SegmentRejectedError) {
+          // Same mapping as the pre-checks above: a bad segment DAY is a 400
+          // (the request names something we will not accept), a too-large
+          // payload or segment is a 413.
+          set.status = err.kind === "day" ? 400 : 413;
+          return { error: err.message, type: raw.type, path: raw.path };
+        }
+        throw err;
+      }
       let applied = 0;
       for (const op of decoded) {
         if (deps.crdt.applyWireOpInMemory(op)) applied += 1;

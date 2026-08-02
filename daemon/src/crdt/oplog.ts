@@ -26,9 +26,67 @@ import {
 import { dirname, join } from "node:path";
 
 import { encodeHlc, type WriterId } from "./hlc.ts";
+import { CRDT_LIMITS } from "./retention.ts";
 import { openWireBridge, type WireBridge, type WireOp } from "./wire.ts";
 
 export type CrdtType = "lww" | "gset" | "orset";
+
+/**
+ * How far into the future an INBOUND segment day may be (F4). The sync push
+ * and live-sync paths both write to a day chosen by the remote peer (the op's
+ * HLC day), and `isSafeSegmentName` only checked that the date was on the
+ * calendar — `9999-12-31` passed. Since segments are never pruned, a peer with
+ * a broken or hostile clock can mint ~2.9 million distinct future segment
+ * files that every subsequent `hydrate()`, `diskUsage()` and Merkle pass must
+ * walk. Seven days is far more skew than any real machine has; beyond it we
+ * reject LOUDLY rather than silently absorbing a clock we cannot trust.
+ */
+export const MAX_FUTURE_SEGMENT_DAYS = 7;
+
+/** Earliest inbound segment day we accept. Before the Unix epoch there is no
+ *  legitimate HLC (`wall_ms` is unsigned ms since epoch), so anything earlier
+ *  is corrupt or forged. */
+export const MIN_SEGMENT_DAY = "1970-01-01";
+
+/** Thrown when an inbound (peer-controlled) append is refused. Callers on the
+ *  HTTP/WS sync paths turn this into a 4xx instead of a 500 — the point is
+ *  that the peer learns its data was refused, rather than us silently
+ *  accepting unbounded growth. */
+export class SegmentRejectedError extends Error {
+  override readonly name = "SegmentRejectedError";
+  /** `"day"` = the segment name is outside the acceptance window (a client
+   *  VALIDATION failure → 400). `"size"` = the payload or the resulting
+   *  segment is too large (→ 413). Without this discriminator the same
+   *  rejection surfaced as 400 from the route's pre-check and 413 from the
+   *  op-log backstop, which is confusing to a peer trying to react. */
+  constructor(message: string, readonly kind: "day" | "size") {
+    super(message);
+  }
+}
+
+/**
+ * Validate a peer-supplied segment day against the acceptance window.
+ * Throws {@link SegmentRejectedError} with an actionable message.
+ *
+ * Deliberately NOT applied to the local append path: our own ops are trusted,
+ * and tests inject fake clocks that legitimately produce 1970 days.
+ */
+export function assertAcceptableSegmentDay(day: string, nowMs: number): void {
+  if (day < MIN_SEGMENT_DAY) {
+    throw new SegmentRejectedError(
+      `segment day ${day} predates ${MIN_SEGMENT_DAY} — refusing (corrupt or forged HLC)`,
+      "day",
+    );
+  }
+  const horizon = utcDate(nowMs + MAX_FUTURE_SEGMENT_DAYS * 86_400_000);
+  if (day > horizon) {
+    throw new SegmentRejectedError(
+      `segment day ${day} is more than ${MAX_FUTURE_SEGMENT_DAYS} days in the future ` +
+        `(horizon ${horizon}) — refusing; check the peer's clock`,
+      "day",
+    );
+  }
+}
 
 export interface OpLogOptions {
   /** Default: 32 writes between fdatasync. */
@@ -82,6 +140,13 @@ export class OpLog {
   appendOps(type: CrdtType, ops: WireOp[]): number {
     if (ops.length === 0) return 0;
     const date = utcDate(ops[0]!.hlc.wall_ms);
+    // Our own ops are never REJECTED — losing local data to a clock problem
+    // would be worse than the clock problem. But a local day outside the
+    // inbound acceptance window means every peer will refuse these bytes
+    // forever (they hit the same guard on their side), so this must not pass
+    // silently: that is a permanent, invisible divergence, exactly the class
+    // of failure this pass exists to remove.
+    this.warnIfLocalDayOutOfWindow(type, date);
     const batch = this.bridge.encode(ops);
     return this.appendBatchBytes(type, date, batch, /* cached */ true);
   }
@@ -92,8 +157,40 @@ export class OpLog {
    * segment's day, and we must write to THAT day, not today, or cross-day
    * sync never converges. Opens the target file directly so it doesn't
    * disturb the cached fd used for local same-day writes.
+   *
+   * F4: this is the ONLY path an untrusted peer can grow our disk through
+   * (`POST /api/sync/push` and the `/ws/sync` frame handler both land here),
+   * so the inbound bounds are enforced HERE rather than in each route — a
+   * future caller cannot forget them. Three guards, all throwing
+   * {@link SegmentRejectedError}:
+   *   1. batch size    — one §13 batch is normally tens of bytes; 8 MiB is
+   *                      ~100,000x headroom and still bounds a single call.
+   *   2. segment day   — must be inside the acceptance window, or a bad clock
+   *                      mints unprunable far-future segments forever.
+   *   3. segment total — refuse the append that would push one day's segment
+   *                      past the hard cap, because `hydrate` and
+   *                      `segmentCompositeKeys` both materialize a whole
+   *                      segment in memory and nothing ever prunes it.
    */
   appendRawBatchToDate(type: CrdtType, date: string, batch: Uint8Array): number {
+    if (batch.length > CRDT_LIMITS.maxPushBatchBytes) {
+      throw new SegmentRejectedError(
+        `inbound §13 batch is ${batch.length} bytes, over the ` +
+          `${CRDT_LIMITS.maxPushBatchBytes}-byte cap — refusing`,
+        "size",
+      );
+    }
+    assertAcceptableSegmentDay(date, this.now());
+    const path = join(this.crdtRoot, type, `${date}.log`);
+    const existingBytes = existsSync(path) ? statSync(path).size : 0;
+    if (existingBytes + batch.length > CRDT_LIMITS.maxSegmentBytes) {
+      throw new SegmentRejectedError(
+        `appending ${batch.length} bytes would grow segment ${type}/${date} past the ` +
+          `${CRDT_LIMITS.maxSegmentBytes}-byte cap (currently ${existingBytes}) — refusing; ` +
+          `the op log is never pruned, so this segment would be re-read in full on every start`,
+        "size",
+      );
+    }
     return this.appendBatchBytes(type, date, batch, /* cached */ false);
   }
 
@@ -119,7 +216,7 @@ export class OpLog {
       mkdirSync(dirname(path), { recursive: true });
       const fd = openSync(path, "a");
       try {
-        writeSync(fd, buf, 0, buf.length);
+        writeFully(fd, buf);
         fdatasyncSync(fd);
       } finally {
         closeSync(fd);
@@ -128,7 +225,7 @@ export class OpLog {
     }
 
     const seg = this.ensureOpenSegment(type, date);
-    writeSync(seg.fd, buf, 0, buf.length);
+    writeFully(seg.fd, buf);
     seg.pendingWrites += 1;
     const nowMs = this.now();
     if (
@@ -140,6 +237,28 @@ export class OpLog {
       seg.lastFlushMs = nowMs;
     }
     return buf.length;
+  }
+
+  /** One `crdt_retention:local_day_out_of_window` line per (type, day), not
+   *  one per append — a skewed clock would otherwise write a line per op. */
+  private readonly warnedLocalDays = new Set<string>();
+
+  private warnIfLocalDayOutOfWindow(type: CrdtType, date: string): void {
+    const key = `${type}/${date}`;
+    if (this.warnedLocalDays.has(key)) return;
+    try {
+      assertAcceptableSegmentDay(date, this.now());
+      return;
+    } catch (err) {
+      if (!(err instanceof SegmentRejectedError)) throw err;
+      this.warnedLocalDays.add(key);
+      process.stderr.write(
+        `crdt_retention:local_day_out_of_window type=${type} day=${date} ` +
+          `reason=${err.message} ` +
+          `action=ops written here are accepted locally but every PEER will refuse them; ` +
+          `fix this machine's clock\n`,
+      );
+    }
   }
 
   /** Force-flush every open segment. Idempotent. */
@@ -270,11 +389,64 @@ export class OpLog {
     return this.bridge.decode(bytes);
   }
 
-  /** Raw bytes of a segment file (for the sync `/api/sync/batch` transport). */
+  /**
+   * Raw bytes of a WHOLE segment file. Only for callers that genuinely need
+   * every byte at once — today that is the `hayven sync` CLI's push direction,
+   * which immediately splits the segment into batches. Ranged readers MUST use
+   * {@link readSegmentRange} instead; see F1 there.
+   */
   readSegmentBytes(type: CrdtType, day: string): Uint8Array | null {
     const path = this.segmentPath(type, day);
     if (!existsSync(path)) return null;
     return new Uint8Array(readFileSync(path));
+  }
+
+  /**
+   * Read at most `maxBytes` of a segment starting at `offset`, reading ONLY
+   * that window off disk.
+   *
+   * F1: `POST /api/sync/batch` is an unauthenticated local endpoint whose
+   * whole job is paginating a segment. It used to call
+   * {@link readSegmentBytes} and slice the result, so a peer walking a 500 MB
+   * segment at the default 1 MiB page performed 500 full 500 MB reads — about
+   * 250 GB of read I/O and 500 half-gigabyte allocations for 500 MB of actual
+   * payload. That is precisely the "read 195 GB" shape of the incident this
+   * pass exists to prevent, reachable from a local socket.
+   *
+   * Returns `null` when the segment does not exist. `size` is the segment's
+   * full length (from the same `stat`) so the caller can set its EOF header
+   * without a second syscall. A short read (the file was truncated under us)
+   * yields fewer bytes rather than a torn buffer of zeros.
+   */
+  readSegmentRange(
+    type: CrdtType,
+    day: string,
+    offset: number,
+    maxBytes: number,
+  ): { bytes: Uint8Array; size: number } | null {
+    const path = this.segmentPath(type, day);
+    if (!existsSync(path)) return null;
+    const size = statSync(path).size;
+    if (offset >= size || maxBytes <= 0) return { bytes: new Uint8Array(0), size };
+    const want = Math.min(maxBytes, size - offset);
+    // `allocUnsafeSlow`, not `allocUnsafe`: a small allocation from the pooled
+    // path would return a VIEW into Node's shared 8 KiB pool, and we hand that
+    // view straight to the HTTP layer as a response body. A later allocation
+    // reusing the pool could then overwrite bytes we have not serialized yet.
+    // Own memory, no aliasing.
+    const buf = Buffer.allocUnsafeSlow(want);
+    const fd = openSync(path, "r");
+    let filled = 0;
+    try {
+      while (filled < want) {
+        const n = readSync(fd, buf, filled, want - filled, offset + filled);
+        if (n <= 0) break; // EOF early: the segment shrank between stat and read.
+        filled += n;
+      }
+    } finally {
+      closeSync(fd);
+    }
+    return { bytes: new Uint8Array(buf.buffer, buf.byteOffset, filled), size };
   }
 
   /**
@@ -308,16 +480,40 @@ export class OpLog {
     return { mtimeMs: s.mtimeMs, size: s.size, tailHex };
   }
 
-  /** Diagnostic: total bytes on disk under `crdt/`. */
+  /**
+   * Per-segment byte sizes for one CRDT type, sorted by day ascending.
+   * `stat` only — never reads segment contents. Unreadable entries are
+   * skipped rather than throwing: this feeds diagnostics, and a health
+   * check must not be able to take the daemon down.
+   */
+  segmentSizes(type: CrdtType): { day: string; bytes: number }[] {
+    const dir = join(this.crdtRoot, type);
+    if (!existsSync(dir)) return [];
+    const out: { day: string; bytes: number }[] = [];
+    for (const f of readdirSync(dir)) {
+      if (!f.endsWith(".log")) continue;
+      try {
+        out.push({ day: f.replace(/\.log$/, ""), bytes: statSync(join(dir, f)).size });
+      } catch {
+        continue;
+      }
+    }
+    out.sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0));
+    return out;
+  }
+
+  /**
+   * Diagnostic: total bytes on disk under `crdt/`.
+   *
+   * F3: this used to `readFileSync` EVERY segment just to sum `byteLength`,
+   * and it runs once per project at daemon start purely to populate a log
+   * field — so a daemon with a large op history read its entire CRDT history
+   * off disk, at every start, for a number the inode already holds. `stat`.
+   */
   diskUsage(): number {
     let total = 0;
     for (const t of TYPES) {
-      const dir = join(this.crdtRoot, t);
-      if (!existsSync(dir)) continue;
-      for (const f of readdirSync(dir)) {
-        if (!f.endsWith(".log")) continue;
-        total += readFileSync(join(dir, f)).byteLength;
-      }
+      for (const seg of this.segmentSizes(t)) total += seg.bytes;
     }
     return total;
   }
@@ -446,6 +642,26 @@ function readVarint(bytes: Uint8Array, offset: number): [number, number] | null 
     }
   }
   return null;
+}
+
+/**
+ * `writeSync` may write FEWER bytes than requested (a signal, a full disk that
+ * partially succeeds). A short write here leaves a torn §13 batch on disk while
+ * the caller goes on to apply every op in memory — disk and memory then
+ * disagree until the next hydrate truncates the tail. Loop until the buffer is
+ * fully written, or throw.
+ */
+function writeFully(fd: number, buf: Uint8Array): void {
+  let written = 0;
+  while (written < buf.length) {
+    const n = writeSync(fd, buf, written, buf.length - written);
+    if (n <= 0) {
+      throw new Error(
+        `short write on CRDT segment: wrote ${written} of ${buf.length} bytes`,
+      );
+    }
+    written += n;
+  }
 }
 
 function truncateAndWarn(path: string, goodEnd: number, fileLen: number): void {
