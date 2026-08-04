@@ -461,15 +461,15 @@ mod tests {
         std::fs::write(root.join(".gitignore"), b"out/\ncoverage/\n").expect("write gitignore");
 
         for out_of_scope in [
-            "vendor/dep/v.ts",       // dependency source
-            "third_party/tp.go",     // dependency source
-            "examples/demo.ts",      // fixture-like
-            "benchmark/b.ts",        // fixture-like
+            "vendor/dep/v.ts",          // dependency source
+            "third_party/tp.go",        // dependency source
+            "examples/demo.ts",         // fixture-like
+            "benchmark/b.ts",           // fixture-like
             "pkg/test/fixtures/a/x.ts", // test fixture app
-            "out/bundle.js",         // gitignored build output
-            "coverage/lcov.js",      // gitignored build output
-            ".output/server.js",     // hidden build output
-            "node_modules/pkg/i.js", // already on the hard list
+            "out/bundle.js",            // gitignored build output
+            "coverage/lcov.js",         // gitignored build output
+            ".output/server.js",        // hidden build output
+            "node_modules/pkg/i.js",    // already on the hard list
         ] {
             assert!(
                 translate(&modify_event(&root.join(out_of_scope)), &scope).is_none(),
@@ -499,7 +499,9 @@ mod tests {
         ev.paths.push(root.join("src/tmp.ts"));
         ev.paths.push(root.join("out/tmp.ts"));
         match translate(&ev, &scope) {
-            Some(WatchRecord::Change { file, kind, from, .. }) => {
+            Some(WatchRecord::Change {
+                file, kind, from, ..
+            }) => {
                 assert_eq!(kind, "delete", "moving out of scope is a deletion");
                 assert_eq!(file, "src/tmp.ts", "the SOURCE is what disappeared");
                 assert!(from.is_none());
@@ -520,10 +522,15 @@ mod tests {
         ev.paths.push(PathBuf::from("/tmp/elsewhere/new.ts"));
         ev.paths.push(root.join("src/new.ts"));
         match translate(&ev, &scope) {
-            Some(WatchRecord::Change { file, kind, from, .. }) => {
+            Some(WatchRecord::Change {
+                file, kind, from, ..
+            }) => {
                 assert_eq!(kind, "rename");
                 assert_eq!(file, "src/new.ts");
-                assert!(from.is_none(), "an out-of-repo source has nothing to delete");
+                assert!(
+                    from.is_none(),
+                    "an out-of-repo source has nothing to delete"
+                );
             }
             other => panic!("expected a rename record, got {other:?}"),
         }

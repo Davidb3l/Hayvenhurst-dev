@@ -183,8 +183,8 @@ impl ScopeFilter {
         }
 
         match self.ignore_verdict(path, is_dir) {
-            Some(true) => false,       // ignored
-            Some(false) => true,       // explicitly whitelisted — beats hidden
+            Some(true) => false, // ignored
+            Some(false) => true, // explicitly whitelisted — beats hidden
             None => !comps.iter().any(is_hidden_component),
         }
     }
@@ -366,8 +366,14 @@ mod tests {
         assert!(!sf.accepts(&f("vendor/dep/v.ts"), false), "vendor/");
         assert!(!sf.accepts(&f("examples/demo.ts"), false), "examples/");
         assert!(!sf.accepts(&f("out/bundle.js"), false), "gitignored out/");
-        assert!(!sf.accepts(&f("coverage/c.js"), false), "gitignored coverage/");
-        assert!(!sf.accepts(&f(".svelte-kit/gen.js"), false), "hidden build dir");
+        assert!(
+            !sf.accepts(&f("coverage/c.js"), false),
+            "gitignored coverage/"
+        );
+        assert!(
+            !sf.accepts(&f(".svelte-kit/gen.js"), false),
+            "hidden build dir"
+        );
         assert!(
             !sf.accepts(&f("pkg/test/fixtures/app/x.ts"), false),
             "test fixture app"
@@ -389,7 +395,10 @@ mod tests {
         std::fs::write(root.join("src/keep/.gitignore"), b"!*.gen.ts\n").expect("write nested");
 
         let sf = ScopeFilter::new(&root, &opts());
-        assert!(!sf.accepts(&root.join("src/a.gen.ts"), false), "root rule ignores");
+        assert!(
+            !sf.accepts(&root.join("src/a.gen.ts"), false),
+            "root rule ignores"
+        );
         assert!(
             sf.accepts(&root.join("src/keep/a.gen.ts"), false),
             "nested negation re-includes"
@@ -415,7 +424,10 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
         std::fs::write(root.join(".gitignore"), b"build_out/\n\n").expect("touch gitignore");
 
-        assert!(!sf.accepts(&target, false), "gitignore edit must take effect");
+        assert!(
+            !sf.accepts(&target, false),
+            "gitignore edit must take effect"
+        );
     }
 
     /// Opt-ins reach the shared filter, so `--include-vendored` /
@@ -474,7 +486,10 @@ mod tests {
         std::fs::create_dir_all(root.join(".hidden")).expect("mkdir");
 
         let sf = ScopeFilter::new(&root, &opts());
-        assert!(sf.accepts(&root.join(".env.ts"), false), "whitelisted dotfile");
+        assert!(
+            sf.accepts(&root.join(".env.ts"), false),
+            "whitelisted dotfile"
+        );
         assert!(
             sf.accepts(&root.join(".hidden/h.ts"), false),
             "file under a whitelisted hidden dir"
