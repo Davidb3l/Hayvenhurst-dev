@@ -248,6 +248,23 @@ describe("E4: every served project gets a pidfile", () => {
     for (let i = 0; i < 150 && !existsSync(secondaryPid); i++) await sleep(100);
     expect(existsSync(secondaryPid)).toBe(true);
 
+    // Wait until the daemon ANSWERS before signalling it. The pidfiles are
+    // written during startup, before the SIGTERM handler is installed — a
+    // SIGTERM landing in that window takes the process down with the default
+    // disposition and no cleanup ever runs (observed once on a loaded CI
+    // runner). A served /api/health proves startup completed.
+    for (let i = 0; i < 150; i++) {
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/api/health`, {
+          signal: AbortSignal.timeout(500),
+        });
+        if (res.ok) break;
+      } catch {
+        // not up yet
+      }
+      await sleep(100);
+    }
+
     child.kill("SIGTERM");
     await child.exited;
     child = null;

@@ -296,7 +296,9 @@ describe("gitDiffSince (real git repo)", () => {
     expect(diff).not.toBeNull();
     expect(diff!.changed.sort()).toEqual(["keep.ts", "new.ts", "stable.ts"]);
     expect(diff!.deleted).toEqual(["gone.ts"]);
-  });
+    // ~10 real git subprocesses; the default 5s timeout flakes on a loaded CI
+    // runner (observed 5.8s there vs <1s locally).
+  }, 30_000);
 
   test("returns null on a bad ref / non-repo", () => {
     expect(gitDiffSince(tmp(), "deadbeef")).toBeNull();

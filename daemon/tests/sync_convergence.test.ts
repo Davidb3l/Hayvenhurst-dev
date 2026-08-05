@@ -147,7 +147,9 @@ maybeDescribe("sync convergence (cross-day, bidirectional)", () => {
     const rb = computeMerkle(b.crdt.oplog).roots;
     expect(ra.gset).toBe(rb.gset);
     expect(ra).toEqual(rb);
-  });
+    // Two full replicas + a bidirectional exchange; the default 5s timeout
+    // flakes on a loaded CI runner (observed 7.3s there vs <1s locally).
+  }, 30_000);
 
   test("a second sync after convergence is a no-op (roots already equal)", async () => {
     const a = makeReplica();
