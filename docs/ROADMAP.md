@@ -16,11 +16,12 @@ Today `hayven sync <peer_url>` is a manual, one-shot, outbound exchange. It
 works for the demo case: one person, on a trusted network, remembering to run
 it. Everything past that is unbuilt, and the gaps compound.
 
-**Current state, precisely.** The responding daemon never learns who called, so
-it cannot answer "who am I synced with?". `config.sync_peers` is declared and
-validated and read by nothing. Nothing runs on a schedule. And the daemon has
-no authentication at all — it refuses to bind a non-loopback address for
-exactly that reason, and its own error text says to put it behind something
+**Current state, precisely.** Stage 1 shipped, so a daemon now records who it
+exchanged with and `hayven crdt peers` answers "who am I synced with?" — but
+those identities are self-asserted and unverified. `config.sync_peers` is
+declared and validated and read by nothing. Nothing runs on a schedule. And the
+daemon has no authentication at all — it refuses to bind a non-loopback address
+for exactly that reason, and its own error text says to put it behind something
 that authenticates.
 
 ### Stage 1 — peer identity *(shipped)*
@@ -96,30 +97,28 @@ goes wrong.
 
 ## Engineering debt (committed, sequenced)
 
-### Deduplicate the hand-synced rule copies
+### Deduplicate the hand-synced rule copies *(shipped)*
 
-Three rules exist in more than one place and are kept aligned by hand: the
-edge-resolution index rules (`EdgeResolver` and the incremental re-resolution
-pass), the context-pack assembly closure (duplicated ~140 lines across the
-two pack builders), and the "is this a test file" predicate (two disagreeing
-definitions between the packer and FTS scoring). Every past quiet bug in this
-codebase came from two correct pieces of code disagreeing about a rule; these
-are the three standing opportunities for the next one.
+Three rules lived in more than one place and were kept aligned by hand: the
+edge-resolution index rules, the context-pack assembly closure, and the "is this
+a test file" predicate. The last turned out to have FOUR definitions, one of
+them carrying a comment that falsely claimed to mirror another.
 
-**What it unlocks:** a rule change lands in one place with one test.
-**Entry condition:** none — this can start any time and should precede new
-feature work in the affected files.
+Each is now single-sourced. The test-file predicate generates both a TypeScript
+predicate and a SQL fragment from one glob list, so the two mechanisms cannot
+drift again; the affected-tests selector stays deliberately separate because it
+answers a different, user-configurable question, and now says so.
 
-### Decompose `ingest.ts` and `context_pack.ts` along their comment seams
+### Decompose `ingest.ts` and `context_pack.ts` along their comment seams *(shipped)*
 
-Both files are past the point where narrative comments substitute for module
-boundaries (1,600 and 1,800 lines). The section headers already name the
-seams; the work is carving, not designing, with the full suite green after
-each carve.
+Carved into seven modules, with the path-containment security gate isolated as
+`db/pack_containment.ts`. Both originals became re-export barrels, so no
+consumer needed an edit, and a pre-existing import cycle between
+`context_pack.ts` and `imported_symbol.ts` fell out as a two-line fix.
 
-**What it unlocks:** cheaper review, and smaller blast radius per change.
-**Entry condition:** the deduplication above lands first, so the carve moves
-one copy of each rule, not two.
+`drainIntoIndex` (~660 lines) and the pack builders (~730) were moved intact.
+Splitting either requires deciding where shared assembly logic belongs, which is
+a design change; that is the next candidate here, not a leftover from this one.
 
 ### Decompose the native parser (`extract.rs`)
 
