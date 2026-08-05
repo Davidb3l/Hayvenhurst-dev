@@ -44,8 +44,12 @@ import { isAbsolute, join } from "node:path";
 import { isTestFile } from "../util/test_files.ts";
 import { IMPORT_KIND } from "./graph_walk.ts";
 import type { Db, NodeRow } from "./queries.ts";
-import { resolveWithinRepo } from "./context_pack.ts";
-import type { ContextSlice } from "./context_pack.ts";
+// Imported from the leaf modules rather than from `context_pack.ts` itself:
+// `context_pack.ts` imports `collectImportedSymbols` from THIS file, so going
+// back through it formed an import cycle. Neither `pack_containment.ts` nor
+// `pack_types.ts` imports anything under `db/`, so this direction is acyclic.
+import { resolveWithinRepo } from "./pack_containment.ts";
+import type { ContextSlice } from "./pack_types.ts";
 
 export interface ImportedSymbolOptions {
   /** Cap how many imported-symbol slices to add (default 5). */
