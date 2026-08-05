@@ -70,7 +70,19 @@ export interface TestHandle {
  * repo-relative path (forward-slash normalized). Config `test.patterns`
  * REPLACES this list when provided.
  *
- * These are the conventions across the five languages Hayven parses: directory
+ * DELIBERATELY SEPARATE from `util/test_files.ts`, which is the one source of
+ * truth for the packer's and search's "is this scaffolding?" question. These
+ * answer different questions and must be free to disagree:
+ *   - `util/test_files.ts` asks "should this file be demoted or filtered as
+ *     scaffolding?". Fixed patterns, because a user narrowing what their test
+ *     runner executes should not silently change how context packs are built.
+ *   - this list asks "can the test runner RUN this file?", which is a property
+ *     of the project's runner config, hence user-overridable via `test.patterns`
+ *     and hence backslash-normalized for Windows-authored paths.
+ * Keep them in sync in SPIRIT (a convention added to one is usually worth
+ * adding to the other) but do not merge them.
+ *
+ * These are the conventions across the languages Hayven parses: directory
  * markers (`/tests/`, `__tests__/`), filename prefixes (`test_foo.py`), and
  * filename infixes/suffixes (`foo.test.ts`, `foo_test.go`, `foo.spec.ts`). The
  * leading `test/` / `tests/` (handled separately in {@link isTestFile}) catches

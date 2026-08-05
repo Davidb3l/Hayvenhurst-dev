@@ -41,6 +41,7 @@
 import { readFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 
+import { isTestFile } from "../util/test_files.ts";
 import { IMPORT_KIND } from "./graph_walk.ts";
 import type { Db, NodeRow } from "./queries.ts";
 import { resolveWithinRepo } from "./context_pack.ts";
@@ -103,15 +104,6 @@ function makeFileReader(repoRoot: string) {
   };
 }
 
-/** Whether a file is a test/spec file — mirrors context_pack.isTestFile. Source
- *  never legitimately imports a symbol FROM a test, so a candidate file that is
- *  a test is noise; skip it. */
-function isTestFile(file: string | null): boolean {
-  return (
-    !!file && (/\.(test|spec)\.[cm]?[tj]sx?$/.test(file) || /(^|\/)__tests__\//.test(file))
-  );
-}
-
 /**
  * The SET of source files imported BY `target.file`, derived from the graph
  * (import-kind edges out of the file's module node), NOT from regex.
@@ -136,6 +128,11 @@ function importedFilesOf(db: Db, target: NodeRow): string[] {
     const imp = db.getNode(e.dst);
     if (!imp?.file) continue;
     if (imp.file === target.file) continue;
+    // Source never legitimately imports a symbol FROM a test, so a candidate
+    // that is a test is noise. This is the SAME predicate the packer's other
+    // passes use (`util/test_files.ts`); it used to be a fourth hand-written
+    // copy here, narrower than the rest, so a Go/Python/Rust test file that
+    // sections 3 to 5 correctly rejected was still walked into by this one.
     if (isTestFile(imp.file)) continue;
     files.add(imp.file);
   }

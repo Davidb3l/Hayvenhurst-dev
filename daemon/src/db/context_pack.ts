@@ -30,6 +30,12 @@ import { readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, resolve, sep } from "node:path";
 
 import { isPathExcludedByWalker } from "../native/ignore.ts";
+// The test-file predicate is SHARED with the fts scaffold-ranking penalty (both
+// are generated from one pattern list) so the packer's neighbor filter and
+// search ranking can no longer disagree about what a test file is. It covers
+// all six indexed languages; the JS/TS-only regex that used to live here let
+// Python/Go/Rust tests through as if they were real source.
+import { isTestFile } from "../util/test_files.ts";
 import { IMPORT_KIND, isCallKind, resolveNodeId } from "./graph_walk.ts";
 import { collectImportedSymbols } from "./imported_symbol.ts";
 import type { Db, NodeRow } from "./queries.ts";
@@ -817,15 +823,6 @@ function overlapsTarget(n: NodeRow, target: NodeRow): boolean {
   );
 }
 
-/** Whether a file is a test/spec file. Source never legitimately *depends on* a
- *  test, so a call edge resolving into one is noise (an ambiguous-name
- *  mis-resolution) — we exclude such neighbors when the target is real source. */
-function isTestFile(file: string | null): boolean {
-  return (
-    !!file && (/\.(test|spec)\.[cm]?[tj]sx?$/.test(file) || /(^|\/)__tests__\//.test(file))
-  );
-}
-
 /** True when `name` appears as a whole identifier in `text` (so `Foo` does not
  *  match `Foobar`/`barFoo`). Identifier-boundary lookaround rather than `\b` so
  *  `$`-containing identifiers behave; `name` is regex-escaped defensively. */
@@ -833,6 +830,225 @@ function referencesName(text: string, name: string): boolean {
   if (!name) return false;
   const esc = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp(`(?<![\\w$])${esc}(?![\\w$])`).test(text);
+}
+
+/**
+ * The state the two NEIGHBOR passes (§3 callees, §4 referenced entities) share.
+ *
+ * Both {@link buildContextPack} (one target) and {@link buildContextPackForSymbols}
+ * (N roots) run the identical passes; they used to be two near-verbatim copies,
+ * so a fix to one had to be mirrored by hand into the other. Every guard is
+ * written against the ROOT SET, which degenerates exactly to the single-target
+ * behavior at length 1 — that is what makes one implementation serve both.
+ *
+ * `slices`, `notes` and `addedIds` are MUTATED by the passes; the caller owns
+ * them and reads them back after.
+ */
+interface NeighborPassState {
+  db: Db;
+  read: (file: string) => string[] | null;
+  slices: ContextSlice[];
+  notes: string[];
+  /** The pack's target(s), in emission order. */
+  roots: NodeRow[];
+  /** Ids of `roots`, for the "an edge pointing back at a root is not a
+   *  neighbor" guard. */
+  rootIds: ReadonlySet<string>;
+  /** Every id already emitted as a slice (roots + whatever the passes add).
+   *  Header slices have `id:null` and never appear here. */
+  addedIds: Set<string>;
+  maxNeighbors: number;
+}
+
+/** Whether ANY root is itself a test file. When one is, test neighbors are
+ *  legitimate (a test really does depend on other test helpers) and the
+ *  mis-resolution filter must not fire. */
+function anyRootIsTest(st: NeighborPassState): boolean {
+  return st.roots.some((r) => isTestFile(r.file));
+}
+
+/** Whether `n` overlaps ANY root's line range in that root's file — i.e. its
+ *  text is already inside a target slice. */
+function overlapsAnyRoot(st: NeighborPassState, n: NodeRow): boolean {
+  return st.roots.some((r) => overlapsTarget(n, r));
+}
+
+/**
+ * §3 NEIGHBORS — 1-hop callee dependencies (outgoing call edges) across ALL
+ * roots, weight-summed, ranked weight-desc then id-asc, deduped, sharing ONE
+ * `maxNeighbors` cap. A callee in another file arrives as its own line-exact
+ * body — the cross-file slice.
+ *
+ * `omitReasonSuffix` is the only genuine difference between the two entry
+ * points: the single-target pack's omission note reads "unresolved/module" and
+ * the multi-root one reads "unresolved/module/dup". Passing it keeps both packs
+ * byte-identical to their pre-extraction output rather than flattening one note
+ * into the other.
+ *
+ * Import edges are deliberately NOT inlined here: the header already carries the
+ * import statements textually, so inlining the imported module's body would
+ * defeat the slicing.
+ */
+function addCalleeNeighbors(st: NeighborPassState, omitReasonSuffix: string): void {
+  const rootIsTest = anyRootIsTest(st);
+  const byCallee = new Map<string, number>();
+  for (const root of st.roots) {
+    for (const e of st.db.outgoing(root.id)) {
+      if (!isCallKind(e.kind) || st.rootIds.has(e.dst)) continue;
+      byCallee.set(e.dst, (byCallee.get(e.dst) ?? 0) + e.weight);
+    }
+  }
+  const ranked = [...byCallee.entries()].sort(
+    (a, b) => b[1] - a[1] || a[0].localeCompare(b[0]),
+  );
+  let added = 0;
+  for (const [calleeId, weight] of ranked) {
+    if (added >= st.maxNeighbors) break;
+    if (st.addedIds.has(calleeId)) continue;
+    const callee = st.db.getNode(calleeId);
+    // Skip danglers (edge to an unresolved id), whole-file modules, and call
+    // edges that mis-resolved into a test file (not a real dependency).
+    if (!callee || isModuleNode(callee)) continue;
+    if (isTestFile(callee.file) && !rootIsTest) continue;
+    if (overlapsAnyRoot(st, callee)) continue; // nested in a root → already shown
+    const slice = sliceNode(callee, "neighbor", st.read);
+    if (!slice) continue;
+    slice.via = "call";
+    slice.weight = weight;
+    st.slices.push(slice);
+    st.addedIds.add(calleeId);
+    added++;
+  }
+  if (ranked.length > added) {
+    st.notes.push(
+      `${ranked.length - added} more callee(s) omitted (cap ${st.maxNeighbors}, or ${omitReasonSuffix})`,
+    );
+  }
+}
+
+/**
+ * §4 REFERENCED ENTITIES — indexed type-like entities NAMED in a root body but
+ * not already included as callees.
+ *
+ * Types aren't call edges and the header skeleton subtracts entity bodies, so a
+ * target whose signature uses a type (a same-file `ServeStaticOptions` OR an
+ * imported `MiddlewareHandler`) would otherwise lack its definition. Same-file
+ * refs run first (over `rootFiles`, in the caller's order), then cross-file refs
+ * resolved via each root file's module-import edges. Refs get their OWN
+ * `maxNeighbors` budget, separate from the callee pass's.
+ */
+function addRefNeighbors(
+  st: NeighborPassState,
+  opts: {
+    /** The text searched for referenced names: the target body, or the
+     *  concatenation of all root bodies in the multi-root case. */
+    rootText: string;
+    /** Root files in same-file-scan order. Also the exclusion set for the
+     *  cross-file scan (a "cross-file" ref must not be in a root file). */
+    rootFiles: string[];
+    maxRefSliceLines: number;
+  },
+): void {
+  const { rootText, rootFiles, maxRefSliceLines } = opts;
+  const rootIsTest = anyRootIsTest(st);
+  const rootFileSet = new Set(rootFiles);
+  let refAdded = 0;
+
+  /** Try to add one entity row as a `via:"ref"` neighbor; returns true if added. */
+  const tryAddRef = (r: { id: string; name: string; kind: string }): boolean => {
+    if (st.rootIds.has(r.id) || r.kind === "module") return false;
+    // ONLY type-like entities (classes/interfaces/structs/enums/type-aliases —
+    // all `kind:"class"` in this schema) are valid refs. The ref pass exists to
+    // surface a TYPE named in a root's signature/body whose definition is
+    // neither a callee nor an import-statement line. Admitting `method`/
+    // `function` entities here matched any same-file symbol that merely SHARES
+    // a common name with the target (e.g. nine sibling `convert` methods for a
+    // target also named `convert`, or `from`/`is`/`drop` in Rust) — pure noise,
+    // since real calls already arrive via the callee pass. (Measured: this
+    // dropped 8–10 junk ref slices per pack on click/anyhow.)
+    if (!isTypeLikeKind(r.kind)) return false;
+    if (st.addedIds.has(r.id)) return false;
+    if (!referencesName(rootText, r.name)) return false;
+    const node = st.db.getNode(r.id);
+    if (!node) return false;
+    if (overlapsAnyRoot(st, node)) return false; // nested in a root → already shown
+    if (isTestFile(node.file) && !rootIsTest) return false;
+    // Skip huge entities (a big class used only as a type) — they'd dominate
+    // the pack; the header's import line already names them.
+    if (node.range_end - node.range_start + 1 > MAX_REF_LINES) return false;
+    const slice = sliceNode(node, "neighbor", st.read);
+    if (!slice) return false;
+    slice.via = "ref";
+    // Leaner ref slices: a referenced type contributes its declaration +
+    // opening shape (interface fields / member signatures), not deep method
+    // bodies. Cap to the FIRST N lines of the entity, LINE-EXACT — the slice
+    // text stays the real file lines [startLine .. startLine+N-1]; the
+    // truncation is recorded in notes + on the slice, never inside text.
+    // (Never applies to callee/target slices; composes with the MAX_REF_LINES
+    // skip-entirely gate above — only refs that ARE included are capped.)
+    const fullEnd = slice.endLine;
+    const sliceLen = slice.endLine - slice.startLine + 1;
+    if (sliceLen > maxRefSliceLines) {
+      const newEnd = slice.startLine + maxRefSliceLines - 1;
+      const lines = st.read(node.file ?? "");
+      if (lines) {
+        slice.endLine = newEnd;
+        slice.text = lines.slice(slice.startLine - 1, newEnd).join("\n");
+        slice.truncatedFromEndLine = fullEnd;
+        st.notes.push(
+          `ref \`${r.id}\` truncated to first ${maxRefSliceLines} of ${sliceLen} lines`,
+        );
+      }
+    }
+    st.slices.push(slice);
+    st.addedIds.add(r.id);
+    refAdded++;
+    return true;
+  };
+
+  const entitiesIn = (file: string) =>
+    st.db.handle
+      .query<{ id: string; name: string; kind: string }, [string]>(
+        "SELECT id, name, kind FROM nodes WHERE file = ?",
+      )
+      .all(file)
+      .sort((a, b) => a.id.localeCompare(b.id));
+
+  // 4a. Same-file referenced entities.
+  for (const file of rootFiles) {
+    if (refAdded >= st.maxNeighbors) break;
+    for (const r of entitiesIn(file)) {
+      if (refAdded >= st.maxNeighbors) break;
+      tryAddRef(r);
+    }
+  }
+
+  // 4b. Cross-file referenced entities: resolve each root file's module node,
+  //     follow its import edges to imported module files, and inline any entity
+  //     therein named in a root body (e.g. an imported type used in the
+  //     signature). Each imported entity comes in as its own line-exact body.
+  if (refAdded >= st.maxNeighbors) return;
+  const importedFiles = new Set<string>();
+  for (const file of rootFiles) {
+    const moduleNode = st.db.handle
+      .query<{ id: string }, [string]>(
+        "SELECT id FROM nodes WHERE file = ? AND kind = 'module' LIMIT 1",
+      )
+      .get(file);
+    if (!moduleNode) continue;
+    for (const e of st.db.outgoing(moduleNode.id)) {
+      if (e.kind !== IMPORT_KIND) continue;
+      const imp = st.db.getNode(e.dst);
+      if (imp?.file && !rootFileSet.has(imp.file)) importedFiles.add(imp.file);
+    }
+  }
+  for (const f of [...importedFiles].sort()) {
+    if (refAdded >= st.maxNeighbors) break;
+    for (const r of entitiesIn(f)) {
+      if (refAdded >= st.maxNeighbors) break;
+      tryAddRef(r);
+    }
+  }
 }
 
 /**
@@ -898,148 +1114,30 @@ export function buildContextPack(
   if (targetSlice) slices.push(targetSlice);
   else notes.push(`could not slice target body for \`${target.id}\``);
 
-  // 3. NEIGHBORS — 1-hop callee dependencies (outgoing call edges), highest
-  //    call-weight first, deduped, modules excluded. A callee in another file
-  //    arrives as its own line-exact body — the cross-file slice.
+  // 3 + 4. NEIGHBOR PASSES — callee dependencies then referenced type-like
+  //    entities. Both are the SHARED implementation (see {@link NeighborPassState}),
+  //    run here over a single-element root set. The omission-note suffix is the
+  //    one output difference from the multi-root entry point and is passed
+  //    explicitly rather than flattened.
+  const passState: NeighborPassState = {
+    db,
+    read,
+    slices,
+    notes,
+    roots: [target],
+    rootIds: new Set([target.id]),
+    addedIds: new Set([target.id]),
+    maxNeighbors,
+  };
   if (includeNeighbors && maxNeighbors > 0) {
-    const byCallee = new Map<string, number>();
-    for (const e of db.outgoing(target.id)) {
-      if (!isCallKind(e.kind) || e.dst === target.id) continue;
-      byCallee.set(e.dst, (byCallee.get(e.dst) ?? 0) + e.weight);
-    }
-    const ranked = [...byCallee.entries()].sort(
-      (a, b) => b[1] - a[1] || a[0].localeCompare(b[0]),
-    );
-    let added = 0;
-    for (const [calleeId, weight] of ranked) {
-      if (added >= maxNeighbors) break;
-      const callee = db.getNode(calleeId);
-      // Skip danglers (edge to an unresolved id), whole-file modules, and
-      // call edges that mis-resolved into a test file (not a real dependency).
-      if (!callee || isModuleNode(callee)) continue;
-      if (isTestFile(callee.file) && !isTestFile(target.file)) continue;
-      if (overlapsTarget(callee, target)) continue; // nested in target → already shown
-      const slice = sliceNode(callee, "neighbor", read);
-      if (!slice) continue;
-      slice.via = "call";
-      slice.weight = weight;
-      slices.push(slice);
-      added++;
-    }
-    if (ranked.length > added) {
-      notes.push(
-        `${ranked.length - added} more callee(s) omitted (cap ${maxNeighbors}, or unresolved/module)`,
-      );
-    }
-    // Note import edges deliberately: the header already carries the import
-    // statements textually, so we don't inline imported modules' bodies.
-    void IMPORT_KIND;
+    addCalleeNeighbors(passState, "unresolved/module");
   }
-
-  // 4. REFERENCED ENTITIES — indexed entities (types/interfaces/classes/
-  //    functions) NAMED in the target body but not already included as callees.
-  //    Types aren't call edges and the skeleton subtracts entity bodies, so a
-  //    target whose signature uses a type (a same-file `ServeStaticOptions` OR
-  //    an imported `MiddlewareHandler`) would otherwise lack its definition.
-  //    Same-file refs run first, then cross-file (resolved via the file's
-  //    module-import edges → imported module files). Shared `maxNeighbors` cap.
   if (includeNeighbors && maxNeighbors > 0 && target.file) {
-    const addedIds = new Set(
-      slices.map((s) => s.id).filter((x): x is string => x !== null),
-    );
-    const targetText = targetSlice?.text ?? "";
-    let refAdded = 0;
-    /** Try to add one entity row as a `via:"ref"` neighbor; returns true if added. */
-    const tryAddRef = (r: { id: string; name: string; kind: string }): boolean => {
-      if (r.id === target.id || r.kind === "module") return false;
-      // ONLY type-like entities (classes/interfaces/structs/enums/type-aliases —
-      // all `kind:"class"` in this schema) are valid refs. The ref pass exists to
-      // surface a TYPE named in the target's signature/body whose definition is
-      // neither a callee nor an import-statement line. Admitting `method`/
-      // `function` entities here matched any same-file symbol that merely SHARES
-      // a common name with the target (e.g. nine sibling `convert` methods for a
-      // target also named `convert`, or `from`/`is`/`drop` in Rust) — pure noise,
-      // since real calls already arrive via the callee pass. (Measured: this
-      // dropped 8–10 junk ref slices per pack on click/anyhow.)
-      if (!isTypeLikeKind(r.kind)) return false;
-      if (addedIds.has(r.id)) return false;
-      if (!referencesName(targetText, r.name)) return false;
-      const node = db.getNode(r.id);
-      if (!node) return false;
-      if (overlapsTarget(node, target)) return false; // nested in target → already shown
-      if (isTestFile(node.file) && !isTestFile(target.file)) return false;
-      // Skip huge entities (a big class used only as a type) — they'd dominate
-      // the pack; the header's import line already names them.
-      if (node.range_end - node.range_start + 1 > MAX_REF_LINES) return false;
-      const slice = sliceNode(node, "neighbor", read);
-      if (!slice) return false;
-      slice.via = "ref";
-      // Leaner ref slices: a referenced type contributes its declaration +
-      // opening shape (interface fields / member signatures), not deep method
-      // bodies. Cap to the FIRST N lines of the entity, LINE-EXACT — the slice
-      // text stays the real file lines [startLine .. startLine+N-1]; the
-      // truncation is recorded in notes + on the slice, never inside text.
-      // (Never applies to callee/target slices; composes with the MAX_REF_LINES
-      // skip-entirely gate above — only refs that ARE included are capped.)
-      const fullEnd = slice.endLine;
-      const sliceLen = slice.endLine - slice.startLine + 1;
-      if (sliceLen > maxRefSliceLines) {
-        const newEnd = slice.startLine + maxRefSliceLines - 1;
-        const lines = read(node.file ?? "");
-        if (lines) {
-          slice.endLine = newEnd;
-          slice.text = lines.slice(slice.startLine - 1, newEnd).join("\n");
-          slice.truncatedFromEndLine = fullEnd;
-          notes.push(
-            `ref \`${r.id}\` truncated to first ${maxRefSliceLines} of ${sliceLen} lines`,
-          );
-        }
-      }
-      slices.push(slice);
-      addedIds.add(r.id);
-      refAdded++;
-      return true;
-    };
-    const entitiesIn = (file: string) =>
-      db.handle
-        .query<{ id: string; name: string; kind: string }, [string]>(
-          "SELECT id, name, kind FROM nodes WHERE file = ?",
-        )
-        .all(file)
-        .sort((a, b) => a.id.localeCompare(b.id));
-
-    // 4a. Same-file referenced entities.
-    for (const r of entitiesIn(target.file)) {
-      if (refAdded >= maxNeighbors) break;
-      tryAddRef(r);
-    }
-
-    // 4b. Cross-file referenced entities: resolve the target file's module node,
-    //     follow its import edges to imported module files, and inline any entity
-    //     therein named in the target body (e.g. an imported type used in the
-    //     signature). Each imported entity comes in as its own line-exact body.
-    if (refAdded < maxNeighbors) {
-      const moduleNode = db.handle
-        .query<{ id: string }, [string]>(
-          "SELECT id FROM nodes WHERE file = ? AND kind = 'module' LIMIT 1",
-        )
-        .get(target.file);
-      if (moduleNode) {
-        const importedFiles = new Set<string>();
-        for (const e of db.outgoing(moduleNode.id)) {
-          if (e.kind !== IMPORT_KIND) continue;
-          const imp = db.getNode(e.dst);
-          if (imp?.file && imp.file !== target.file) importedFiles.add(imp.file);
-        }
-        for (const f of [...importedFiles].sort()) {
-          if (refAdded >= maxNeighbors) break;
-          for (const r of entitiesIn(f)) {
-            if (refAdded >= maxNeighbors) break;
-            tryAddRef(r);
-          }
-        }
-      }
-    }
+    addRefNeighbors(passState, {
+      rootText: targetSlice?.text ?? "",
+      rootFiles: [target.file],
+      maxRefSliceLines,
+    });
   }
 
   // 5. CALLERS — OPT-IN 1-hop INCOMING-caller neighbors (default OFF). Mirrors
@@ -1072,6 +1170,15 @@ export function buildContextPack(
       // id), whole-file modules, call edges from a test file (not a real
       // dependency when the target is real source), and any caller already in
       // the slice set (dedupe by id against everything added so far).
+      //
+      // The test guard reads DIFFERENTLY on this pass and is deliberately kept:
+      // real source genuinely IS called by its tests, so dropping test callers
+      // can leave the opt-in caller hop empty for a well-tested symbol. It is
+      // retained anyway because the pass exists to recover behavior SUPPLIED BY
+      // a caller (a lambda handed to a higher-order function), and a test's
+      // stub argument is exactly the wrong thing to hand the model as if it
+      // were production behavior. Widening `isTestFile` to Python/Go/Rust makes
+      // this filter fire in repos where it previously never did.
       if (!caller || isModuleNode(caller)) continue;
       if (isTestFile(caller.file) && !isTestFile(target.file)) continue;
       if (overlapsTarget(caller, target)) continue; // straddles target → already shown
@@ -1357,128 +1464,29 @@ export function buildContextPackForSymbols(
     }
   }
 
-  // Dedupe set: every id already a slice (roots), plus an (file,range) overlap
-  // test so a callee that IS a root (or nested in one) is not re-added.
-  const addedIds = new Set<string>(rootIds);
-  const overlapsAnyRoot = (n: NodeRow): boolean =>
-    roots.some((r) => overlapsTarget(n, r));
-
+  // 3 + 4. NEIGHBOR PASSES — the SAME shared implementation the single-target
+  //    entry point uses, run over the full root set. Dedupe set starts at every
+  //    id already a slice (the roots); the (file,range) overlap test inside the
+  //    passes keeps a callee that IS a root (or nested in one) from re-entering.
   if (includeNeighbors && maxNeighbors > 0) {
-    // 3. NEIGHBORS — 1-hop callee deps across ALL roots, weight-summed, ranked
-    //    weight-desc then id-asc, ONE shared cap.
-    const byCallee = new Map<string, number>();
-    for (const root of roots) {
-      for (const e of db.outgoing(root.id)) {
-        if (!isCallKind(e.kind) || rootIds.has(e.dst)) continue;
-        byCallee.set(e.dst, (byCallee.get(e.dst) ?? 0) + e.weight);
-      }
-    }
-    const ranked = [...byCallee.entries()].sort(
-      (a, b) => b[1] - a[1] || a[0].localeCompare(b[0]),
-    );
-    let added = 0;
-    for (const [calleeId, weight] of ranked) {
-      if (added >= maxNeighbors) break;
-      if (addedIds.has(calleeId)) continue;
-      const callee = db.getNode(calleeId);
-      if (!callee || isModuleNode(callee)) continue;
-      if (isTestFile(callee.file) && !roots.some((r) => isTestFile(r.file))) continue;
-      if (overlapsAnyRoot(callee)) continue; // nested in/overlapping a root → already shown
-      const slice = sliceNode(callee, "neighbor", read);
-      if (!slice) continue;
-      slice.via = "call";
-      slice.weight = weight;
-      slices.push(slice);
-      addedIds.add(calleeId);
-      added++;
-    }
-    if (ranked.length > added) {
-      notes.push(
-        `${ranked.length - added} more callee(s) omitted (cap ${maxNeighbors}, or unresolved/module/dup)`,
-      );
-    }
-
-    // 4. REFERENCED ENTITIES — type-like entities named in ANY root body but not
-    //    already included. Same-file then cross-file; shared cap with callees is
-    //    NOT applied (mirrors buildContextPack, which gives refs their own
-    //    maxNeighbors budget). Dedupe across roots via addedIds.
-    const combinedTargetText = roots
-      .map((r) => targetSlices.get(r.id)?.text ?? "")
-      .join("\n");
-    let refAdded = 0;
-    const tryAddRef = (r: { id: string; name: string; kind: string }): boolean => {
-      if (rootIds.has(r.id) || r.kind === "module") return false;
-      if (!isTypeLikeKind(r.kind)) return false;
-      if (addedIds.has(r.id)) return false;
-      if (!referencesName(combinedTargetText, r.name)) return false;
-      const node = db.getNode(r.id);
-      if (!node) return false;
-      if (overlapsAnyRoot(node)) return false;
-      if (isTestFile(node.file) && !roots.some((rr) => isTestFile(rr.file))) return false;
-      if (node.range_end - node.range_start + 1 > MAX_REF_LINES) return false;
-      const slice = sliceNode(node, "neighbor", read);
-      if (!slice) return false;
-      slice.via = "ref";
-      const fullEnd = slice.endLine;
-      const sliceLen = slice.endLine - slice.startLine + 1;
-      if (sliceLen > maxRefSliceLines) {
-        const newEnd = slice.startLine + maxRefSliceLines - 1;
-        const lns = read(node.file ?? "");
-        if (lns) {
-          slice.endLine = newEnd;
-          slice.text = lns.slice(slice.startLine - 1, newEnd).join("\n");
-          slice.truncatedFromEndLine = fullEnd;
-          notes.push(
-            `ref \`${r.id}\` truncated to first ${maxRefSliceLines} of ${sliceLen} lines`,
-          );
-        }
-      }
-      slices.push(slice);
-      addedIds.add(r.id);
-      refAdded++;
-      return true;
+    const passState: NeighborPassState = {
+      db,
+      read,
+      slices,
+      notes,
+      roots,
+      rootIds,
+      addedIds: new Set<string>(rootIds),
+      maxNeighbors,
     };
-    const entitiesIn = (file: string) =>
-      db.handle
-        .query<{ id: string; name: string; kind: string }, [string]>(
-          "SELECT id, name, kind FROM nodes WHERE file = ?",
-        )
-        .all(file)
-        .sort((a, b) => a.id.localeCompare(b.id));
-
-    // 4a. Same-file refs — over each root file (deduped).
-    for (const file of [...rootsByFile.keys()].sort()) {
-      if (refAdded >= maxNeighbors) break;
-      for (const r of entitiesIn(file)) {
-        if (refAdded >= maxNeighbors) break;
-        tryAddRef(r);
-      }
-    }
-    // 4b. Cross-file refs via each root file's module-import edges.
-    if (refAdded < maxNeighbors) {
-      const importedFiles = new Set<string>();
-      for (const file of rootsByFile.keys()) {
-        const moduleNode = db.handle
-          .query<{ id: string }, [string]>(
-            "SELECT id FROM nodes WHERE file = ? AND kind = 'module' LIMIT 1",
-          )
-          .get(file);
-        if (!moduleNode) continue;
-        for (const e of db.outgoing(moduleNode.id)) {
-          if (e.kind !== IMPORT_KIND) continue;
-          const imp = db.getNode(e.dst);
-          if (imp?.file && !rootsByFile.has(imp.file)) importedFiles.add(imp.file);
-        }
-      }
-      for (const f of [...importedFiles].sort()) {
-        if (refAdded >= maxNeighbors) break;
-        for (const r of entitiesIn(f)) {
-          if (refAdded >= maxNeighbors) break;
-          tryAddRef(r);
-        }
-      }
-    }
-    void IMPORT_KIND;
+    addCalleeNeighbors(passState, "unresolved/module/dup");
+    // Refs are searched against the CONCATENATION of every root body, and
+    // scanned same-file over each root file (sorted) before going cross-file.
+    addRefNeighbors(passState, {
+      rootText: roots.map((r) => targetSlices.get(r.id)?.text ?? "").join("\n"),
+      rootFiles: [...rootsByFile.keys()].sort(),
+      maxRefSliceLines,
+    });
   }
 
   const anchorFile = roots[0]?.file ?? null;

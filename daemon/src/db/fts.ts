@@ -15,6 +15,14 @@ import {
 import { makeInferFn } from "../conflict/llm_oracle.ts";
 import { isModelPresent, modelDir } from "../models/registry.ts";
 import { tryLocateNativeBinary } from "../native/locate.ts";
+import { scaffoldFileSqlPredicate } from "../util/test_files.ts";
+
+/** The `isScaffold` LIKE chain, generated from the SAME pattern list that backs
+ *  the TypeScript `isScaffoldFile` predicate (see `util/test_files.ts`). It is
+ *  a parameter-free literal fragment, exactly as the hand-written chain it
+ *  replaced was, so the query still binds only MATCH / path / the two LIMITs.
+ *  Built once at module load rather than per query. */
+const SCAFFOLD_SQL = scaffoldFileSqlPredicate("n.file", " ".repeat(26));
 
 /**
  * Upper bound on the number of original (whitespace-split) query terms we feed
@@ -41,9 +49,20 @@ const MAX_QUERY_TERMS = 32;
  *     direction). `−α·log1p(degree)` gently lifts well-connected nodes; `log1p`
  *     keeps a 100-edge hub from swamping the BM25 signal, and a leaf (degree 0)
  *     gets exactly zero boost so exact-identifier hits are undisturbed.
- *   - `isScaffold` = 1 for nodes whose source file is a test or bench file
- *     (`*.test.*`, `…/tests/…`, `bench/…`). `+τ·isScaffold` demotes that
- *     scaffolding so the product implementation surfaces above its tests.
+ *   - `isScaffold` = 1 for nodes whose source file is a test, bench, or mock
+ *     file. The pattern list lives in `util/test_files.ts` and is shared with
+ *     the packer's TypeScript predicate, so the two can no longer drift; it
+ *     covers every indexed language (`*.test.*`, `*.spec.*`, `__tests__/`,
+ *     `test_*.py`, `*_test.py`, `*_test.go`, `tests/`) plus `bench/` and mocks.
+ *     `+τ·isScaffold` demotes that scaffolding so the product implementation
+ *     surfaces above its tests.
+ *
+ * The α/τ figures below PRE-DATE the scaffold-set widening described above:
+ * they were measured when `isScaffold` recognised JS/TS tests, `…/tests/…` and
+ * `bench/` only. Six more classes (`*.spec.*`, `__tests__/`, `test_*.py`,
+ * `*_test.py`, `*_test.go`, a root-anchored `tests/`) now take the full `+τ`
+ * demotion, so treat the numbers as the tuning RATIONALE, not as a current
+ * measurement. Re-run `bench/agent-nav-eval.ts` before quoting them again.
  *
  * α/τ were tuned on `bench/agent-nav-eval.ts` (this repo's index): they lift
  * BROAD MRR 0.649 → 0.708 and BROAD top-5 5/6 → 6/6 while leaving the IMPL
@@ -386,19 +405,7 @@ function rankedSearch(
                       ))
                     + ${SCAFFOLD_PENALTY_TAU} * (
                         SELECT CASE
-                          WHEN n.file LIKE '%.test.%'
-                            OR n.file LIKE '%/tests/%'
-                            OR n.file LIKE 'bench/%'
-                            OR n.file LIKE '%/bench/%'
-                            -- Mock files are scaffold too: a test mock
-                            -- (api/mocks.ts mockNeighbors) must not outrank the
-                            -- real impl (walkNeighbors). Covers mocks.ts,
-                            -- foo.mock.ts, mocks/ dirs, and jest __mocks__/.
-                            OR n.file LIKE '%/mocks.%'
-                            OR n.file LIKE 'mocks.%'
-                            OR n.file LIKE '%.mock.%'
-                            OR n.file LIKE '%/mocks/%'
-                            OR n.file LIKE '%/__mocks__/%' THEN 1 ELSE 0
+                          WHEN ${SCAFFOLD_SQL} THEN 1 ELSE 0
                         END
                         FROM nodes n WHERE n.id = f.id
                       ) AS finalScore
