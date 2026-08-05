@@ -14,6 +14,15 @@ import type { Aggregator, Observation } from "./aggregator.ts";
 const UINT16_MAX = 0xffff;
 
 /**
+ * This package's version, mirrored from package.json `"version"`. This
+ * tsconfig does not enable `resolveJsonModule`, so the value cannot be
+ * imported from package.json directly; bump it alongside package.json at
+ * release time. (The `flusher user-agent tracks package version` test fails
+ * loudly if the two drift, so it cannot silently go stale again.)
+ */
+export const PACKAGE_VERSION = "0.0.5";
+
+/**
  * Injectable transport. Production uses `fetch`; tests inject a mock so the
  * flusher can be exercised without a live daemon. A thrown/rejected sender
  * makes `flushOnce` no-op gracefully (the error is stashed, not raised).
@@ -65,6 +74,14 @@ export class Flusher {
   private readonly sender: Sender;
 
   private timer: ReturnType<typeof setInterval> | null = null;
+  /**
+   * Serialization chain for flushes. Every `flushOnce` queues behind the tail
+   * of this chain, so an interval tick can never overlap a manual or stop()
+   * flush (overlap would race `lastError`/`lastFlushCount`). The chain never
+   * rejects (the flush body catches everything), so a failed flush cannot
+   * poison later flushes.
+   */
+  private inFlight: Promise<void> = Promise.resolve();
   private _lastError: string | null = null;
   private _lastFlushCount = 0;
   private _lastFlushAt = 0;
@@ -100,7 +117,15 @@ export class Flusher {
       clearInterval(this.timer);
       this.timer = null;
     }
-    if (flush) await this.flushOnce();
+    // `flushOnce` queues behind any in-flight flush, so awaiting it both
+    // waits out a racing interval tick and sends the final batch. When the
+    // caller opts out of the final flush we still wait for the tail of the
+    // chain so stop() never resolves with a send still in the air.
+    if (flush) {
+      await this.flushOnce();
+    } else {
+      await this.inFlight.catch(() => {});
+    }
   }
 
   // ----- public surface -----
@@ -108,8 +133,22 @@ export class Flusher {
   /**
    * Drain and POST. Returns the number of observations sent. Errors are stashed
    * on `lastError`; we never throw into user code.
+   *
+   * Flushes are SERIALIZED: a call that arrives while another flush is in
+   * flight queues behind it instead of running concurrently. Drain is atomic
+   * either way, but overlap would race `lastError`/`lastFlushCount`.
    */
   async flushOnce(): Promise<number> {
+    const run = this.inFlight.then(() => this.doFlush());
+    this.inFlight = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  /** The actual drain-and-POST body; only ever entered via the `inFlight` chain. */
+  private async doFlush(): Promise<number> {
     const obs = this.agg.drain();
     if (obs.length === 0) return 0;
     const payload = this.encode(obs);
@@ -180,7 +219,7 @@ export class Flusher {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "User-Agent": "hayven-trace-browser/0.0.4",
+          "User-Agent": `hayven-trace-browser/${PACKAGE_VERSION}`,
         },
         body: payload,
         signal: controller.signal,

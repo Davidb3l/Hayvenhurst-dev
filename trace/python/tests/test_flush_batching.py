@@ -17,7 +17,7 @@ capturing-sender pattern as ``test_coverage.py``.
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
 from hayven_trace.aggregator import Aggregator, CoverageAggregator
 from hayven_trace.flusher import FLUSH_BATCH_SIZE, Flusher
@@ -72,7 +72,9 @@ class _FlakyOnceSender(_CapturingSender):
         super().__call__(url, payload)
 
 
-def _make_flusher(sender, **kw) -> Tuple[Aggregator, CoverageAggregator, Flusher]:
+def _make_flusher(
+    sender: Callable[[str, bytes], None], **kw: Any
+) -> Tuple[Aggregator, CoverageAggregator, Flusher]:
     agg = Aggregator()
     cov = CoverageAggregator()
     f = Flusher(

@@ -33,6 +33,78 @@ def _chunk(rows: Sequence[_T], size: int) -> List[List[_T]]:
 
 log = logging.getLogger("hayven_trace.flusher")
 
+# Lazily-resolved User-Agent header value. Resolved on first use (not at
+# import) because the fallback reads the package's ``__version__``, and this
+# module is imported DURING the package's own ``__init__``, before the
+# attribute exists.
+_user_agent: Optional[str] = None
+
+
+def _package_version() -> str:
+    """Resolve this package's version for the User-Agent header.
+
+    Prefers the installed distribution metadata (always correct for a pip
+    install, including editable installs) and falls back to the in-tree
+    ``__version__`` constant when the package is imported straight from a
+    source checkout with no metadata. Sourcing the version here, instead of
+    hardcoding it in the header, is what keeps the User-Agent from silently
+    going stale across releases.
+    """
+    try:
+        from importlib.metadata import version
+
+        return version("hayven-trace")
+    except Exception:
+        pass
+    # Source checkout without installed metadata: read the version straight
+    # from the adjacent pyproject.toml, the single authoritative place it is
+    # bumped at release time. (A plain regex, not tomllib: requires-python is
+    # >=3.9 and this file must stay zero-dep.)
+    try:
+        import os
+        import re
+
+        pyproject = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "..", "pyproject.toml"
+        )
+        with open(pyproject, "r", encoding="utf-8") as fh:
+            m = re.search(r'^version\s*=\s*"([^"]+)"', fh.read(), re.MULTILINE)
+        if m is not None:
+            return m.group(1)
+    except Exception:
+        pass
+    # Last resort: the in-tree constant. Known to lag behind releases (it is
+    # hand-bumped), which is why the two sources above are preferred.
+    try:
+        from . import __version__
+
+        return str(__version__)
+    except Exception:
+        return "unknown"
+
+
+def _user_agent_header() -> str:
+    global _user_agent
+    if _user_agent is None:
+        _user_agent = f"hayven-trace/{_package_version()}"
+    return _user_agent
+
+
+def _is_permanent_rejection(e: Exception) -> bool:
+    """True when a sender failure is a PERMANENT daemon rejection.
+
+    Permanent means the daemon received the request and rejected the payload
+    itself (4xx, e.g. a 400 contract mismatch); retrying the identical rows
+    can only produce the identical rejection. 408 (request timeout) and 429
+    (backpressure) are explicitly transient. The default sender raises
+    ``urllib.error.HTTPError`` which carries the status on ``.code``; we
+    duck-type on an int ``code`` attribute so injectable senders can opt in.
+    Anything without a recognizable status (URLError, socket timeout, a custom
+    sender's plain raise) is transient, the safe default: retry, never drop.
+    """
+    code = getattr(e, "code", None)
+    return isinstance(code, int) and 400 <= code < 500 and code not in (408, 429)
+
 # Maximum number of rows (observations OR coverage) carried in a single POST.
 # The flush splits the drained payload into chunks of this size so no single
 # request is multi-MB. This is the FIX for the measured data-loss bug: a full
@@ -100,6 +172,14 @@ class Flusher:
         self._source = source
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        # Serializes flush_once against itself: the background thread's
+        # interval flush and a caller's manual/stop flush must not interleave.
+        # Drain is atomic either way (no loss), but overlap would interleave
+        # chunk sends and race _last_flush_count/_last_error.
+        self._flush_lock = threading.Lock()
+        # One-shot guard so a permanent daemon rejection is logged once, not
+        # once per interval.
+        self._permanent_drop_logged = False
         self._last_flush_at: float = 0.0
         self._last_flush_count: int = 0
         self._last_error: Optional[str] = None
@@ -180,9 +260,24 @@ class Flusher:
         array, which the daemon accepts), fixing the early-return that used to
         drain-then-drop coverage on an edge-empty flush.
 
+        Failure handling distinguishes two shapes. A TRANSIENT failure
+        (network error, 5xx, 408, 429) re-buffers the chunk so the next flush
+        retries it. A PERMANENT rejection (other 4xx, e.g. a 400 contract
+        mismatch) DROPS the chunk instead (re-buffering it would re-POST the
+        same rejected rows every interval forever), records a distinct
+        ``dropped-permanent: …`` marker on ``last_error``, and logs a WARNING
+        once per flusher (not per interval).
+
+        Flushes are SERIALIZED via a lock: the background thread's interval
+        flush and a caller's manual flush cannot interleave.
+
         Errors are logged at DEBUG and stashed on ``self._last_error``; we
         never raise into the user's code.
         """
+        with self._flush_lock:
+            return self._flush_once_locked()
+
+    def _flush_once_locked(self) -> int:
         obs = self._agg.drain()
         coverage = self._coverage.drain() if self._coverage is not None else []
         if not obs and not coverage:
@@ -206,12 +301,29 @@ class Flusher:
                 self._sender(self._url, payload)
                 sent += len(o)
             except Exception as e:
-                any_error = f"{type(e).__name__}: {e}"
-                log.debug("hayven-trace flush chunk failed: %s", any_error)
-                # Re-buffer the failed chunk so the next flush retries it; this
-                # turns a transient failure into a delayed send rather than a
-                # permanent drop. We CONTINUE so chunks i+1… still go out.
-                self._rebuffer(o, c)
+                msg = f"{type(e).__name__}: {e}"
+                if _is_permanent_rejection(e):
+                    # The daemon actively rejected this chunk's payload.
+                    # Retrying the identical rows can only produce the
+                    # identical rejection, so drop the chunk and surface a
+                    # distinct marker instead of quietly re-POSTing it every
+                    # interval forever.
+                    any_error = f"dropped-permanent: {msg}"
+                    if not self._permanent_drop_logged:
+                        self._permanent_drop_logged = True
+                        log.warning(
+                            "hayven-trace: daemon permanently rejected a trace "
+                            "batch; dropping it (%s)",
+                            msg,
+                        )
+                else:
+                    any_error = msg
+                    log.debug("hayven-trace flush chunk failed: %s", any_error)
+                    # Re-buffer the failed chunk so the next flush retries it;
+                    # this turns a transient failure into a delayed send rather
+                    # than a permanent drop. We CONTINUE so chunks i+1… still
+                    # go out.
+                    self._rebuffer(o, c)
 
         if any_error is not None:
             self._last_error = any_error
@@ -290,7 +402,7 @@ class Flusher:
             url,
             data=payload,
             method="POST",
-            headers={"Content-Type": "application/json", "User-Agent": "hayven-trace/0.0.4"},
+            headers={"Content-Type": "application/json", "User-Agent": _user_agent_header()},
         )
         # Bound the network call so a broken daemon never stalls user code.
         with urllib.request.urlopen(req, timeout=self._timeout) as resp:

@@ -38,4 +38,6 @@ __all__ = [
     "stop",
 ]
 
-__version__ = "0.0.4"
+# Kept in lockstep with pyproject.toml's `version` at release time; the
+# flusher's User-Agent resolves from installed metadata and does not read this.
+__version__ = "0.0.5"
