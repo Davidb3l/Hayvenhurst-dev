@@ -865,6 +865,12 @@ async function registerDaemonProject(args: ParsedArgs): Promise<number> {
     case "error":
       process.stderr.write(`note: daemon reachable but did not add it: ${hot.message}\n`);
       break;
+    case "foreign-home":
+      // The registry write above already landed in OUR home, which is the part
+      // that matters. Only the live hot-add was skipped, so this stays a note
+      // and the command still exits 0.
+      process.stderr.write(`note: skipped the live hot-add.\n${hot.message}\n`);
+      break;
     case "no-daemon":
       process.stdout.write(`no running daemon — it will load on the next \`hayven daemon start\`\n`);
       break;
@@ -1226,10 +1232,16 @@ async function ensureServedByRunningDaemon(
     process.stdout.write(`daemon already running at ${base}/ — now serving '${hot.alias}'.\n`);
     return 0;
   }
+  // A foreign-home daemon is a REAL blocker here, unlike in `init`/`register`:
+  // the port we wanted is occupied by a daemon we must not write to, so there is
+  // no way to serve this project without freeing it. Say which boundary it is,
+  // so the user does not read this as a version problem.
   const detail =
     hot.kind === "error"
       ? hot.message
-      : "it does not support live project registration (old version?)";
+      : hot.kind === "foreign-home"
+        ? `it anchors its global state to ${hot.daemonHome} while this process uses ${hot.ourHome}`
+        : "it does not support live project registration (old version?)";
   process.stderr.write(
     `error: a hayven daemon is running at ${base} but this project could not be registered with it: ${detail}\n` +
       "Restart it from this repo (`hayven daemon stop && hayven daemon start`).\n",

@@ -3,7 +3,26 @@
  */
 import { Elysia } from "elysia";
 
+import { hayvenHomeDir } from "../../util/paths.ts";
 import type { ServerDependencies } from "../server.ts";
+
+/**
+ * The global home THIS daemon process anchors its registry, writer id and logs
+ * to. Read live rather than captured at wiring time so it always reflects the
+ * process that is actually going to perform a write.
+ *
+ * Degrades to `null` rather than throwing: `hayvenHomeDir()` rejects a relative
+ * `$HAYVEN_HOME`, and `/api/health` is the LIVENESS endpoint. A daemon that
+ * cannot state its home must still be able to answer "am I up?", and a client
+ * reads `null`/absent as "cannot verify", which is not a mismatch.
+ */
+function globalHome(): string | null {
+  try {
+    return hayvenHomeDir();
+  } catch {
+    return null;
+  }
+}
 
 /**
  * HLC skew rejections, or `null` when the CRDT clock is unavailable.
@@ -35,6 +54,15 @@ export function healthRoutes(deps: ServerDependencies) {
     // port 7777, so without an identity check a foreign repo's daemon on the
     // same port would be silently mutated.
     root: deps.paths.repoRoot,
+    // GLOBAL HOME (additive; older daemons omit it entirely). `root` says which
+    // PROJECT this daemon serves; this says where its GLOBAL state lives, and
+    // the two answer different questions. A CLI sandboxed with `$HAYVEN_HOME`
+    // is still able to reach a daemon running under the developer's real home,
+    // and `POST /api/projects` would then persist the registration THERE, in a
+    // registry the sandboxed process never reads and never cleans up. Clients
+    // compare this against their own `hayvenHomeDir()` before posting; absence
+    // means "cannot verify" and is deliberately not treated as a mismatch.
+    global_home: globalHome(),
     // LIVE branch re-pointing: the branch key + index path the daemon CURRENTLY
     // serves, read through the swappable holder so it reflects a `git checkout`
     // the daemon followed mid-run. `null`/`branch_path` absent when no holder is

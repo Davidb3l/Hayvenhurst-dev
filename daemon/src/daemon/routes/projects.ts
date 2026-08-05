@@ -16,6 +16,7 @@
  */
 import { Elysia } from "elysia";
 
+import { canonicalRoot, hayvenHomeDir } from "../../util/paths.ts";
 import type { ServerDependencies } from "../server.ts";
 
 /** Pull a string field off an untyped JSON body without throwing. */
@@ -25,6 +26,43 @@ function bodyString(body: unknown, key: string): string | undefined {
     if (typeof v === "string" && v.length > 0) return v;
   }
   return undefined;
+}
+
+/**
+ * DEFENSE IN DEPTH for the global-home sandbox escape.
+ *
+ * A client sandboxed with `$HAYVEN_HOME` can still reach a daemon running under
+ * a different home, and this route would then persist the registration into the
+ * DAEMON's `projects.json` rather than the caller's. The primary guard is on the
+ * client (it probes `/api/health` for our `global_home` and declines to post on
+ * a mismatch), but an OLDER CLI does not probe, so refuse here too.
+ *
+ * OPTIONAL BY CONTRACT: an old CLI omits the field entirely, and absence means
+ * "no opinion", never "mismatch". Reading absence as a mismatch would break
+ * every already-installed CLI against a freshly built daemon.
+ *
+ * Compared CANONICALLY for the same reason the client does it: `/tmp` is a
+ * symlink to `/private/tmp` on macOS, so two spellings of one directory must
+ * not read as two directories.
+ *
+ * Returns an error message when the write must be refused, `null` to proceed.
+ */
+function foreignHomeRefusal(clientHome: string | undefined): string | null {
+  if (clientHome === undefined) return null; // old client, no opinion
+  let ours: string;
+  try {
+    ours = hayvenHomeDir();
+  } catch {
+    return null; // we cannot state our own home, so we cannot claim a mismatch
+  }
+  const oursCanon = canonicalRoot(ours);
+  const theirsCanon = canonicalRoot(clientHome);
+  if (oursCanon === theirsCanon) return null;
+  return (
+    "refusing to register across a global-home boundary: this daemon keeps its project registry " +
+    `under ${oursCanon}, but the caller declared ${theirsCanon}. The registration would land in a ` +
+    "registry the caller never reads. Talk to the daemon running under your own HAYVEN_HOME."
+  );
 }
 
 export function projectsRoutes(deps: ServerDependencies) {
@@ -42,6 +80,13 @@ export function projectsRoutes(deps: ServerDependencies) {
       if (!path) {
         set.status = 400;
         return { error: "body.path is required (an absolute repo root that has been `hayven init`'d)" };
+      }
+      // Checked BEFORE `addProject`, which is the call that persists to the
+      // registry. A refusal must cost the caller a 409 and nothing else.
+      const refusal = foreignHomeRefusal(bodyString(body, "client_home"));
+      if (refusal !== null) {
+        set.status = 409;
+        return { error: refusal };
       }
       try {
         const result = await deps.addProject(path, bodyString(body, "alias"));

@@ -76,6 +76,18 @@ function makeRepo(name: string, files = 0): string {
   const root = join(home, name);
   mkdirSync(join(root, ".hayven"), { recursive: true });
   mkdirSync(join(root, "src"), { recursive: true });
+  // Pin the port to one nothing listens on. Without a config the fixture falls
+  // back to the DEFAULT 7777, so `register` hot-adds into whatever daemon is
+  // running on the developer's machine, and THAT daemon writes the row into its
+  // own real registry. Sandboxing HAYVEN_HOME cannot prevent it: the escape is
+  // an HTTP call to another process, not a path this one resolves. That is how
+  // roughly 76 of these fixtures ended up in a real `~/.hayven/projects.json`.
+  // Port 1 is privileged and unbound, so the hot-add fails fast and the test
+  // exercises the no-daemon path it always meant to.
+  writeFileSync(
+    join(root, ".hayven", "config.json"),
+    `${JSON.stringify({ daemon_port: 1 }, null, 2)}\n`,
+  );
   for (let i = 0; i < files; i++) {
     writeFileSync(join(root, "src", `f${i}.ts`), "export const x = 1;\n");
   }

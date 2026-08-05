@@ -8,7 +8,7 @@ import { DETACH_HEALTH_TIMEOUT_MS, DETACH_PROBE_TIMEOUT_MS } from "../daemon/det
 import { isRegistrableRoot } from "../daemon/registry.ts";
 import { resolveReadIndex } from "../db/branch_index.ts";
 import { Db } from "../db/queries.ts";
-import { canonicalRoot, detectRepoRoot, hayvenPathsFor, type HayvenPaths } from "../util/paths.ts";
+import { canonicalRoot, detectRepoRoot, hayvenHomeDir, hayvenPathsFor, type HayvenPaths } from "../util/paths.ts";
 import { rootLogger } from "../util/log.ts";
 
 export interface ProjectContext {
@@ -89,7 +89,137 @@ export type HotAddResult =
   | { kind: "added"; alias: string }
   | { kind: "exists"; alias: string }
   | { kind: "no-daemon" }
-  | { kind: "error"; message: string };
+  | { kind: "error"; message: string }
+  /**
+   * The daemon anchors its GLOBAL state to a different home than we do, so we
+   * did not POST at all. Distinct from `error` because nothing went wrong: the
+   * hot-add was correctly SKIPPED, and every caller must report it as a note
+   * rather than a failure.
+   */
+  | { kind: "foreign-home"; ourHome: string; daemonHome: string; message: string };
+
+/**
+ * The `/api/health` field a daemon reports its global home under, and the
+ * `POST /api/projects` body field a client declares its own under. Named once
+ * so the client, the route and the tests cannot drift apart.
+ */
+export const HEALTH_GLOBAL_HOME_FIELD = "global_home";
+export const PROJECTS_CLIENT_HOME_FIELD = "client_home";
+
+/**
+ * THE SANDBOX ESCAPE this exists to close.
+ *
+ * `$HAYVEN_HOME` is the only way to sandbox global state (see
+ * `util/paths.ts#hayvenHomeDir`), and every test that touches the project
+ * registry sets it. But registration does not stay in-process: it travels over
+ * HTTP to a RUNNING daemon, and that daemon writes to ITS OWN registry, derived
+ * from ITS OWN `$HAYVEN_HOME`. So a child process with a throwaway home still
+ * caused a row to land in the developer's real `~/.hayven/projects.json`
+ * whenever any daemon happened to be listening on the configured port. The
+ * observed damage was 86 registry entries, ~76 of them test-fixture temp dirs
+ * whose tests sandboxed correctly. The tests were not at fault; the hop was.
+ *
+ * The fix is a home handshake in BOTH directions. This type is the client half.
+ */
+export type DaemonHomeCheck =
+  /** Both sides anchor to the same global home. Safe to mutate the daemon. */
+  | { kind: "match"; home: string }
+  /** Different homes. A write here escapes our sandbox into theirs. */
+  | { kind: "mismatch"; ours: string; theirs: string }
+  /**
+   * Cannot verify: the daemon is unreachable, unhealthy, or predates the field.
+   * MUST NOT block the hot-add. An older daemon reports no home at all, and
+   * treating silence as mismatch would mean upgrading the CLI breaks
+   * registration against every daemon already running.
+   */
+  | { kind: "unknown" };
+
+/**
+ * Our own global home, or `undefined` when it cannot be determined.
+ *
+ * `hayvenHomeDir()` THROWS on a relative `$HAYVEN_HOME`. The hot-add path is
+ * best-effort and must never throw, so a bad override degrades to "no opinion"
+ * here and the real error surfaces from whichever command actually needs the
+ * path.
+ */
+function callerGlobalHome(): string | undefined {
+  try {
+    return hayvenHomeDir();
+  } catch {
+    return undefined;
+  }
+}
+
+/*
+ * THE RESIDUAL EXPOSURE, stated so nobody has to rediscover it. A plain block
+ * comment, not a doc comment: it documents a DECISION about the whole handshake
+ * rather than any one symbol, and there is no declaration for it to attach to.
+ *
+ * The handshake closes the leak against a daemon that reports its home. It does
+ * NOT close it against an OLDER daemon, which reports nothing: the probe returns
+ * `unknown`, `unknown` proceeds, and that daemon has no guard of its own. This is
+ * a deliberate compatibility choice, because treating silence as a mismatch would
+ * mean a CLI upgrade breaks registration against every daemon already running.
+ *
+ * Measured, so the size of the residual is on record rather than assumed: with
+ * this fix in place and a resident 0.0.7 daemon on the default port, a full
+ * `bun test` on the owner's machine still added two fixture rows to the real
+ * `~/.hayven/projects.json`. A fresh contributor is not exposed (they build this
+ * tree, so their daemon reports a home and the mismatch rule fires). Anyone with
+ * a pre-handshake daemon still running is, until they restart it.
+ *
+ * A stricter rule was written and measured: refuse the unverifiable post when
+ * `$HAYVEN_HOME` is set to something other than the real home, which is exactly
+ * the sandbox case and leaves ordinary users untouched. It DOES close the
+ * residual (registry rows held flat at 7 across a full suite run). It was backed
+ * out because it contradicts the compatibility rule above and because it changes
+ * the expectations of four existing test files that hot-add against stub daemons
+ * which omit the field. Reinstate it as a follow-up, with those tests, if the
+ * residual is judged worse than the incompatibility.
+ */
+
+/**
+ * Compare a daemon-reported global home against ours.
+ *
+ * CANONICAL comparison, not string equality. On macOS `/tmp` is a symlink to
+ * `/private/tmp`, so a sandbox created as `/tmp/x` and reported back as
+ * `/private/tmp/x` is the SAME directory; a naive `===` would call that a
+ * mismatch and refuse a perfectly legitimate hot-add. `canonicalRoot` resolves
+ * symlinks and normalizes away a trailing slash, and falls back to a plain
+ * `resolve` for a path that does not exist on this side.
+ */
+export function compareGlobalHomes(reported: unknown): DaemonHomeCheck {
+  if (typeof reported !== "string" || reported.length === 0) return { kind: "unknown" };
+  const ours = callerGlobalHome();
+  if (ours === undefined) return { kind: "unknown" };
+  const oursCanon = canonicalRoot(ours);
+  const theirsCanon = canonicalRoot(reported);
+  return oursCanon === theirsCanon
+    ? { kind: "match", home: oursCanon }
+    : { kind: "mismatch", ours: oursCanon, theirs: theirsCanon };
+}
+
+/**
+ * Ask the daemon at `base` which global home it anchors to, and compare it to
+ * ours. Never throws: every failure mode (refused, wedged, unhealthy, old
+ * daemon with no field) resolves to `unknown`, which is explicitly NOT a
+ * mismatch.
+ *
+ * Bounded with the PROBE budget, not the health budget: this is the same
+ * one-shot `/api/health` call `probeDaemon` makes, and it runs BEFORE the
+ * hot-add POST, so it must not double the worst case against a wedged daemon.
+ */
+export async function probeDaemonGlobalHome(base: string): Promise<DaemonHomeCheck> {
+  const signal = AbortSignal.timeout(DETACH_PROBE_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${base}/api/health`, { signal });
+    if (!res.ok) return { kind: "unknown" };
+    const body = (await res.json()) as Record<string, unknown>;
+    return compareGlobalHomes(body[HEALTH_GLOBAL_HOME_FIELD]);
+  } catch {
+    return { kind: "unknown" };
+  }
+}
 
 /**
  * Best-effort: ask the daemon at `base` to serve `root` LIVE (`POST /api/projects`)
@@ -117,17 +247,50 @@ export async function hotAddToRunningDaemon(root: string, base: string, alias?: 
   if (!isRegistrableRoot(root)) {
     return { kind: "error", message: `refusing to serve ${root} as a project (see \`hayven daemon register --help\`)` };
   }
+  // GLOBAL-HOME HANDSHAKE, before anything is sent. `$HAYVEN_HOME` sandboxes
+  // our own process, but this POST is a write to SOMEONE ELSE'S global state:
+  // the daemon persists the registration under the home ITS process resolved.
+  // Posting across that boundary is how test fixtures ended up in a real
+  // `~/.hayven/projects.json`. `unknown` (unreachable, unhealthy, or a daemon
+  // predating the field) deliberately falls through and posts, so upgrading the
+  // CLI does not break registration against a daemon that is already running.
+  const homes = await probeDaemonGlobalHome(base);
+  if (homes.kind === "mismatch") {
+    return {
+      kind: "foreign-home",
+      ourHome: homes.ours,
+      daemonHome: homes.theirs,
+      message:
+        `daemon at ${base} anchors its global state to a different home, so it was NOT asked to serve ${root}.\n` +
+        `  this process: ${homes.ours}\n` +
+        `  that daemon:  ${homes.theirs}\n` +
+        "Registering across that boundary would write into the daemon's project registry, not ours.",
+    };
+  }
+  // `unknown` DELIBERATELY FALLS THROUGH AND POSTS. The "RESIDUAL EXPOSURE"
+  // block above states what that leaves open, why it is left open, and the
+  // measurement behind the decision.
   // ONE signal for the whole exchange, exactly as `probeDaemon` does: aborting
   // tears down the response BODY stream too, so a daemon that sends headers and
   // then stalls mid-body is bounded by the same budget as the connect phase —
   // otherwise `res.json()` below just becomes the new place to hang forever.
+  const ourHome = callerGlobalHome();
   const signal = AbortSignal.timeout(DETACH_HEALTH_TIMEOUT_MS);
   let res: Response;
   try {
     res = await fetch(`${base}/api/projects`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(alias ? { path: root, alias } : { path: root }),
+      // Declare our home in the body as well as probing for theirs. The probe
+      // is the primary guard; this is defense in depth for the reverse pairing,
+      // where a NEW daemon receives a post from an OLD CLI that never probed.
+      // The field is omitted when we cannot determine our own home, and the
+      // route reads absence as "no opinion", never as a mismatch.
+      body: JSON.stringify({
+        path: root,
+        ...(alias ? { alias } : {}),
+        ...(ourHome !== undefined ? { [PROJECTS_CLIENT_HOME_FIELD]: ourHome } : {}),
+      }),
       signal,
     });
   } catch {
@@ -279,9 +442,14 @@ export async function assertDaemonServesProject(
   const registerNote =
     hot.kind === "error"
       ? `\n  (live registration failed: ${hot.message})`
-      : hot.kind === "no-daemon"
-        ? "\n  (this daemon does not support live project registration — restart it from this repo)"
-        : "\n  (live registration did not return a usable project alias)";
+      : hot.kind === "foreign-home"
+        ? // Not a failure, a refusal on our side: that daemon keeps its global
+          // state somewhere else, so registering into it would leave the row in
+          // a registry this process never reads.
+          `\n  (live registration SKIPPED: that daemon's global home is ${hot.daemonHome}, ours is ${hot.ourHome})`
+        : hot.kind === "no-daemon"
+          ? "\n  (this daemon does not support live project registration — restart it from this repo)"
+          : "\n  (live registration did not return a usable project alias)";
   return {
     ok: false,
     message:

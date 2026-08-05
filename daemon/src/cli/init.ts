@@ -371,6 +371,12 @@ export async function runInit(args: ParsedArgs): Promise<number> {
       const hot = await hotAddToRunningDaemon(root, `http://${cfg.daemon_host}:${cfg.daemon_port}`);
       if (hot.kind === "added") {
         process.stdout.write("  daemon:         added live to the running daemon (no restart needed)\n");
+      } else if (hot.kind === "foreign-home") {
+        // A SKIP, not a failure. The daemon on this port keeps its global state
+        // under a different home, so registering into it would put the row in a
+        // registry this process never reads. `init` itself succeeded, so this is
+        // a note on stderr and the exit code stays 0.
+        process.stderr.write(`note: skipped the live hot-add.\n${hot.message}\n`);
       }
     } catch {
       /* best-effort — a hot-add failure must never fail an otherwise-good init */
