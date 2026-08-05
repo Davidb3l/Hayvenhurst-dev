@@ -1,11 +1,12 @@
 /**
  * ONE source of truth for "is this path test/bench/mock scaffolding?".
  *
- * Two consumers need this answer through two different MECHANISMS:
+ * Consumers need this answer through two different MECHANISMS:
  *
- *   - `db/context_pack.ts` needs a TypeScript predicate (it filters graph
- *     neighbors in memory: a call edge that resolves into a test file is an
- *     ambiguous-name mis-resolution, not a real dependency).
+ *   - `db/pack_neighbors.ts` and `db/imported_symbol.ts` need a TypeScript
+ *     predicate (they filter graph neighbors in memory: a call or import edge
+ *     that resolves into a test file is an ambiguous-name mis-resolution, not a
+ *     real dependency).
  *   - `db/fts.ts` needs a SQL fragment (its `isScaffold` search-ranking penalty
  *     is computed inside the re-rank query, per matched row).
  *
@@ -46,15 +47,51 @@ const TEST_GLOBS: readonly string[] = [
   "__tests__/*",
   "*/__tests__/*",
 
-  // Python. Both PyTest conventions. The escaped underscore is what keeps
-  // `latest.py` out of `*_test.py` (it needs a literal `_test.py` suffix) and
-  // `testing.py` out of `test_*.py`.
+  // The UNDERSCORE twin of `*.test.*`, adopted from the affected-tests
+  // selector's `_test.` substring. Cross-language and extension-open, because a
+  // `_test` SUFFIX names the file after the thing it tests in every language we
+  // index: `go test` compiles `*_test.go` only into the test binary,
+  // Deno/Google-style TS uses `foo_test.ts`, and a Rust `parser_test.rs` is the
+  // near-universal shape of a `#[cfg(test)] mod parser_test`. Note the contrast
+  // with the `test_` PREFIX two blocks down, which is NOT shared: a `_test`
+  // suffix reads "tests OF parser", while a `test_` prefix reads "helpers FOR
+  // tests" (`test_util.rs`, `test_helpers.go`) and those are ordinary source.
+  // That asymmetry, not the toolchain, is what justifies sharing one and not
+  // the other.
+  //
+  // This SUBSUMES the former `*_test.py` and `*_test.go` rows, which are gone
+  // rather than duplicated. The literal dot is what keeps the near-misses out:
+  // `attestation.go`, `detest.rs`, `walkXtest.go` have no `_test.` at all, and
+  // even `latest_test_helpers.go` misses, because the character after `_test`
+  // there is `_`, not `.`.
+  //
+  // KNOWN RESIDUAL FALSE POSITIVE: a production file whose stem ends in the
+  // NOUN "test" — `src/ab_test.ts` (A/B testing feature code) is the realistic
+  // one. Accepted, because the alternative shapes (`load_test`, `smoke_test`,
+  // `unit_test`) really are tests and enumerating extensions would not exclude
+  // `ab_test.ts` anyway. If this bites, narrow by stem, not by extension.
+  "*_test.*",
+
+  // Ruby RSpec, and deliberately `.rb`-ONLY where the dotted `*.spec.*` above is
+  // extension-open. `_spec` does NOT generalize the way `_test` does: outside
+  // Ruby, "spec" is production vocabulary for SPECIFICATION, so an
+  // extension-open `*_spec.*` swallows `src/api_spec.ts`, `src/openapi_spec.py`,
+  // `internal/wire_spec.go` and `src/protocol_spec.rs` — all real source, all
+  // then silently dropped from context packs. The JS/TS test convention is the
+  // dotted `foo.spec.ts`, which `*.spec.*` already covers, so restricting to
+  // `.rb` costs only the legacy Jasmine `foo_spec.js` shape. That leaves
+  // `src/cookie_spec.ts` divergent from the selector on purpose; see the ledger.
+  "*_spec.rb",
+
+  // Python's PREFIX convention, and deliberately Python-ONLY. pytest's default
+  // `python_files` makes `test_*.py` a genuine test MODULE, so it is scaffolding
+  // to the packer too. No cross-language `test_*` row exists on purpose: outside
+  // Python a `test_`-prefixed file (`src/test_helpers.go`, `src/test_util.rs`)
+  // is ordinary source that merely SUPPORTS tests — the Go and Rust compilers
+  // build it into the package, so the packer is right to inline it. The escaped
+  // underscore keeps `testing.py` out (it needs a literal `test_`).
   "test_*.py",
   "*/test_*.py",
-  "*_test.py",
-
-  // Go. `attestation.go` does not match: the pattern needs a literal `_test.go`.
-  "*_test.go",
 
   // Rust (`tests/` integration-test dir), Python (`tests/` package), and the
   // many JS/Go repos that also use a top-level `tests/`. Both the repo-root
@@ -72,6 +109,51 @@ const TEST_GLOBS: readonly string[] = [
   "test/*",
   "*/test/*",
 ];
+
+/**
+ * THE DIVERGENCE LEDGER: what this list deliberately does NOT take from
+ * `db/test_nodes.ts::DEFAULT_TEST_PATH_PATTERNS`.
+ *
+ * That list is the affected-tests selector's, and it answers a different
+ * question ("can the test runner RUN this file?"). The two were compared
+ * mechanically over a corpus spanning every indexed language plus Ruby and Java
+ * (`tests/win_b_glob_divergence.test.ts`, which PINS the result, so a future
+ * edit to either list that changes the divergence set fails loudly). Every
+ * remaining difference below is a decision, not an accident:
+ *
+ *   - BARE `test_` (unanchored substring). NOT adopted. It is a substring test
+ *     with nothing before it, so it fires on `src/greatest_hits.ts`,
+ *     `src/protest_utils.py`, `src/attest_helpers.go` and
+ *     `src/latest_test_helpers.go` — all real source. The anchored Python rows
+ *     above (root and nested `test_*.py`) exist precisely to get the Python
+ *     convention without that. The selector can afford the false positives, its
+ *     detection is an intentional UNION with NAME conventions and its run list
+ *     is filtered again downstream; the packer cannot, because a false positive
+ *     here silently DELETES a real dependency from a context pack.
+ *
+ *   - The selector matching `src/test_helpers.go` / `src/test_util.rs` as tests.
+ *     NOT adopted, same reason stated at the `test_*.py` rows: a `test_` PREFIX
+ *     names a helper FOR tests, which is ordinary source the packer must keep
+ *     inlining, unlike the `_test` SUFFIX which names the file as tests.
+ *
+ *   - `_spec.` on any extension but `.rb`. PARTIALLY adopted only. The selector
+ *     calls `src/cookie_spec.ts` and `src/openapi_spec.py` tests; the shared
+ *     list takes just `*_spec.rb`, because "spec" is production vocabulary for
+ *     SPECIFICATION outside Ruby. The selector can hold the wider form for the
+ *     same reason it holds bare `test_`.
+ *
+ * ONE PROPERTY THAT SURPRISES READERS: none of these patterns are
+ * basename-anchored. `*` compiles to SQL `%`, which matches `/` as well, so a
+ * DIRECTORY whose name contains `.test.` / `_test.` marks everything beneath it
+ * (`fixtures/repo_test.d/src/main.go` is a test file to this list). That was
+ * already true of `*.test.*` before any of this and is left alone; the glob DSL
+ * has no way to say "basename only", and the shapes it costs us are rare.
+ *
+ * And one difference that ran the OTHER way and was fixed on the selector's
+ * side rather than here: a REPO-ROOT `__tests__/router.ts` was a test to this
+ * list and not to the selector, whose `/__tests__/` substring needs a leading
+ * slash. See the prefix check in `db/test_nodes.ts::isTestFile`.
+ */
 
 /** Benchmark scaffolding. Distinct from tests: a bench file is real source that
  *  exercises the implementation, so the packer still treats it as a legitimate

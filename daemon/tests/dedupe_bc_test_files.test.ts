@@ -38,6 +38,17 @@ export const TEST_PATHS: readonly string[] = [
   // Rust
   "tests/integration.rs",
   "crates/core/tests/integration.rs",
+  // The UNDERSCORE forms, adopted from the affected-tests selector's `_test.` /
+  // `_spec.` after the divergence audit (tests/win_b_glob_divergence.test.ts).
+  // `_test.` is extension-open (Deno/Google-style TS, Rust, Go, Python all use
+  // it); `_spec.` was taken for Ruby RSpec ONLY, because elsewhere a `_spec`
+  // stem means SPECIFICATION rather than test.
+  "src/cookie_test.ts",
+  "src/cookie_test.tsx",
+  "src/parser_test.rs",
+  "spec/foo_spec.rb",
+  "spec/models/user_spec.rb",
+  "test/user_test.rb",
 ];
 
 /** Real source that a naive broadening would wrongly capture. */
@@ -54,6 +65,27 @@ export const NON_TEST_PATHS: readonly string[] = [
   "src/detest.rs",
   "cookie.ts",
   "src/db/context_pack.ts",
+  // The blast-radius edge of the adopted `*_test.*` / `*_spec.*` rows. Each of
+  // these contains `_test` or `_spec` and must still be real source, because
+  // the adopted patterns require a LITERAL dot immediately after.
+  "src/latest_test_helpers.go", // `_test` followed by `_`, not `.`
+  "src/inspector_spectrum.ts", // `_spec` followed by `t`, not `.`
+  "src/greatest_hits.ts",
+  "src/protest_utils.py",
+  // Deliberately divergent from the affected-tests selector, which DOES call
+  // these tests. A `test_`-prefixed Go/Rust file compiles into its package, so
+  // it is production source here. See the divergence ledger in
+  // `src/util/test_files.ts`.
+  "src/test_helpers.go",
+  "src/test_util.rs",
+  // "spec" as the production noun SPECIFICATION. The shared list took only
+  // `*_spec.rb`, so these stay real source even though the selector calls them
+  // tests. An extension-open `*_spec.*` would have dropped all four from
+  // context packs silently.
+  "src/api_spec.ts",
+  "src/openapi_spec.py",
+  "internal/wire_spec.go",
+  "src/protocol_spec.rs",
 ];
 
 /** Scaffold but NOT a test: bench and mock files. The packer still treats these
@@ -161,5 +193,10 @@ describe("LIKE underscore escaping is real", () => {
     expect(isTestFile("pkg/testX.py")).toBe(false);
     expect(isTestFile("pkg/walkXtest.go")).toBe(false);
     expect(isTestFile("XXtests__/a.ts")).toBe(false);
+    // The adopted `*_test.*` / `*_spec.*` rows each carry an underscore too, so
+    // they double the surface for this failure: unescaped, they would match any
+    // single character before `test.` / `spec.`.
+    expect(isTestFile("src/aXtest.ts")).toBe(false);
+    expect(isTestFile("src/aXspec.rb")).toBe(false);
   });
 });

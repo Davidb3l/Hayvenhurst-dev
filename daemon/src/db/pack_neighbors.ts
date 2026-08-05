@@ -1,11 +1,22 @@
 /**
- * THE SHARED NEIGHBOR PASSES: §3 callee neighbors and §4 referenced entities,
- * plus the small node predicates they are written against.
+ * THE SHARED NEIGHBOR PASSES: §3 callee neighbors, §4 referenced entities, §5
+ * opt-in callers and §6 opt-in cross-file imported symbols, plus the small node
+ * predicates they are written against.
  *
  * Carved out of `context_pack.ts` verbatim. Both single-target and multi-root
  * builders run these identical passes over a `NeighborPassState`; keeping them
  * in one module (as they already were in one region of the old file) is what
  * stops the two entry points from drifting apart again.
+ *
+ * §5 and §6 arrived here LAST, and for exactly the reason this module exists.
+ * They had been written only on the single-target builder, so the multi-root
+ * entry point ACCEPTED `maxCallers`/`importedSymbols` in its shared
+ * `ContextPackOptions` and silently discarded both: an opted-in caller got an
+ * empty result and no note, and `buildContextPackForChange` inherited the same
+ * hole by delegation. Generalizing each guard from one target to the ROOT SET
+ * (the same move §3/§4 already made) is what makes one implementation serve
+ * both, and it degenerates exactly to the previous single-target behavior at
+ * root-set size 1.
  */
 // The test-file predicate is SHARED with the fts scaffold-ranking penalty (both
 // are generated from one pattern list) so the packer's neighbor filter and
@@ -14,6 +25,7 @@
 // let Python/Go/Rust tests through as if they were real source.
 import { isTestFile } from "../util/test_files.ts";
 import { IMPORT_KIND, isCallKind } from "./graph_walk.ts";
+import { collectImportedSymbols } from "./imported_symbol.ts";
 import { sliceNode } from "./pack_slicing.ts";
 import type { ContextSlice } from "./pack_types.ts";
 import type { Db, NodeRow } from "./queries.ts";
@@ -278,5 +290,134 @@ export function addRefNeighbors(
       if (refAdded >= st.maxNeighbors) break;
       tryAddRef(r);
     }
+  }
+}
+
+/**
+ * The dedupe set §5 and §6 work against: every node id ALREADY emitted as a
+ * slice, recomputed from `st.slices` rather than read from `st.addedIds`.
+ *
+ * This is deliberate and is the shape both passes have always had. `addedIds`
+ * is the §3/§4 working set and is not populated when those passes are skipped
+ * (`neighbors:false`, or `maxNeighbors:0`), whereas §5/§6 run regardless of
+ * that gate. Deriving from the emitted slices is therefore the one source that
+ * is correct on every path. Header slices carry `id:null` and drop out, so only
+ * target/callee/ref/caller ids can collide.
+ */
+function emittedIds(st: NeighborPassState): Set<string> {
+  return new Set(st.slices.map((s) => s.id).filter((x): x is string => x !== null));
+}
+
+/**
+ * §5 CALLERS: OPT-IN 1-hop INCOMING-caller neighbors (default OFF). Mirrors the
+ * §3 callee pass exactly (same dangler/module/test/overlap guards, same
+ * weight-desc-then-id-asc ranking) but over `db.incoming` (symbols that CALL a
+ * root), and tagged `via:"caller"`. This recovers the case the callee/ref passes
+ * structurally CAN'T: a target whose load-bearing behavior is supplied BY its
+ * caller (a higher-order function handed a lambda, a callback wired at the call
+ * site).
+ *
+ * Weights are SUMMED across roots and the cap is shared across the combined
+ * caller set, exactly as §3 does for callees, so a multi-root pack stays bounded
+ * rather than paying `maxCallers` per root. Skipped entirely when `maxCallers`
+ * is 0/undefined, which is what keeps the default pack byte-identical to the
+ * pre-caller-hop behavior on both entry points.
+ */
+export function addCallerNeighbors(st: NeighborPassState, maxCallers: number): void {
+  if (maxCallers <= 0) return;
+  const rootIsTest = anyRootIsTest(st);
+  const addedIds = emittedIds(st);
+  const byCaller = new Map<string, number>();
+  for (const root of st.roots) {
+    for (const e of st.db.incoming(root.id)) {
+      // An edge from one root into another is not a neighbor; both bodies are
+      // already target slices. At root-set size 1 this is the old
+      // `e.src === target.id` test.
+      if (!isCallKind(e.kind) || st.rootIds.has(e.src)) continue;
+      byCaller.set(e.src, (byCaller.get(e.src) ?? 0) + e.weight);
+    }
+  }
+  const ranked = [...byCaller.entries()].sort(
+    (a, b) => b[1] - a[1] || a[0].localeCompare(b[0]),
+  );
+  let added = 0;
+  for (const [callerId, weight] of ranked) {
+    if (added >= maxCallers) break;
+    const caller = st.db.getNode(callerId);
+    // Same guards as the callee pass: skip danglers (edge from an unresolved
+    // id), whole-file modules, call edges from a test file (not a real
+    // dependency when the roots are real source), and any caller already in the
+    // slice set (dedupe by id against everything added so far).
+    //
+    // The test guard reads DIFFERENTLY on this pass and is deliberately kept:
+    // real source genuinely IS called by its tests, so dropping test callers can
+    // leave the opt-in caller hop empty for a well-tested symbol. It is retained
+    // anyway because the pass exists to recover behavior SUPPLIED BY a caller (a
+    // lambda handed to a higher-order function), and a test's stub argument is
+    // exactly the wrong thing to hand the model as if it were production
+    // behavior. Widening `isTestFile` to Python/Go/Rust makes this filter fire in
+    // repos where it previously never did.
+    if (!caller || isModuleNode(caller)) continue;
+    if (isTestFile(caller.file) && !rootIsTest) continue;
+    if (overlapsAnyRoot(st, caller)) continue; // straddles a root → already shown
+    if (addedIds.has(callerId)) continue; // already a target/callee/ref slice
+    const slice = sliceNode(caller, "neighbor", st.read);
+    if (!slice) continue;
+    slice.via = "caller";
+    slice.weight = weight;
+    st.slices.push(slice);
+    addedIds.add(callerId);
+    added++;
+  }
+  if (ranked.length > added) {
+    st.notes.push(
+      `${ranked.length - added} more caller(s) omitted (cap ${maxCallers}, or unresolved/module/dup)`,
+    );
+  }
+}
+
+/**
+ * §6 IMPORTED SYMBOLS: OPT-IN cross-file non-node definitions (default OFF).
+ *
+ * The §4 ref pass only inlines indexed type-like NODES; a root that names an
+ * imported `const`/object/`type` (a dispatch table, a CONFIG) defined in another
+ * file has no node, so it is invisible to every rung. When opted in,
+ * `collectImportedSymbols` text-extracts those declarations from each root
+ * file's imported source files and returns them as `via:"ref"` slices.
+ *
+ * Roots are visited in emission order against ONE shared dedupe set and ONE
+ * shared budget, so the same imported declaration reached from two roots is
+ * added once and the total is capped like every other pass. `rootTexts` is keyed
+ * by root id because the scan is over each root's OWN body text, not the
+ * concatenation: an identifier only counts as imported-and-used where it is
+ * actually named. Skipped entirely when off, so the default pack is unchanged.
+ */
+export function addImportedSymbolNeighbors(
+  st: NeighborPassState,
+  opts: {
+    repoRoot: string;
+    /** Root id → that root's target-slice text. */
+    rootTexts: ReadonlyMap<string, string>;
+    /** Shared cap across all roots. */
+    maxSymbols: number;
+  },
+): void {
+  const { repoRoot, rootTexts, maxSymbols } = opts;
+  if (maxSymbols <= 0) return;
+  const addedIds = emittedIds(st);
+  let added = 0;
+  for (const root of st.roots) {
+    if (added >= maxSymbols) break;
+    if (!root.file) continue;
+    const text = rootTexts.get(root.id) ?? "";
+    if (!text) continue;
+    const extra = collectImportedSymbols(st.db, repoRoot, root, text, addedIds, {
+      maxSymbols: maxSymbols - added,
+    });
+    for (const s of extra) st.slices.push(s);
+    added += extra.length;
+  }
+  if (added > 0) {
+    st.notes.push(`+${added} cross-file imported symbol(s) (opt-in)`);
   }
 }

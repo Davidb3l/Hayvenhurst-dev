@@ -32,17 +32,17 @@
  *   - `pack_types.ts`       : `ContextSlice` / `ContextPack` / `ContextPackOptions`.
  *   - `pack_containment.ts` : the containment and admissibility gate.
  *   - `pack_slicing.ts`     : segmentation, module scoping, the file reader/slicer.
- *   - `pack_neighbors.ts`   : the shared §3 callee and §4 referenced-entity passes.
+ *   - `pack_neighbors.ts`   : the shared neighbor passes: §3 callees, §4
+ *                             referenced entities, §5 opt-in callers, §6 opt-in
+ *                             cross-file imported symbols.
  * Consumers import from here exactly as before; nothing moved out of view.
  */
-import { isTestFile } from "../util/test_files.ts";
-import { isCallKind, resolveNodeId } from "./graph_walk.ts";
-import { collectImportedSymbols } from "./imported_symbol.ts";
+import { resolveNodeId } from "./graph_walk.ts";
 import {
   addCalleeNeighbors,
+  addCallerNeighbors,
+  addImportedSymbolNeighbors,
   addRefNeighbors,
-  isModuleNode,
-  overlapsTarget,
   type NeighborPassState,
 } from "./pack_neighbors.ts";
 import {
@@ -194,87 +194,19 @@ export function buildContextPack(
     });
   }
 
-  // 5. CALLERS — OPT-IN 1-hop INCOMING-caller neighbors (default OFF). Mirrors
-  //    the §3 callee pass exactly — same dangler/module/test/overlap guards,
-  //    same weight-desc-then-id-asc ranking — but over `db.incoming` (symbols
-  //    that CALL the target) and tagged `via:"caller"`. This recovers the case
-  //    the callee/ref passes structurally CAN'T: a target whose load-bearing
-  //    behavior is supplied BY its caller (a higher-order function handed a
-  //    lambda, a callback wired at the call site). Dedupes by id against every
-  //    slice already added (header has id:null, so only target/callee/ref ids
-  //    collide). Skipped entirely when maxCallers is 0/undefined → the default
-  //    pack is byte-identical to the pre-caller-hop behavior.
-  if (maxCallers > 0) {
-    const addedIds = new Set(
-      slices.map((s) => s.id).filter((x): x is string => x !== null),
-    );
-    const byCaller = new Map<string, number>();
-    for (const e of db.incoming(target.id)) {
-      if (!isCallKind(e.kind) || e.src === target.id) continue;
-      byCaller.set(e.src, (byCaller.get(e.src) ?? 0) + e.weight);
-    }
-    const ranked = [...byCaller.entries()].sort(
-      (a, b) => b[1] - a[1] || a[0].localeCompare(b[0]),
-    );
-    let added = 0;
-    for (const [callerId, weight] of ranked) {
-      if (added >= maxCallers) break;
-      const caller = db.getNode(callerId);
-      // Same guards as the callee pass: skip danglers (edge from an unresolved
-      // id), whole-file modules, call edges from a test file (not a real
-      // dependency when the target is real source), and any caller already in
-      // the slice set (dedupe by id against everything added so far).
-      //
-      // The test guard reads DIFFERENTLY on this pass and is deliberately kept:
-      // real source genuinely IS called by its tests, so dropping test callers
-      // can leave the opt-in caller hop empty for a well-tested symbol. It is
-      // retained anyway because the pass exists to recover behavior SUPPLIED BY
-      // a caller (a lambda handed to a higher-order function), and a test's
-      // stub argument is exactly the wrong thing to hand the model as if it
-      // were production behavior. Widening `isTestFile` to Python/Go/Rust makes
-      // this filter fire in repos where it previously never did.
-      if (!caller || isModuleNode(caller)) continue;
-      if (isTestFile(caller.file) && !isTestFile(target.file)) continue;
-      if (overlapsTarget(caller, target)) continue; // straddles target → already shown
-      if (addedIds.has(callerId)) continue; // already a target/callee/ref slice
-      const slice = sliceNode(caller, "neighbor", read);
-      if (!slice) continue;
-      slice.via = "caller";
-      slice.weight = weight;
-      slices.push(slice);
-      addedIds.add(callerId);
-      added++;
-    }
-    if (ranked.length > added) {
-      notes.push(
-        `${ranked.length - added} more caller(s) omitted (cap ${maxCallers}, or unresolved/module/dup)`,
-      );
-    }
-  }
-
-  // 6. IMPORTED SYMBOLS — OPT-IN cross-file non-node definitions (default OFF).
-  //    The §4 ref pass only inlines indexed type-like NODES; a target that names
-  //    an imported `const`/object/`type` (a dispatch table, a CONFIG) defined in
-  //    another file has no node, so it's invisible to every rung. When opted in,
-  //    `collectImportedSymbols` text-extracts those declarations from the target
-  //    file's imported source files and returns them as `via:"ref"` slices.
-  //    Skipped entirely when off → the default pack is byte-identical.
-  if (importedSymbols && target.file) {
-    const addedIds = new Set(
-      slices.map((s) => s.id).filter((x): x is string => x !== null),
-    );
-    const extra = collectImportedSymbols(
-      db,
+  // 5 + 6. OPT-IN PASSES: the caller hop then cross-file imported symbols, both
+  //    the SHARED implementation over the same single-element root set. Neither
+  //    is gated on `includeNeighbors`/`maxNeighbors`: they carry their own knobs
+  //    (`maxCallers`, `importedSymbols`) and are skipped entirely when those are
+  //    at their defaults, which is what keeps the default pack byte-identical to
+  //    the pre-caller-hop behavior.
+  addCallerNeighbors(passState, maxCallers);
+  if (importedSymbols) {
+    addImportedSymbolNeighbors(passState, {
       repoRoot,
-      target,
-      targetSlice?.text ?? "",
-      addedIds,
-      { maxSymbols: maxNeighbors },
-    );
-    for (const s of extra) slices.push(s);
-    if (extra.length > 0) {
-      notes.push(`+${extra.length} cross-file imported symbol(s) (opt-in)`);
-    }
+      rootTexts: new Map([[target.id, targetSlice?.text ?? ""]]),
+      maxSymbols: maxNeighbors,
+    });
   }
 
   let lineCount = 0;
@@ -430,6 +362,13 @@ export function buildModuleFrame(
  * input order, then deps weight-desc then id-asc. The dangler/module/test/
  * overlap guards from {@link buildContextPack} are reused.
  *
+ * The OPT-IN passes are honored here too: `maxCallers` adds the §5 caller hop
+ * and `importedSymbols` adds the §6 cross-file imported-symbol pass, both over
+ * the whole root set and both sharing one cap. They used to be accepted and
+ * silently dropped on this path, so an opted-in caller got nothing back and no
+ * note saying why; the passes now live in `pack_neighbors.ts` beside §3/§4 so
+ * the two entry points cannot drift apart on them again.
+ *
  * Returns null only if NO id resolves. A single-element `rawIds` produces a pack
  * equivalent to {@link buildContextPack} for that id.
  */
@@ -447,6 +386,8 @@ export function buildContextPackForSymbols(
     DEFAULT_MAX_REF_SLICE_LINES,
     1,
   );
+  const maxCallers = countOpt(opts.maxCallers, DEFAULT_MAX_CALLERS);
+  const importedSymbols = opts.importedSymbols === true;
 
   const read = makeFileReader(repoRoot);
   const slices: ContextSlice[] = [];
@@ -522,17 +463,17 @@ export function buildContextPackForSymbols(
   //    entry point uses, run over the full root set. Dedupe set starts at every
   //    id already a slice (the roots); the (file,range) overlap test inside the
   //    passes keeps a callee that IS a root (or nested in one) from re-entering.
+  const passState: NeighborPassState = {
+    db,
+    read,
+    slices,
+    notes,
+    roots,
+    rootIds,
+    addedIds: new Set<string>(rootIds),
+    maxNeighbors,
+  };
   if (includeNeighbors && maxNeighbors > 0) {
-    const passState: NeighborPassState = {
-      db,
-      read,
-      slices,
-      notes,
-      roots,
-      rootIds,
-      addedIds: new Set<string>(rootIds),
-      maxNeighbors,
-    };
     addCalleeNeighbors(passState, "unresolved/module/dup");
     // Refs are searched against the CONCATENATION of every root body, and
     // scanned same-file over each root file (sorted) before going cross-file.
@@ -540,6 +481,25 @@ export function buildContextPackForSymbols(
       rootText: roots.map((r) => targetSlices.get(r.id)?.text ?? "").join("\n"),
       rootFiles: [...rootsByFile.keys()].sort(),
       maxRefSliceLines,
+    });
+  }
+
+  // 5 + 6. OPT-IN PASSES: the caller hop then cross-file imported symbols, the
+  //    SAME shared implementation the single-target entry point runs, here over
+  //    the full root set: caller weights are summed across roots and both passes
+  //    share ONE cap, so an N-root pack stays as bounded as a 1-root one. These
+  //    options were previously ACCEPTED and silently discarded on this path.
+  //    Like on the single-target path they are NOT gated on `includeNeighbors`/
+  //    `maxNeighbors`; they carry their own knobs, and at those knobs' defaults
+  //    neither pass emits anything, so a pack built without them is unchanged.
+  addCallerNeighbors(passState, maxCallers);
+  if (importedSymbols) {
+    addImportedSymbolNeighbors(passState, {
+      repoRoot,
+      rootTexts: new Map(
+        roots.map((r) => [r.id, targetSlices.get(r.id)?.text ?? ""] as const),
+      ),
+      maxSymbols: maxNeighbors,
     });
   }
 
@@ -595,6 +555,12 @@ export function buildContextPackForChange(
   regions: ChangeRegion[],
   opts: ContextPackOptions = {},
 ): ContextPack | null {
+  // Read here only to tell the LANE 3 fallback whether opt-in sections were
+  // requested; `opts` itself is forwarded whole to the multi-root builder, which
+  // is where both passes actually run.
+  const maxCallers = countOpt(opts.maxCallers, DEFAULT_MAX_CALLERS);
+  const importedSymbols = opts.importedSymbols === true;
+
   // Classify each region against the file's non-module nodes.
   const rows = db.handle
     .query<
@@ -821,6 +787,25 @@ export function buildContextPackForChange(
       notes.push(
         `pack was not smaller than \`${file}\` — returned the whole file (lossless, never worse than reading it)`,
       );
+      // HONESTY NOTE for the opt-in passes. The fallback replaces the assembled
+      // slices with ONE file, and the §5 caller / §6 imported-symbol slices are
+      // exactly the ones that can live in OTHER files, so an opted-in caller can
+      // get back a pack with none of what it opted into. That is a real loss of
+      // information, not just of tokens: "never worse than reading the file" is a
+      // TOKEN guarantee, and it was written when every slice came from the target
+      // file or a cheap same-file dep.
+      //
+      // The fallback rule itself is deliberately NOT changed here: `worthwhile`
+      // already governs packs built with no options at all, so re-deciding when
+      // it fires would move output for callers who never asked for any of this.
+      // Saying so in `notes` is the part that is safe and is strictly better than
+      // the silent drop. Only reachable when an option was actually passed, so a
+      // no-options pack is unaffected.
+      if (maxCallers > 0 || importedSymbols) {
+        notes.push(
+          `the opt-in caller/imported-symbol slices were dropped by that fallback (the whole file is returned instead)`,
+        );
+      }
     }
   }
 

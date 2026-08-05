@@ -189,7 +189,50 @@ a green-to-red demonstration.
 
 ---
 
-## 10. Affected-tests does not follow `export *` re-export hops
+## 10. The whole-file fallback can discard the slices an opt-in pass added
+
+**What.** A pack that is not smaller than simply reading the anchor file is
+replaced by that file (the "never worse than reading the file" rule). The two
+opt-in passes, `maxCallers` and `importedSymbols`, add slices that by definition
+live in OTHER files, so switching them on can push a pack past the threshold and
+trigger the very fallback that then throws those slices away.
+
+**Cost.** A caller asks for the incoming-caller hop and receives a small file
+containing none of it. The token guarantee still holds; the INFORMATION
+guarantee does not, and the two stopped being the same thing once a pack could
+legitimately span several files. A note now says so whenever an option was
+passed, so the pack is no longer silently misleading, but the caller still does
+not get what it asked for.
+
+**Why not fixed.** The obvious fix is to skip the fallback when the pack holds
+slices outside the anchor file. `worthwhile` also governs every pack built with
+no options at all, so changing when it fires moves output for callers who asked
+for none of this. That is a deliberate behavior change and belongs in its own
+change with its own before-and-after measurement, not bundled into the fix that
+made the options work.
+
+---
+
+## 11. The imported-symbol pass costs one uncached scan per root
+
+**What.** `importedSymbols` runs `isIndexedNode` (a leading-wildcard `LIKE`) and
+re-reads files once per root. Measured on a synthetic fixture: 9 ms at one root,
+533 ms at sixty.
+
+**Cost.** None today, and that is load-bearing: no in-repo caller sets the
+option, and the MCP surface refuses it. The exposure is latent, because
+`contextForChange` does not cap how many entity ids a change region yields, so a
+whole-file region on a large file could produce thousands of roots.
+
+**Why not fixed.** Memoizing `isIndexedNode` and the file reader across roots is
+the fix and it lives in `db/imported_symbol.ts`. It is the gate on exposing
+these knobs through MCP, recorded there in `UNSUPPORTED_PACK_OPTS`. This module
+has been bitten by exactly this shape before (the 76-second bitmap incident), so
+the cost is being written down before it is reachable rather than after.
+
+---
+
+## 12. Affected-tests does not follow `export *` re-export hops
 
 **What.** The affected-tests selector walks the import graph to find tests
 reachable from a change. A re-export chain that passes through `export * from`

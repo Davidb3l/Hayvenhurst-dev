@@ -134,12 +134,17 @@ const CHANGE_REGION_SCHEMA = {
  * `fenceLangFor` and the object-valued `prior` are handled separately).
  *
  * `maxCallers` and `importedSymbols` are NOT here even though
- * {@link ContextPackOptions} carries them. Both tools route through
- * `buildContextPackForSymbols` (the multi-root path), and only the SINGLE-symbol
- * `buildContextPack` implements the caller hop and the imported-symbol pass — so
- * advertising them here promised behavior the server silently could not deliver
- * (verified: `importedSymbols: true` returned byte-identical output to `false`).
- * See {@link UNSUPPORTED_PACK_OPTS}, which refuses them loudly instead.
+ * {@link ContextPackOptions} carries them. They are now IMPLEMENTED on the
+ * multi-root path both tools use, so the original reason (only the single-symbol
+ * builder had them) is no longer true. They stay refused for two different
+ * reasons, both recorded in KNOWN_ISSUES:
+ *   - the whole-file fallback can discard exactly the slices these passes add,
+ *     because those slices live outside the anchor file, and
+ *   - the imported-symbol pass costs one uncached scan per root (measured 9ms at
+ *     one root, 533ms at sixty), while `contextForChange` does not cap its root
+ *     count.
+ * Opening these knobs to MCP clients is gated on both. See
+ * {@link UNSUPPORTED_PACK_OPTS}, which refuses them loudly rather than silently.
  */
 const PACK_OPT_PROPERTIES = {
   neighbors: {
@@ -170,11 +175,11 @@ const PACK_OPT_PROPERTIES = {
  *  prompt it believes contains context it does not. */
 const UNSUPPORTED_PACK_OPTS: Record<string, string> = {
   maxCallers:
-    "the incoming-caller hop is implemented only on the single-symbol pack path, " +
-    "which neither MCP tool uses",
+    "the incoming-caller hop is implemented but not yet exposed here: the " +
+    "whole-file fallback can discard the cross-file slices it adds",
   importedSymbols:
-    "cross-file imported non-node symbols are implemented only on the " +
-    "single-symbol pack path, which neither MCP tool uses",
+    "cross-file imported non-node symbols are implemented but not yet exposed " +
+    "here: the pass costs one uncached scan per root and the root count is uncapped",
 };
 
 /** The `prior` continuation input. Opaque to the client EXCEPT that it round-trips

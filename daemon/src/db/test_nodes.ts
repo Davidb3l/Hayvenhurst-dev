@@ -82,6 +82,29 @@ export interface TestHandle {
  * Keep them in sync in SPIRIT (a convention added to one is usually worth
  * adding to the other) but do not merge them.
  *
+ * THE DIVERGENCE LEDGER (the two lists were compared mechanically over a
+ * cross-language corpus in `tests/win_b_glob_divergence.test.ts`, which PINS the
+ * result; the twin of this note lives beside `TEST_GLOBS`):
+ *   - `_test.` is no longer divergent: the shared list adopted it as
+ *     `*_test.*`, because `src/cookie_test.ts` and `src/parser_test.rs` are
+ *     scaffolding to the packer too, not just runnable to a runner.
+ *   - `_spec.` is now only PARTIALLY divergent: the shared list took
+ *     `*_spec.rb` (RSpec) and nothing wider, because outside Ruby "spec" means
+ *     SPECIFICATION and `src/openapi_spec.py` / `internal/wire_spec.go` are
+ *     real source. This list keeps the wide form; it can afford to.
+ *   - BARE `test_` stays divergent and stays HERE only. Unanchored it also
+ *     matches `src/greatest_hits.ts`, `src/protest_utils.py` and
+ *     `src/attest_helpers.go`. That is tolerable for detection, which is a
+ *     deliberate UNION and is re-filtered downstream (`isCollectableTest`, and
+ *     the vitest branch of {@link classifyTest} which nulls a runnable whose
+ *     file is not itself a test path), but it would be a silent dependency
+ *     DELETION in the packer, so the shared list keeps the anchored
+ *     `test_*.py` form instead. Do not "fix the drift" by copying `test_`
+ *     across; it is the one pattern here that is wrong to share.
+ *   - This list matching `src/test_helpers.go` / `src/test_util.rs` also stays
+ *     divergent: those compile into their package, so they are production
+ *     source to the packer while still being worth reaching here.
+ *
  * These are the conventions across the languages Hayven parses: directory
  * markers (`/tests/`, `__tests__/`), filename prefixes (`test_foo.py`), and
  * filename infixes/suffixes (`foo.test.ts`, `foo_test.go`, `foo.spec.ts`). The
@@ -110,18 +133,34 @@ function normalizePath(file: string): string {
 
 /**
  * True when `file` is a test file by PATH. A file matches when any pattern is a
- * substring of the normalized path, OR the path STARTS with `test/` / `tests/`
- * (the no-leading-slash case the `/tests/` substring pattern can't see).
+ * substring of the normalized path, OR the path STARTS with `test/`, `tests/`
+ * or `__tests__/` (the no-leading-slash case the `/tests/` substring pattern
+ * can't see).
  *
  * `patterns` REPLACES {@link DEFAULT_TEST_PATH_PATTERNS} when provided (verbatim
  * — the caller's config wins), so a project can narrow or widen what counts as
- * a test location without code changes.
+ * a test location without code changes. With ONE honest caveat: the three
+ * leading-dir prefixes below are hard-coded and no config can switch them off,
+ * so `patterns` narrows everything except "lives in a root test dir". That was
+ * already true of `test/` and `tests/`; `__tests__/` joins them.
  */
 function isTestFile(file: string, patterns: readonly string[]): boolean {
   const path = normalizePath(file);
   // Leading-dir case: a repo-relative path like `tests/foo.py` has no leading
   // slash, so the `/tests/` substring never fires — check the prefix directly.
-  if (path.startsWith("test/") || path.startsWith("tests/")) return true;
+  // `__tests__/` was MISSING here until the divergence audit: a repo-root
+  // `__tests__/router.ts` (an ordinary JS layout) was a test to the shared
+  // `util/test_files.ts` list and NOT to this one, so the packer filtered it
+  // while affected-tests never selected it. That was the selector being wrong,
+  // not a difference worth keeping. The nested form still comes from the
+  // `/__tests__/` pattern.
+  if (
+    path.startsWith("test/") ||
+    path.startsWith("tests/") ||
+    path.startsWith("__tests__/")
+  ) {
+    return true;
+  }
   return patterns.some((p) => path.includes(p));
 }
 
