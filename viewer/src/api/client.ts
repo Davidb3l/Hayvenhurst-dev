@@ -58,23 +58,75 @@ function withProject(path: string): string {
   return `${path}${sep}project=${encodeURIComponent(alias)}`;
 }
 
+// Daemon liveness probe. A "live" verdict is cached for the page lifetime; a
+// "mock" verdict EXPIRES (REPROBE_AFTER_MS) so a slow-starting daemon gets
+// picked up by a later query instead of the page silently serving fabricated
+// data until a manual reload. Each probe retries with growing timeouts before
+// committing to mock, and mock mode is surfaced in the UI: it flips the
+// `data-hv-mock` attribute on <html>, which shows the "demo data" banner in
+// Base.astro (styled in styles/global.css).
 let _liveProbe: Promise<boolean> | null = null;
+let _probeOwner: symbol | null = null; // identifies the probe allowed to commit side effects
+let _mockVerdictExpiry = 0; // epoch ms after which a mock verdict is stale
+
+const PROBE_TIMEOUTS_MS = [250, 500, 1000]; // per-attempt fetch timeouts
+const PROBE_BACKOFF_MS = 300; // pause between attempts, multiplied by attempt #
+const REPROBE_AFTER_MS = 5000;
+
+function setMockActive(active: boolean): void {
+  try {
+    if (typeof document === "undefined") return;
+    if (active) document.documentElement.setAttribute("data-hv-mock", "");
+    else document.documentElement.removeAttribute("data-hv-mock");
+  } catch {
+    /* no DOM, ignore */
+  }
+}
+
+async function probeOnce(timeoutMs: number): Promise<boolean> {
+  try {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), timeoutMs);
+    const r = await fetch(API_BASE + "/api/health", { signal: ctl.signal });
+    clearTimeout(t);
+    return r.ok;
+  } catch {
+    return false;
+  }
+}
 
 async function isDaemonLive(): Promise<boolean> {
   if (typeof window === "undefined") return false; // SSG: always mock
-  if (_liveProbe) return _liveProbe;
-  _liveProbe = (async () => {
-    try {
-      const ctl = new AbortController();
-      const t = setTimeout(() => ctl.abort(), 250);
-      const r = await fetch(API_BASE + "/api/health", { signal: ctl.signal });
-      clearTimeout(t);
-      return r.ok;
-    } catch {
-      return false;
+  if (_liveProbe) {
+    const cached = _liveProbe;
+    const live = await cached;
+    if (live || Date.now() < _mockVerdictExpiry) return live;
+    // Mock verdict has expired. Several callers can resume past the await
+    // above together; only the first may start the re-probe, the rest join
+    // whatever probe it installed (otherwise each would fire its own retry
+    // ladder, and a straggler could overwrite the winner's verdict/banner).
+    if (_liveProbe !== cached) return _liveProbe;
+  }
+  const owner = Symbol("hv-probe");
+  _probeOwner = owner;
+  const probe = (async () => {
+    for (let i = 0; i < PROBE_TIMEOUTS_MS.length; i++) {
+      if (i > 0) await new Promise((r) => setTimeout(r, PROBE_BACKOFF_MS * i));
+      if (await probeOnce(PROBE_TIMEOUTS_MS[i]!)) {
+        if (_probeOwner === owner) setMockActive(false);
+        return true;
+      }
     }
+    // Only the probe that still owns the cache slot may commit the verdict
+    // side effects; a superseded probe must not flip the banner or expiry.
+    if (_probeOwner === owner) {
+      _mockVerdictExpiry = Date.now() + REPROBE_AFTER_MS;
+      setMockActive(true);
+    }
+    return false;
   })();
-  return _liveProbe;
+  _liveProbe = probe;
+  return probe;
 }
 
 // Fetches `path` and returns the parsed JSON. Two paths:

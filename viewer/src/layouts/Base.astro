@@ -49,6 +49,12 @@ const navItems: ReadonlyArray<{ href: string; label: string; key: Props["current
   </head>
   <body>
     <a class="hv-skip-link" href="#main">Skip to main content</a>
+    <!-- Hidden unless the daemon probe fails: src/api/client.ts sets
+         data-hv-mock on <html> when queries fall back to the built-in mock
+         dataset, and the CSS in global.css reveals this banner. -->
+    <div class="hv-mock-banner" role="status">
+      <span class="mono">[demo data]</span> daemon unreachable, showing built-in sample data
+    </div>
     <nav class="hv-nav" aria-label="Primary">
       <a class="brand" href="/"><span class="dot" aria-hidden="true"></span>Hayvenhurst</a>
       <div class="links">

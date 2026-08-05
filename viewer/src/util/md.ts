@@ -24,6 +24,22 @@ function esc(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ESC[c] ?? c);
 }
 
+// Reverses esc(). Wiki-link ids are captured AFTER escaping, so building a
+// URL from them directly would percent-encode the entity text (`&amp;` →
+// `%26amp%3B`), a double-encoded, wrong /node/ link. Single regex pass, so
+// the `&` produced for `&amp;` can never be re-consumed by a second entity.
+const UNESC: Record<string, string> = {
+  "&amp;": "&",
+  "&lt;": "<",
+  "&gt;": ">",
+  "&quot;": '"',
+  "&#39;": "'",
+};
+
+function unesc(s: string): string {
+  return s.replace(/&(?:amp|lt|gt|quot|#39);/g, (e) => UNESC[e] ?? e);
+}
+
 function inline(s: string): string {
   let out = esc(s);
   // wiki links first (operate on escaped text — brackets are safe)
@@ -36,7 +52,9 @@ function inline(s: string): string {
       const label = safe.replace(/^\?:?/, "").replace(/^(\.\.\/)+/, "");
       return `<span class="hv-unresolved" title="Unresolved reference — target file not indexed in this repo">${label}</span>`;
     }
-    return `<a href="/node/${encodeURIComponent(safe)}">${safe}</a>`;
+    // Encode the RAW id for the href (safe is HTML-escaped display text;
+    // URL-encoding it would double-encode ids containing & or quotes).
+    return `<a href="/node/${encodeURIComponent(unesc(safe))}">${safe}</a>`;
   });
   // emphasis — **strong**, then _em_ / *em*. The underscore form requires a
   // non-word char on both sides so snake_case identifiers (my_var) stay literal.

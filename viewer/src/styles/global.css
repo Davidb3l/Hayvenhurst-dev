@@ -186,6 +186,24 @@ h3::before { content: "// "; color: var(--fg-faint); }
   outline-offset: 2px;
 }
 
+/* ---------- mock-data banner ----------
+ * Hidden by default. src/api/client.ts sets data-hv-mock on <html> when the
+ * daemon probe fails and queries fall back to the built-in mock dataset, so
+ * the user never mistakes fabricated nodes/stats for real data. Cleared
+ * automatically when a re-probe finds the daemon. */
+.hv-mock-banner { display: none; }
+[data-hv-mock] .hv-mock-banner {
+  display: block;
+  text-align: center;
+  padding: var(--space-2) var(--space-4);
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  color: var(--warn);
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--border-2);
+}
+.hv-mock-banner .mono { color: var(--warn); font-weight: 600; }
+
 /* ---------- nav ---------- */
 .hv-nav {
   display: flex; align-items: center; gap: 22px;

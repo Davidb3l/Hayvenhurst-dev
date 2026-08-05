@@ -4,6 +4,7 @@ import preact from "@astrojs/preact";
 import { readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
+import { computeOrphans } from "./src/build/prune-chunks.mjs";
 
 // Prune orphan JS chunks from the static client build. (BL-17 #2.)
 //
@@ -44,46 +45,19 @@ function pruneOrphanChunks() {
         };
         walk(distDir);
 
-        // NOTE: the name may contain DOTS. Astro 5 emitted hash-only chunks
-        // (`P4Fj0MHm.js`); Astro 7 emits `<name>.<hash>.js`
-        // (`SearchBox.BC2z29UO.js`). A dot-less character class matches the
-        // former and NOTHING in the latter, which made every HTML root come
-        // back empty, marked every chunk unreachable, and deleted the entire
-        // client bundle — a viewer that renders as dead static HTML while the
-        // build exits 0. Keep both shapes matchable.
-        const NAME = "[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*";
-        const chunkRe = new RegExp(`_a\\/(${NAME}\\.js)`, "g");
-        const localRe = new RegExp(`["'](?:\\.\\/|_a\\/)(${NAME}\\.js)["']`, "g");
-        /**
-         * @param {string} src
-         * @param {RegExp} re
-         * @returns {Set<string>}
-         */
-        const matchAll = (src, re) => {
-          /** @type {Set<string>} */
-          const out = new Set();
-          for (const m of src.matchAll(re)) if (m[1]) out.add(m[1]);
-          return out;
-        };
-
-        // BFS from HTML roots through each chunk's imports.
-        const roots = new Set();
-        for (const h of htmlFiles) {
-          for (const c of matchAll(readFileSync(h, "utf8"), chunkRe)) roots.add(c);
-        }
-        const reachable = new Set();
-        const stack = [...roots];
-        while (stack.length) {
-          const c = stack.pop();
-          if (reachable.has(c) || !assetFiles.includes(c)) continue;
-          reachable.add(c);
-          const src = readFileSync(join(assetsDir, c), "utf8");
-          for (const dep of matchAll(src, localRe)) stack.push(dep);
-        }
+        // BFS from HTML roots through each chunk's imports. The matching +
+        // reachability logic lives in src/build/prune-chunks.mjs so it is
+        // unit-tested against both Astro 5 (`P4Fj0MHm.js`) and Astro 7
+        // (`SearchBox.BC2z29UO.js`) chunk-name shapes; a dot-less pattern
+        // once deleted the entire client bundle (commit 85d232c).
+        const { orphans } = computeOrphans(
+          assetFiles,
+          htmlFiles.map((h) => readFileSync(h, "utf8")),
+          (name) => readFileSync(join(assetsDir, name), "utf8"),
+        );
 
         let freed = 0;
-        for (const f of assetFiles) {
-          if (reachable.has(f)) continue;
+        for (const f of orphans) {
           freed += statSync(join(assetsDir, f)).size;
           rmSync(join(assetsDir, f));
           logger.info(`pruned orphan chunk _a/${f}`);
@@ -133,16 +107,6 @@ export default defineConfig({
       modulePreload: { polyfill: false },
       rollupOptions: {
         output: {
-          // Keep filename hashes short to save a few bytes per HTML reference.
-          entryFileNames: "_a/[hash:8].js",
-          chunkFileNames: (info) => {
-            // Pin the renderer to a stable filename so build measurements can
-            // verify the PRD §12.3 "renderer stays under ~25KB" budget without
-            // grepping hashed chunks. Everything under src/graph/ ends up here.
-            if (info.name === "graph-renderer") return "_a/graph-renderer.js";
-            return "_a/[hash:8].js";
-          },
-          assetFileNames: "_a/[hash:8][extname]",
           manualChunks(id) {
             // Bundle the renderer modules (layout, render, interact, viewport,
             // lod) into a single chunk so the PRD §12.3 bundle budget for the
@@ -150,6 +114,35 @@ export default defineConfig({
             // GraphView island (toolbar, degradation panel, etc).
             if (/\/src\/graph\//.test(id)) return "graph-renderer";
             return undefined;
+          },
+        },
+      },
+    },
+    // Astro 7 builds the client bundle in a dedicated Vite "client"
+    // environment and layers its own `[name].[hash].js` naming ON TOP of any
+    // top-level rollupOptions.output, so filename overrides placed there are
+    // silently ignored. The environment-scoped output below is the one spread
+    // LAST in Astro's build config (see astro/dist/core/build/
+    // vite-build-config.js, client environment), so it is the only place these
+    // naming overrides are honored.
+    environments: {
+      client: {
+        build: {
+          rolldownOptions: {
+            output: {
+              // Keep filename hashes short to save a few bytes per HTML
+              // reference.
+              entryFileNames: "_a/[hash:8].js",
+              chunkFileNames: (info) => {
+                // Pin the renderer to a stable filename so build measurements
+                // can verify the PRD §12.3 "renderer stays under ~25KB" budget
+                // without grepping hashed chunks. Everything under src/graph/
+                // ends up here (see manualChunks above).
+                if (info.name === "graph-renderer") return "_a/graph-renderer.js";
+                return "_a/[hash:8].js";
+              },
+              assetFileNames: "_a/[hash:8][extname]",
+            },
           },
         },
       },

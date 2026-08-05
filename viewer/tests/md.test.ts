@@ -48,4 +48,19 @@ describe("renderMarkdown", () => {
     const out = renderMarkdown("[[my_node]]");
     expect(out).toContain(">my_node</a>");
   });
+
+  test("wiki link href encodes the RAW id, not the HTML-escaped one", () => {
+    const out = renderMarkdown("[[pkg/foo&bar]]");
+    // href must percent-encode the raw `&`, not the escaped `&amp;` text.
+    expect(out).toContain('href="/node/pkg%2Ffoo%26bar"');
+    expect(out).not.toContain("%26amp%3B");
+    // display text stays HTML-escaped
+    expect(out).toContain(">pkg/foo&amp;bar</a>");
+  });
+
+  test("wiki link href encodes raw quotes", () => {
+    const out = renderMarkdown(`[[say"hi"]]`);
+    expect(out).toContain(`href="/node/say%22hi%22"`);
+    expect(out).not.toContain("%26quot%3B");
+  });
 });
