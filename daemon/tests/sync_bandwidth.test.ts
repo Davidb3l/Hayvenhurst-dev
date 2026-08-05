@@ -231,9 +231,15 @@ maybeDescribe("PRD §16(5): routine daily sync transfers <30 KB", () => {
     const ledger: BandwidthLedger = { requestBytes: 0, responseBytes: 0, roundTrips: 0 };
     await syncWithLedger(a, b, ledger);
     expect(ledger.roundTrips).toBe(1);
-    // Bodies are tiny (~150 B); with one round-trip's header overhead a real
+    // Bodies are tiny (~225 B); with one round-trip's header overhead a real
     // no-op probe is still well under 1 KB.
-    expect(payloadBytes(ledger)).toBeLessThan(300);
+    //
+    // Raised from 300 when RFC-001 §4 added the `peer` handshake block to
+    // `/api/sync/merkle`: a 32-hex writer ID plus a protocol number costs ~70 B
+    // on the ONE no-op round-trip. Deliberately still a tight bound rather than
+    // a slackened one — the point of this test is that a no-op sync stays
+    // negligible, and the §16(5) budget it defends is 30 KB.
+    expect(payloadBytes(ledger)).toBeLessThan(400);
     expect(realisticBytes(ledger)).toBeLessThan(1_000);
   });
 

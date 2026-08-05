@@ -11,12 +11,14 @@
 // CLI agree on.
 import { Elysia } from "elysia";
 
+import { writerIdToHex } from "../../crdt/hlc.ts";
 import { computeMerkle, computeRoots, type SegmentLeaf } from "../../crdt/merkle.ts";
 import {
   assertAcceptableSegmentDay,
   SegmentRejectedError,
   type CrdtType,
 } from "../../crdt/oplog.ts";
+import { recordPeer, SYNC_PROTOCOL_VERSION } from "../../crdt/peers.ts";
 import { CRDT_LIMITS } from "../../crdt/retention.ts";
 import type { ServerDependencies } from "../server.ts";
 
@@ -43,6 +45,34 @@ function isCrdtType(s: unknown): s is CrdtType {
   return typeof s === "string" && (s === "lww" || s === "gset" || s === "orset");
 }
 
+/**
+ * Learn WHO called us from a sync request body and record it (RFC-001 §4).
+ *
+ * This is the inbound half of peer identity, and the half that did not exist:
+ * `hayven sync` is outbound-only, so a responding daemon served segments to
+ * anyone and stayed permanently anonymous about it — it could not answer "who
+ * am I synced with?" for any peer that had only ever called IT.
+ *
+ * Deliberately best-effort and never fatal. A caller that omits
+ * `peer_writer_id` (an older `hayven sync`) or sends a malformed one is served
+ * exactly as before: `recordPeer` returns null and the exchange proceeds. This
+ * field records identity, it does NOT authorise anything, so refusing a request
+ * over it would break interop with every older peer to protect nothing.
+ */
+function recordInboundPeer(deps: ServerDependencies, body: unknown): void {
+  if (body === null || typeof body !== "object") return;
+  const raw = body as { peer_writer_id?: unknown; peer_protocol?: unknown };
+  if (raw.peer_writer_id === undefined) return;
+  recordPeer(deps.paths.peersDir, {
+    writerId: raw.peer_writer_id,
+    // An inbound caller's address is not a URL we can dial back (it is a
+    // client socket, and it may be behind NAT), so we record no URL and let
+    // `recordPeer` keep whatever a previous OUTBOUND sync learned.
+    protocol: typeof raw.peer_protocol === "number" ? raw.peer_protocol : null,
+    selfWriterId: writerIdToHex(deps.crdt.writer),
+  });
+}
+
 function isSafeSegmentName(s: string): boolean {
   // YYYY-MM-DD; defends against path traversal in the segment-bytes endpoint.
   // The shape regex alone (`^\d{4}-\d{2}-\d{2}$`) still rejects `..`, `/`, NUL
@@ -65,7 +95,19 @@ function isSafeSegmentName(s: string): boolean {
 export function syncRoutes(deps: ServerDependencies) {
   return new Elysia()
     .get("/api/sync/merkle", () => {
-      return computeRoots(deps.crdt.oplog);
+      // ADDITIVE (RFC-001 §4): the per-CRDT-type roots are unchanged and keep
+      // their top-level keys, so an older peer that reads `body.lww` etc. is
+      // unaffected. `peer` is a new sibling carrying THIS daemon's identity —
+      // the existing `writer_id`, never a second one, because two notions of
+      // "who am I" is the duplicate-decision-function shape that has already
+      // caused bugs here.
+      return {
+        ...computeRoots(deps.crdt.oplog),
+        peer: {
+          writer_id: writerIdToHex(deps.crdt.writer),
+          protocol: SYNC_PROTOCOL_VERSION,
+        },
+      };
     })
     .post("/api/sync/leaves", ({ body, set }) => {
       const raw = body as { type?: unknown } | null;
@@ -109,6 +151,11 @@ export function syncRoutes(deps: ServerDependencies) {
         set.status = 404;
         return { error: "segment not found", type: raw.type, path: raw.path };
       }
+      // Record only once we have actually SERVED something — same rule as
+      // `/push` below. A rejected or empty-handed request is an attempt, not an
+      // exchange, and enrolling a peer on the strength of a 400/404 would let a
+      // scanner populate the registry without ever syncing a byte.
+      recordInboundPeer(deps, raw);
       set.headers["content-type"] = "application/octet-stream";
       set.headers["x-segment-size"] = String(chunk.size);
       set.headers["x-segment-eof"] =
@@ -195,6 +242,10 @@ export function syncRoutes(deps: ServerDependencies) {
       for (const op of decoded) {
         if (deps.crdt.applyWireOpInMemory(op)) applied += 1;
       }
+      // Record only once the push actually LANDED. A refused push (bad segment
+      // day, oversized batch, undecodable bytes) returned above without
+      // touching the registry — those are attempts, not exchanges.
+      recordInboundPeer(deps, raw);
       return { ok: true, applied, total: decoded.length, persisted: true };
     });
 }

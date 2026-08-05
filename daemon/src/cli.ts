@@ -123,7 +123,7 @@ export const COMMANDS: readonly Command[] = [
   { name: "sync", group: "coordination", run: runSync,
     help: "sync <peer_url> [--peer-project <alias>]  Sync CRDT state with a peer" },
   { name: "crdt", group: "coordination", run: runCrdt,
-    help: "crdt [retention] [--json]  Op-log size, segment counts and growth-bound violations (it is never pruned)" },
+    help: "crdt [retention|peers] [--json]  Op-log size and growth bounds (never pruned); or the peers this project has synced with" },
   { name: "traces", group: "coordination", run: runTraces,
     help: "traces <id>                Runtime trace history for an entity" },
   { name: "remember", group: "coordination", run: runRemember,

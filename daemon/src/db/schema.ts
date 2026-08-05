@@ -52,8 +52,30 @@
  *       FTS_FLEET_MEMORY_SQL / FTS_FLEET_MEMORY_TRIGGERS_SQL; an existing DB gains
  *       them AND a one-time backfill from `fleet_memory` via the v6→v7 migration
  *       step (no reingest; grounded `memoryForNode`/`listMemory` are unchanged).
+ *   8 — Entity-id scheme change (KNOWN_ISSUES #1). `scopeForFile` no longer
+ *       elides the first `src/` path segment, because eliding made `a/src/b.ts`
+ *       and `a/b.ts` derive the SAME module id `a/b` — and ids are the `nodes`
+ *       PRIMARY KEY, so one file's symbols were silently overwritten by the
+ *       other's. EVERY stored id therefore changes spelling
+ *       (`auth/login` → `src/auth/login`).
+ *
+ *       Unlike every step above, this one is NOT additive: `nodes`, `edges`,
+ *       `call_sites`, `nodes_fts` and `merge_rejections` all key off ids that
+ *       are now wrong, so the v7→v8 step DROPS them and the index requires a
+ *       full re-ingest to repopulate. That is safe because all five are
+ *       re-derived from a parse of the working tree.
+ *
+ *       `fleet_memory` is NOT re-derivable — it is agent/user-authored
+ *       knowledge with no markdown mirror and no CRDT op log behind it — so its
+ *       `node_id` and `scope_json` anchors are REWRITTEN in place from the old
+ *       ids to the new ones before the graph is dropped (the `nodes` table is
+ *       the only thing that knows which file each old id belonged to, so the
+ *       rewrite must happen while it still exists).
+ *
+ *       The whole step is ONE transaction that includes its own
+ *       `PRAGMA user_version` stamp, so a partial v8 migration cannot exist.
  */
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 
 /** Core relational tables. */
 export const SCHEMA_SQL = `

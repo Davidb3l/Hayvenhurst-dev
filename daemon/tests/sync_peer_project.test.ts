@@ -336,8 +336,12 @@ describe("shared daemon /api/sync/* strictness (server leg)", () => {
       }),
     );
     expect(res.status).toBe(200);
-    const roots = (await res.json()) as Record<string, string>;
-    expect(Object.keys(roots).sort()).toEqual(["gset", "lww", "orset"]);
+    const roots = (await res.json()) as Record<string, unknown>;
+    // `peer` is the RFC-001 §4 handshake block — additive, so the three root
+    // keys are unchanged and an older peer reading `body.lww` is unaffected.
+    // Asserted as an exact set on purpose: a FIFTH key appearing unnoticed is
+    // how an "additive" response quietly becomes a breaking one.
+    expect(Object.keys(roots).sort()).toEqual(["gset", "lww", "orset", "peer"]);
   });
 
   it("still serves un-addressed GET /api/sync/merkle from the primary (legacy clients)", async () => {

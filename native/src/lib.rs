@@ -5,6 +5,7 @@
 //! binary. The supported public surface for callers (the daemon) is the
 //! NDJSON stdout protocol emitted by the binary, not this Rust API.
 
+pub mod ignore_query;
 pub mod infer;
 pub mod parse;
 pub mod proto;

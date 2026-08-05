@@ -13,13 +13,19 @@ import { normalizePosix, SpecifierResolver } from "./specifierResolve.ts";
 import { WorkspaceMap } from "./workspace.ts";
 import type { GraphEdge, GraphNode, RawEdge } from "./types.ts";
 import { pruneExpired } from "../db/fleet_memory.ts";
-import type { Db } from "../db/queries.ts";
+import { IngestSpill, type Db } from "../db/queries.ts";
 import { describeFailure, type ParseRun } from "../native/process.ts";
 import type { NativeRecord } from "../native/protocol.ts";
 import type { Logger } from "../util/log.ts";
 
 const NODE_BATCH = 1000;
 const EDGE_BATCH = 1000;
+/**
+ * How many nodes are replayed from the ingest spill per markdown-writing pass.
+ * Bounds the heap held by that phase; the writer's own `concurrency` still
+ * bounds in-flight I/O within a page.
+ */
+const MARKDOWN_BATCH = 1000;
 
 /** `stats` key holding when expired fleet memory was last reclaimed (epoch ms).
  *  See the prune block at the end of {@link runIngest} for why it is rate-limited. */
@@ -219,6 +225,37 @@ export function readGitHead(repoRoot: string): string | null {
  * Resolves after the native binary exits cleanly. Throws on non-zero exit.
  */
 export async function runIngest(opts: IngestOptions): Promise<IngestResult> {
+  /**
+   * ON-DISK OVERFLOW for this run's node and raw-edge records — the fix for
+   * KNOWN_ISSUES #2. Both collections used to be plain arrays held for the whole
+   * run, so heap grew linearly with repo size and a large enough repo could
+   * exhaust memory mid-ingest.
+   *
+   * They CANNOT simply be processed as they stream: edge resolution needs the
+   * COMPLETE node set before it may resolve anything (the per-package ambiguity
+   * sentinel in {@link EdgeResolver} is only correct over the whole graph — a
+   * name looks unique until its second definition arrives), and node markdown
+   * must not be written until the native binary's exit code is known. So they go
+   * to disk, in order, and are replayed in pages.
+   *
+   * Opened HERE, outside the drain, so the `finally` covers EVERY exit path —
+   * success, a hard-cap refusal, a non-zero native exit, a thrown spill write.
+   * Nothing about a failed ingest should leave a multi-hundred-MB file on the
+   * temp volume. Opened BEFORE the drain raises the in-progress marker too, so a
+   * spill that cannot be created at all (no writable temp dir) leaves a healthy
+   * index untouched AND unflagged, exactly like the over-cap scope refusal.
+   */
+  const spill = IngestSpill.open("ingest");
+  try {
+    return await drainIntoIndex(opts, spill);
+  } finally {
+    spill.destroy();
+  }
+}
+
+/** The ingest proper. Separated from {@link runIngest} only so the spill's
+ *  lifetime is a single unmissable `try`/`finally` around the whole thing. */
+async function drainIntoIndex(opts: IngestOptions, spill: IngestSpill): Promise<IngestResult> {
   const { db, nodesDir, run, logger } = opts;
   const startedAt = Date.now();
 
@@ -248,8 +285,6 @@ export async function runIngest(opts: IngestOptions): Promise<IngestResult> {
   const callerDeclaredIngest = db.hasDeclaredIngest();
   db.markIngestInProgress(startedAt);
 
-  const nodes: GraphNode[] = [];
-  const rawEdges: RawEdge[] = [];
   /**
    * Every source file this run actually parsed (from the node records' `file`).
    * This is what lets the call-site replacement below be per-file WITHOUT the
@@ -284,14 +319,23 @@ export async function runIngest(opts: IngestOptions): Promise<IngestResult> {
    * module entity id → the FIRST file that claimed it, so a second file
    * deriving the same id is REPORTED instead of silently overwriting it.
    *
-   * WHY: `scopeForFile` elides the first `src/` path segment, so `a/src/b.ts`
-   * and `a/b.ts` both derive the module id `a/b`. Ids are the `nodes` PRIMARY
-   * KEY, so the second file's rows UPSERT over the first's and one file
-   * disappears from the graph with no error anywhere — the same class as the
-   * monorepo collision that erased 22% of a real repo. Fixing the derivation is
-   * an id-scheme migration (every stored id, markdown path and `fleet_memory`
-   * anchor changes), which is out of scope here; making the collision LOUD is
-   * not, and it is the difference between a wrong answer and a reported one.
+   * WHY: ids are the `nodes` PRIMARY KEY, so when two files derive the same one
+   * the second file's rows UPSERT over the first's and one file disappears from
+   * the graph with no error anywhere — the class of bug that erased 22% of a
+   * real monorepo. Reporting it is the difference between a wrong answer and a
+   * reported one.
+   *
+   * SCHEMA v8 NARROWED THIS, IT DID NOT RETIRE IT. The collision this detector
+   * was originally written for — `scopeForFile` eliding the first `src/`
+   * segment, so `a/src/b.ts` and `a/b.ts` both derived `a/b` — is GONE: the
+   * scope is now the directory path verbatim and is therefore injective on
+   * files by construction (see `idScheme.ts`). Two collisions remain, both
+   * pre-existing and both still only DETECTED here, never prevented:
+   *   - EXTENSION-ONLY difference: `a/b.ts` and `a/b.py` both derive `a/b`,
+   *     because the module name is the extension-stripped stem.
+   *   - FILE-VERSUS-DIRECTORY: a function `b` in `a/src.ts` and the module node
+   *     of `a/src/b.ts` both spell `a/src/b` — a file and a directory of the
+   *     same name occupy one id namespace.
    *
    * Module-level is sufficient AND cheap: a non-module id is
    * `<scope>/<module>/<qn>`, so two files can only collide on an entity id if
@@ -315,13 +359,37 @@ export async function runIngest(opts: IngestOptions): Promise<IngestResult> {
   let nativeNodes = 0;
   let nativeEdges = 0;
   let nativeElapsedMs = 0;
+  /** Node RECORDS seen this run (not distinct ids) — the value `nodes.length`
+   *  used to supply for the node cap and the {@link IngestResult}. */
+  let nodeCount = 0;
+  /** Raw edge RECORDS seen this run — the value `rawEdges.length` used to
+   *  supply for the edge cap. */
+  let edgeCount = 0;
+
+  /**
+   * Edge resolution, built INCREMENTALLY as node records arrive rather than in
+   * one pass over a retained array. Same class the exported `resolveEdges`
+   * runs on, so this path and every `resolveEdges` unit test share one
+   * implementation — see {@link EdgeResolver}.
+   */
+  const resolver = new EdgeResolver(opts.repoRoot ?? process.cwd());
 
   const nodeBuffer: GraphNode[] = [];
   const flushNodes = (): void => {
     if (nodeBuffer.length === 0) return;
     db.upsertNodes(nodeBuffer);
+    // One buffer, two sinks, flushed together: the spilled node set is
+    // BY CONSTRUCTION the set that reached the `nodes` table, so the markdown
+    // pass below cannot drift from the rows it describes.
+    spill.appendNodes(nodeBuffer);
     mutatedIndex = true; // rows are now persisted — an abort leaves it partial
     nodeBuffer.length = 0;
+  };
+  const edgeBuffer: RawEdge[] = [];
+  const flushEdges = (): void => {
+    if (edgeBuffer.length === 0) return;
+    spill.appendEdges(edgeBuffer);
+    edgeBuffer.length = 0;
   };
 
   for await (const rec of run.records) {
@@ -395,9 +463,13 @@ export async function runIngest(opts: IngestOptions): Promise<IngestResult> {
               collidesWith: owner,
               hint:
                 "ids are the `nodes` primary key, so one of these files is being " +
-                "overwritten in the graph. Usually caused by a `src/` segment " +
-                "being elided from the id scope (`a/src/b.ts` and `a/b.ts` both " +
-                "derive `a/b`).",
+                "overwritten in the graph. Since schema v8 the id scope is the " +
+                "directory path verbatim, so this is no longer a `src/`-elision " +
+                "collision; the remaining causes are two files differing only by " +
+                "EXTENSION (`a/b.ts` and `a/b.py` share the stem `b`, hence the " +
+                "module id `a/b`), or a FILE AND A DIRECTORY of the same name " +
+                "(`a/src.ts` defining `b` collides with `a/src/b.ts`'s module). " +
+                "Rename one of them, or exclude one from indexing.",
             });
           }
         }
@@ -413,16 +485,22 @@ export async function runIngest(opts: IngestOptions): Promise<IngestResult> {
           last_seen: Date.now(),
           logical_clock: 0,
         };
-        nodes.push(node);
+        nodeCount++;
+        // Index the node NOW. Resolution still cannot start until the last node
+        // has been offered (the ambiguity sentinel is only correct over the
+        // complete set), but the INDEX can be built as they stream, which is
+        // what removes the retained `nodes[]`.
+        resolver.addNode(node);
         parsedFiles.add(rec.file);
         nodeBuffer.push(node);
         if (nodeBuffer.length >= NODE_BATCH) flushNodes();
-        if (nodes.length > maxNodes) {
+        if (nodeCount > maxNodes) {
           abortReason =
-            `refusing to ingest more than ${maxNodes} nodes — \`nodes[]\` is held ` +
-            "in memory for the whole run (resolveEdges and the markdown writer " +
-            "need the full set), so this is the heap ceiling. Raise " +
-            "HAYVEN_MAX_INGEST_NODES if this repo really is that large.";
+            `refusing to ingest more than ${maxNodes} nodes — the resolver's ` +
+            "name/qualified-name/ambiguity indexes must cover the whole graph " +
+            "before any edge can be resolved, so they are the remaining heap " +
+            "ceiling even though the node records themselves now spill to disk. " +
+            "Raise HAYVEN_MAX_INGEST_NODES if this repo really is that large.";
         }
         break;
       }
@@ -474,7 +552,7 @@ export async function runIngest(opts: IngestOptions): Promise<IngestResult> {
         const colRaw = (rec as unknown as { col?: unknown }).col;
         const col =
           typeof colRaw === "number" && Number.isFinite(colRaw) ? colRaw : undefined;
-        rawEdges.push({
+        edgeBuffer.push({
           src_file: rec.src_file,
           src_name: rec.src_name,
           dst_name: rec.dst_name,
@@ -488,12 +566,15 @@ export async function runIngest(opts: IngestOptions): Promise<IngestResult> {
           ...(line !== undefined ? { line } : {}),
           ...(col !== undefined ? { col } : {}),
         } as RawEdgeWithChain);
-        if (rawEdges.length > maxEdges) {
+        edgeCount++;
+        if (edgeBuffer.length >= EDGE_BATCH) flushEdges();
+        if (edgeCount > maxEdges) {
           abortReason =
-            `refusing to ingest more than ${maxEdges} edges — \`rawEdges[]\` is ` +
-            "held in memory until the second-pass resolve, so this is the heap " +
-            "ceiling. Raise HAYVEN_MAX_INGEST_EDGES if this repo really is that " +
-            "large.";
+            `refusing to ingest more than ${maxEdges} edges — every raw edge is ` +
+            "retained until the second-pass resolve (they now spill to disk, but " +
+            "the run still holds one aggregated row per distinct edge plus the " +
+            "import-witness table). Raise HAYVEN_MAX_INGEST_EDGES if this repo " +
+            "really is that large.";
         }
         break;
       }
@@ -542,6 +623,7 @@ export async function runIngest(opts: IngestOptions): Promise<IngestResult> {
   }
 
   flushNodes();
+  flushEdges();
 
   // Verify the native binary exited cleanly.
   const code = await run.wait();
@@ -549,45 +631,14 @@ export async function runIngest(opts: IngestOptions): Promise<IngestResult> {
     throw new Error(describeFailure(code, run.recentStderr()));
   }
 
-  // Resolve edges in a second pass.
-  const { resolved, unresolved, sites } = resolveEdges(nodes, rawEdges, {
-    repoRoot: opts.repoRoot ?? process.cwd(),
-  });
-  // AGGREGATE before writing: `resolveEdges` emits ONE GraphEdge per raw edge
-  // OCCURRENCE, so the same (src, dst, kind) key recurs once per call site. Fold
-  // them into one row per key with the weight summed, then write with SET (not
-  // accumulate) semantics via `replaceEdges`.
-  //
-  // WHY: `upsertEdges` does `weight = edges.weight + excluded.weight` on
-  // conflict, which is correct ONLY if each key is written once per rebuild.
-  // `hayven ingest` guaranteed that by calling `clearGraph()` first — and the
-  // daemon's full re-ingest simply did not clear, so every repeated full ingest
-  // INFLATED every edge weight without bound (measured: max weight 1 → 3 after
-  // two runs), silently corrupting every weight-ordered ranking with no
-  // user-visible signal. Making the DB write idempotent means a caller that
-  // forgets to clear can no longer cause that. Correct on the incremental path
-  // too: edges are keyed by `src`, and the incremental reconcile deletes a
-  // changed file's nodes (and their src-side edges) before re-parsing, so every
-  // key this run re-emits is a key it fully re-derived.
-  const aggregated = new Map<string, GraphEdge>();
-  for (const e of [...resolved, ...unresolved]) {
-    // NUL is the field separator (it cannot occur in an id or kind), written
-    // as the ESCAPE `\x00` and never as a literal byte: a raw NUL makes
-    // `file(1)` report this source as `data` and makes GNU grep/ripgrep
-    // classify it as BINARY and skip it SILENTLY. Two separate audits of this
-    // file (the ingest caps, the edge writes, the orphan sweep) came back empty
-    // for exactly that reason. The escape costs nothing and keeps the file
-    // visible to every tool.
-    const key = `${e.src}\x00${e.dst}\x00${e.kind}`;
-    const prior = aggregated.get(key);
-    if (prior === undefined) aggregated.set(key, { ...e });
-    else prior.weight += e.weight;
-  }
-  const allEdges: GraphEdge[] = [...aggregated.values()];
-  if (allEdges.length > 0) {
-    for (let i = 0; i < allEdges.length; i += EDGE_BATCH) {
-      db.replaceEdges(allEdges.slice(i, i + EDGE_BATCH));
-    }
+  // SECOND PASS — resolve edges. The node set is complete, so the resolver may
+  // now build its module-specifier index and start answering.
+  resolver.sealNodes();
+  // Import-witness pre-pass. `addImportEdge` ignores non-import edges, so this
+  // is the same subset in the same order as the old inline loop over the whole
+  // `rawEdges` array; the SQL filter just avoids parsing the other 80%.
+  for (const page of spill.edges<RawEdge>(EDGE_BATCH, "import")) {
+    for (const e of page) resolver.addImportEdge(e);
   }
 
   // Line-precise call sites — replace only what this run re-derived.
@@ -606,22 +657,112 @@ export async function runIngest(opts: IngestOptions): Promise<IngestResult> {
   // re-inserting is correct for a full run AND a scoped one. `fullRebuild`
   // additionally opts into the O(1) whole-table clear, which also reclaims sites
   // belonging to files that vanished from the repo.
+  //
+  // The DELETE now runs BEFORE the resolve loop rather than after it, because
+  // the loop streams its call sites straight into the table instead of building
+  // one big `sites[]` array first. Same order of effects on the table (clear,
+  // then insert this run's sites); it just no longer needs the array to exist.
   if (opts.fullRebuild === true) {
     db.clearCallSites();
   } else if (parsedFiles.size > 0) {
     db.deleteCallSitesByFile(parsedFiles);
   }
-  if (sites.length > 0) {
-    for (let i = 0; i < sites.length; i += EDGE_BATCH) {
-      db.insertCallSites(sites.slice(i, i + EDGE_BATCH));
+
+  // AGGREGATE before writing: `resolveEdges` emits ONE GraphEdge per raw edge
+  // OCCURRENCE, so the same (src, dst, kind) key recurs once per call site. Fold
+  // them into one row per key with the weight summed, then write with SET (not
+  // accumulate) semantics via `replaceEdges`.
+  //
+  // WHY: `upsertEdges` does `weight = edges.weight + excluded.weight` on
+  // conflict, which is correct ONLY if each key is written once per rebuild.
+  // `hayven ingest` guaranteed that by calling `clearGraph()` first — and the
+  // daemon's full re-ingest simply did not clear, so every repeated full ingest
+  // INFLATED every edge weight without bound (measured: max weight 1 → 3 after
+  // two runs), silently corrupting every weight-ordered ranking with no
+  // user-visible signal. Making the DB write idempotent means a caller that
+  // forgets to clear can no longer cause that. Correct on the incremental path
+  // too: edges are keyed by `src`, and the incremental reconcile deletes a
+  // changed file's nodes (and their src-side edges) before re-parsing, so every
+  // key this run re-emits is a key it fully re-derived.
+  //
+  // Folding happens INLINE as each edge resolves, rather than over two
+  // materialised `resolved[]`/`unresolved[]` arrays. That is safe because the
+  // two groups can never share a key — a resolved dst is an entity id and an
+  // unresolved one is `?:<name>` — so interleaving them cannot merge rows that
+  // the old resolved-then-unresolved concatenation kept apart, and summing an
+  // occurrence's weight is order-independent.
+  // ONE `last_seen` stamp for every edge this run writes — the value the old
+  // `const now = Date.now()` at the top of `resolveEdges` supplied.
+  const now = Date.now();
+  const aggregated = new Map<string, GraphEdge>();
+  /** Unresolved edge OCCURRENCES (the old `unresolved.length`). */
+  let unresolvedCount = 0;
+  let siteBuffer: CallSite[] = [];
+  for (const page of spill.edges<RawEdge>(EDGE_BATCH)) {
+    for (const e of page) {
+      const out = resolver.resolveOne(e, now);
+      if (out === null) continue; // src not in the index — dropped, as before
+      if (!out.resolved) unresolvedCount++;
+      // NUL is the field separator (it cannot occur in an id or kind), written
+      // as the ESCAPE `\x00` and never as a literal byte: a raw NUL makes
+      // `file(1)` report this source as `data` and makes GNU grep/ripgrep
+      // classify it as BINARY and skip it SILENTLY. Two separate audits of this
+      // file (the ingest caps, the edge writes, the orphan sweep) came back empty
+      // for exactly that reason. The escape costs nothing and keeps the file
+      // visible to every tool.
+      const key = `${out.edge.src}\x00${out.edge.dst}\x00${out.edge.kind}`;
+      const prior = aggregated.get(key);
+      if (prior === undefined) aggregated.set(key, out.edge);
+      else prior.weight += out.edge.weight;
+      // Per-occurrence call sites stream to the table in batches instead of
+      // accumulating a whole-repo `sites[]` array (30k+ objects on a mid-size
+      // repo). The delete that supersedes them already ran, above.
+      if (out.site !== null) {
+        siteBuffer.push(out.site);
+        if (siteBuffer.length >= EDGE_BATCH) {
+          db.insertCallSites(siteBuffer);
+          siteBuffer = [];
+        }
+      }
     }
   }
+  if (siteBuffer.length > 0) db.insertCallSites(siteBuffer);
+
+  // One aggregated row per (src, dst, kind), written in batches straight off
+  // the map so no whole-repo edge array is materialised.
+  const edgeWriteBuffer: GraphEdge[] = [];
+  for (const e of aggregated.values()) {
+    edgeWriteBuffer.push(e);
+    if (edgeWriteBuffer.length >= EDGE_BATCH) {
+      db.replaceEdges(edgeWriteBuffer);
+      edgeWriteBuffer.length = 0;
+    }
+  }
+  if (edgeWriteBuffer.length > 0) db.replaceEdges(edgeWriteBuffer);
 
   // Write markdown files. `writeNodeMarkdowns` skips any file whose bytes are
   // already identical, so a watcher cycle over an unchanged repo now writes
   // nothing at all (this unconditional per-node rewrite was a direct contributor
   // to the incident's 12.6 GB written).
-  await writeNodeMarkdowns(nodesDir, nodes, new Map(), opts.markdownConcurrency ?? 16);
+  //
+  // Replayed from the spill a page at a time instead of from a retained
+  // `nodes[]`. The nodes are byte-for-byte the objects that were written to the
+  // `nodes` table (same buffer, same flush), so the markdown is identical to
+  // what the array produced — in particular it still renders the `logical_clock`
+  // and (absent) `summary` THIS RUN parsed, not whatever the stored row merged
+  // them into, which is why the nodes are replayed rather than re-read from
+  // SQLite. `ensuredDirs` is shared across pages so a directory is still
+  // `mkdir`ed once per RUN, not once per page.
+  const ensuredDirs = new Set<string>();
+  for (const page of spill.nodes<GraphNode>(MARKDOWN_BATCH)) {
+    await writeNodeMarkdowns(
+      nodesDir,
+      page,
+      new Map(),
+      opts.markdownConcurrency ?? 16,
+      ensuredDirs,
+    );
+  }
 
   // Reclaim orphan markdown — files whose symbol was renamed or removed. ONLY
   // on a declared full rebuild, where `nodes` IS the complete graph; a scoped
@@ -631,10 +772,10 @@ export async function runIngest(opts: IngestOptions): Promise<IngestResult> {
   // never fail a successful ingest over disk hygiene.
   if (opts.fullRebuild === true && opts.sweepOrphanMarkdown === true) {
     try {
-      const orphans = pruneOrphanNodeMarkdowns(
-        nodesDir,
-        nodes.map((n) => n.id),
-      );
+      // `resolver.ids` is every id this run indexed — the same keep-set the old
+      // `nodes.map((n) => n.id)` produced (the sweep builds a Set of derived
+      // paths from it, so de-duplication is immaterial).
+      const orphans = pruneOrphanNodeMarkdowns(nodesDir, resolver.ids);
       if (orphans > 0) logger?.info("reclaimed orphan node markdown", { removed: orphans });
     } catch (err) {
       logger?.warn("orphan node-markdown sweep failed (non-fatal)", {
@@ -728,9 +869,9 @@ export async function runIngest(opts: IngestOptions): Promise<IngestResult> {
     finishedAt,
     filesTotal,
     filesDone,
-    nodes: nodes.length,
-    edges: allEdges.length,
-    unresolvedEdges: unresolved.length,
+    nodes: nodeCount,
+    edges: aggregated.size,
+    unresolvedEdges: unresolvedCount,
     warnings,
     nativeElapsedMs: nativeElapsedMs || finishedAt - startedAt,
     idCollisions,
@@ -795,25 +936,82 @@ export function resolveEdges(
   rawEdges: RawEdge[],
   options?: ResolveEdgesOptions,
 ): { resolved: GraphEdge[]; unresolved: GraphEdge[]; sites: CallSite[] } {
+  const resolver = new EdgeResolver(options?.repoRoot ?? "");
+  for (const n of nodes) resolver.addNode(n);
+  resolver.sealNodes();
+  for (const e of rawEdges) resolver.addImportEdge(e);
+
   const now = Date.now();
+  const resolved: GraphEdge[] = [];
+  const unresolved: GraphEdge[] = [];
+  // Per-occurrence call sites: one per RESOLVED call edge that carried 1-based
+  // line/col over the wire. The `edges` table sums occurrences into `weight`;
+  // this list preserves each occurrence's exact location for `refs --sites`.
+  const sites: CallSite[] = [];
+  for (const e of rawEdges) {
+    const out = resolver.resolveOne(e, now);
+    if (out === null) continue;
+    if (out.resolved) resolved.push(out.edge);
+    else unresolved.push(out.edge);
+    if (out.site !== null) sites.push(out.site);
+  }
+  return { resolved, unresolved, sites };
+}
 
-  // Module-specifier resolver (file → module id, with alias/relative/workspace
-  // probing) + the workspace package map that scopes name-match to packages.
-  // Built FIRST because the node indexes below key by package.
-  const specResolver = new SpecifierResolver(nodes, options?.repoRoot ?? "");
-  const ws = specResolver.workspace;
-  const pkgCache = new Map<string, string>();
-  /** Workspace package dir owning `file` ("" = root/implicit package). */
-  const pkgOf = (file: string): string => {
-    let pkg = pkgCache.get(file);
-    if (pkg === undefined) {
-      pkg = ws.packageForFile(file);
-      pkgCache.set(file, pkg);
-    }
-    return pkg;
-  };
+/** One raw edge's resolution outcome — see {@link EdgeResolver.resolveOne}. */
+export interface EdgeOutcome {
+  edge: GraphEdge;
+  /** True when `edge.dst` is a real entity id; false when it is `?:<dst_name>`. */
+  resolved: boolean;
+  /** The per-occurrence call site, when this is a resolved call edge that
+   *  carried line/col; `null` otherwise. */
+  site: CallSite | null;
+}
 
-  const byFileName = new Map<string, string>();
+/**
+ * The edge-resolution engine, in INCREMENTAL form: feed nodes one at a time,
+ * seal, feed the import edges, then resolve raw edges one at a time.
+ *
+ * WHY A CLASS (KNOWN_ISSUES #2): `runIngest` used to accumulate the whole
+ * repo's `GraphNode[]` and `RawEdge[]` in heap purely so it could hand both to
+ * one big `resolveEdges(nodes, rawEdges)` call, and heap therefore grew
+ * linearly with repo size. It can now build the indexes as node records arrive
+ * and resolve edges as they are replayed from the on-disk spill, holding no
+ * record collection at all.
+ *
+ * The split is deliberately a REFACTOR, NOT A REWRITE. Everything below is the
+ * original single-function body, cut at its existing phase boundaries, and the
+ * exported {@link resolveEdges} is now a thin loop over this class. There is
+ * exactly ONE implementation of resolution, so the streaming ingest path and
+ * every existing `resolveEdges` unit test exercise the same code — which is the
+ * only real defence against the failure mode this rework risks, namely a
+ * second, subtly-different resolver that invents or loses edges silently.
+ *
+ * PHASE ORDER MATTERS and is enforced:
+ *   1. {@link addNode} for EVERY node in the graph. The per-package ambiguity
+ *      sentinel is only correct over the COMPLETE node set — a name seen once
+ *      looks unique until the second definition arrives — so no edge may be
+ *      resolved before the last node is in.
+ *   2. {@link sealNodes} builds the {@link SpecifierResolver} over the node
+ *      projections and releases them.
+ *   3. {@link addImportEdge} for every raw edge (it filters to imports itself),
+ *      building the per-file import-witness table.
+ *   4. {@link resolveOne} per raw edge.
+ */
+export class EdgeResolver {
+  private readonly ws: WorkspaceMap;
+  private specResolver: SpecifierResolver | null = null;
+  /**
+   * Minimal `{id, kind, file}` projections of every node, kept ONLY until
+   * {@link sealNodes} builds the SpecifierResolver from them (its constructor
+   * reads exactly those three fields — one pass for `module` nodes, one for the
+   * whole-graph id set, one for the dotted-import index). Retaining the full
+   * `GraphNode`s instead cost 85 MB of a 235 MB peak heap on a 92k-node fixture,
+   * for four fields (`name`, `qualified_name`, `ast_hash`, `range`) that
+   * resolution never reads. Released at seal.
+   */
+  private nodeStubs: GraphNode[] = [];
+  private readonly byFileName = new Map<string, string>();
   // Per-file index keyed by an entity's QUALIFIED name. The native extractor
   // sets an edge's `src_name` to the enclosing definition's `qualified_name`
   // (extract.rs `enclosing_definition(...).qualified_name`), NOT its bare
@@ -822,7 +1020,7 @@ export function resolveEdges(
   // the src lookup only by `name` (the historic behavior) silently DROPPED every
   // call whose enclosing definition was a method or nested function. We key by
   // qualified_name and fall back to it when the bare-name lookup misses.
-  const byFileQn = new Map<string, string>();
+  private readonly byFileQn = new Map<string, string>();
   // PACKAGE-SCOPED qn/name indexes: keyed `<pkg>\0<name>` so uniqueness (and
   // the AMBIGUOUS sentinel) is judged WITHIN a package, never across packages.
   // Two benefits on a monorepo: a name duplicated across packages no longer
@@ -830,18 +1028,57 @@ export function resolveEdges(
   // name can never resolve into a foreign package without an import witness
   // (false-positive fix). Non-workspace repos have one package ("") — the maps
   // then degenerate to exactly the old global maps.
-  const byQualified = new Map<string, string | typeof AMBIGUOUS>();
-  const byName = new Map<string, string | typeof AMBIGUOUS>();
-  const byId = new Set<string>();
+  private readonly byQualified = new Map<string, string | typeof AMBIGUOUS>();
+  private readonly byName = new Map<string, string | typeof AMBIGUOUS>();
+  private readonly byId = new Set<string>();
   /** id → owning package dir, for import-witnessed cross-package lookups. */
-  const pkgById = new Map<string, string>();
-  const pkgKey = (pkg: string, name: string): string => `${pkg}\0${name}`;
+  private readonly pkgById = new Map<string, string>();
+  private readonly pkgCache = new Map<string, string>();
 
-  for (const n of nodes) {
+  constructor(private readonly repoRoot: string) {
+    // The workspace package map is loaded EAGERLY here rather than pulled off
+    // `SpecifierResolver.workspace` later, because the per-package node indexes
+    // below are built as nodes stream in — long before the resolver exists. The
+    // same instance is then injected into the SpecifierResolver at seal, so both
+    // sides still agree on package identity exactly as they did when one
+    // function owned both. `WorkspaceMap.load` is a pure read of the repo's
+    // workspace manifests; it does not depend on the node set.
+    this.ws = WorkspaceMap.load(repoRoot);
+  }
+
+  /** Workspace package dir owning `file` ("" = root/implicit package). */
+  private pkgOf(file: string): string {
+    let pkg = this.pkgCache.get(file);
+    if (pkg === undefined) {
+      pkg = this.ws.packageForFile(file);
+      this.pkgCache.set(file, pkg);
+    }
+    return pkg;
+  }
+
+  private static pkgKey(pkg: string, name: string): string {
+    return `${pkg}\0${name}`;
+  }
+
+  /** Every entity id fed to {@link addNode}. Also the markdown orphan-sweep
+   *  keep-set, which used to be `nodes.map((n) => n.id)`. */
+  get ids(): ReadonlySet<string> {
+    return this.byId;
+  }
+
+  /** PHASE 1 — index one node. Must be called for EVERY node in the graph
+   *  before any edge is resolved (see the class doc on the ambiguity sentinel). */
+  addNode(n: GraphNode): void {
+    const { byFileName, byFileQn, byQualified, byName, byId, pkgById } = this;
+    const pkgKey = EdgeResolver.pkgKey;
+    // `{id, kind, file}` is the entire SpecifierResolver contract — see
+    // {@link nodeStubs}. Order is preserved, so the resolver it builds at seal
+    // is identical to one built from the full node array.
+    this.nodeStubs.push({ id: n.id, kind: n.kind, file: n.file } as GraphNode);
     byFileName.set(`${n.file}::${n.name}`, n.id);
     byFileQn.set(`${n.file}::${n.qualified_name}`, n.id);
     byId.add(n.id);
-    const pkg = pkgOf(n.file);
+    const pkg = this.pkgOf(n.file);
     pkgById.set(n.id, pkg);
     // A `module` node is resolved as an IMPORT target via the SpecifierResolver,
     // never as a call/reference `dst` by NAME (you import a module; you call a
@@ -853,7 +1090,7 @@ export function resolveEdges(
     // the function found zero callers. The module stays in `byFileName`/
     // `byFileQn`/`byId` (it's a valid same-file lookup + a real import target);
     // only the by-NAME call-resolution indexes skip it.
-    if (n.kind === "module") continue;
+    if (n.kind === "module") return;
     const qnKey = pkgKey(pkg, n.qualified_name);
     const existingQn = byQualified.get(qnKey);
     if (existingQn === undefined) byQualified.set(qnKey, n.id);
@@ -865,22 +1102,53 @@ export function resolveEdges(
     else if (existing !== n.id) byName.set(nameKey, AMBIGUOUS);
   }
 
+  /**
+   * PHASE 2 — no more nodes. Builds the module-specifier resolver (file →
+   * module id, with alias/relative/workspace probing) over the node
+   * projections, then releases them.
+   */
+  sealNodes(): void {
+    if (this.specResolver !== null) return;
+    this.specResolver = new SpecifierResolver(this.nodeStubs, this.repoRoot, this.ws);
+    // The stubs exist only to construct the resolver above; holding them past
+    // this point would reinstate exactly the per-node retention this class was
+    // written to remove. The strings they referenced that resolution still
+    // needs (ids) are retained by `byId`/`pkgById` and by the resolver's own
+    // index, so this frees the objects, not the data.
+    this.nodeStubs = [];
+  }
+
+  private specs(): SpecifierResolver {
+    if (this.specResolver === null) {
+      // A programming error, not a data error: resolving before the node set is
+      // complete would silently mis-resolve (the ambiguity sentinel and the
+      // file→module index would both be partial), which is precisely the class
+      // of bug this rework must not introduce. Fail loudly instead.
+      throw new Error("EdgeResolver.resolveOne called before sealNodes()");
+    }
+    return this.specResolver;
+  }
+
   // Per-file index of import `local` binding → resolved module id, for Tier-2
   // member-call resolution. Built lazily/once over rawEdges. `aliases` maps a
   // LOCAL binding (`ca`) to the originally-exported `imported` name
   // (`checkAccess`) for `import { checkAccess as ca }`, so a call to the alias
   // resolves to `<module>/checkAccess` rather than the non-existent
   // `<module>/ca`. Absent/empty when the import has no aliases (the common case).
-  const importsByFile = new Map<
+  private readonly importsByFile = new Map<
     string,
     Array<{ local: string[]; spec: string; aliases?: Map<string, string> }>
   >();
-  for (const e of rawEdges) {
+
+  /** PHASE 3 — offer one raw edge to the import-witness table. Non-import edges
+   *  and imports with no `local` bindings are ignored, so callers can simply
+   *  replay every raw edge through it (which is what the old inline loop did). */
+  addImportEdge(e: RawEdge): void {
     if (e.kind === "import" && e.local && e.local.length > 0) {
-      let arr = importsByFile.get(e.src_file);
+      let arr = this.importsByFile.get(e.src_file);
       if (!arr) {
         arr = [];
-        importsByFile.set(e.src_file, arr);
+        this.importsByFile.set(e.src_file, arr);
       }
       const aliasPairs = (e as RawEdgeWithChain).import_aliases;
       let aliases: Map<string, string> | undefined;
@@ -892,43 +1160,47 @@ export function resolveEdges(
     }
   }
 
-  const resolved: GraphEdge[] = [];
-  const unresolved: GraphEdge[] = [];
-  // Per-occurrence call sites: one per RESOLVED call edge that carried 1-based
-  // line/col over the wire. The `edges` table sums occurrences into `weight`;
-  // this list preserves each occurrence's exact location for `refs --sites`.
-  const sites: CallSite[] = [];
-
   /** Qn-then-name lookup WITHIN one package (no same-file preference). */
-  const lookupInPackage = (pkg: string, dstName: string): string | null => {
-    const qn = byQualified.get(pkgKey(pkg, dstName));
+  private lookupInPackage(pkg: string, dstName: string): string | null {
+    const qn = this.byQualified.get(EdgeResolver.pkgKey(pkg, dstName));
     // NB: the ambiguity sentinel is a literal string; exclude it explicitly so
     // an ambiguous dst never resolves to a bogus "ambiguous" entity id.
     if (typeof qn === "string" && qn !== AMBIGUOUS) return qn;
-    const named = byName.get(pkgKey(pkg, dstName));
+    const named = this.byName.get(EdgeResolver.pkgKey(pkg, dstName));
     if (typeof named === "string" && named !== AMBIGUOUS) return named;
     return null;
-  };
+  }
 
   /**
    * Generic name-based resolution: same-file → same-PACKAGE qn → same-package
    * unique name. Scoped to the source file's package — cross-package hits
    * require the import-witness paths below, never bare name luck.
    */
-  const resolveByName = (srcFile: string, dstName: string): string | null => {
-    const sameFile = byFileName.get(`${srcFile}::${dstName}`);
+  private resolveByName(srcFile: string, dstName: string): string | null {
+    const sameFile = this.byFileName.get(`${srcFile}::${dstName}`);
     if (sameFile) return sameFile;
-    return lookupInPackage(pkgOf(srcFile), dstName);
-  };
+    return this.lookupInPackage(this.pkgOf(srcFile), dstName);
+  }
 
-  for (const e of rawEdges) {
+  /**
+   * PHASE 4 — resolve ONE raw edge. `now` is the `last_seen` stamp; callers pass
+   * a single value captured once per run so a whole ingest's edges share it
+   * (the previous `const now = Date.now()` at the top of `resolveEdges`).
+   *
+   * Returns `null` when the edge is DROPPED (its source is not in the index).
+   */
+  resolveOne(e: RawEdge, now: number): EdgeOutcome | null {
+    const specResolver = this.specs();
+    const importsByFile = this.importsByFile;
+    const byId = this.byId;
+    const pkgById = this.pkgById;
     // The extractor sets `src_name` to the enclosing definition's
     // qualified_name (extract.rs). For a top-level function that equals its
     // bare name (the `byFileName` hit); for a method/nested arrow it's the
     // qualified form (`thing/resolve`, `Cls.method`) → use the qn-keyed index.
     let srcId =
-      byFileName.get(`${e.src_file}::${e.src_name}`) ??
-      byFileQn.get(`${e.src_file}::${e.src_name}`);
+      this.byFileName.get(`${e.src_file}::${e.src_name}`) ??
+      this.byFileQn.get(`${e.src_file}::${e.src_name}`);
     if (!srcId) {
       // The native extractor uses the file path as `src_name` when a call (or
       // nested import) has no NAMEABLE enclosing definition — e.g. a bare call
@@ -947,7 +1219,7 @@ export function resolveEdges(
       if (!srcId) {
         // The source itself isn't in our index — skip silently; the native
         // binary shouldn't emit edges for unknown sources, but be defensive.
-        continue;
+        return null;
       }
     }
 
@@ -1011,7 +1283,7 @@ export function resolveEdges(
           // pins the target module — if the id ladder missed, try the member
           // name WITHIN the target module's package only.
           if (!dstId) {
-            dstId = lookupInPackage(pkgById.get(moduleId) ?? "", e.dst_name);
+            dstId = this.lookupInPackage(pkgById.get(moduleId) ?? "", e.dst_name);
           }
         } else {
           externallyBound = true;
@@ -1020,7 +1292,7 @@ export function resolveEdges(
       // Fall back to same-file/same-package name resolution — unless the
       // receiver is witnessed as an EXTERNAL import (then a name-match hit
       // would be a false cross-package edge; stay unresolved, honest).
-      if (!dstId && !externallyBound) dstId = resolveByName(e.src_file, e.dst_name);
+      if (!dstId && !externallyBound) dstId = this.resolveByName(e.src_file, e.dst_name);
     } else if (e.kind === "static_call") {
       // BARE call `fn(...)` (no receiver). The global name lookups handle the
       // common case where the callee name is unique, but they MISS when:
@@ -1065,7 +1337,7 @@ export function resolveEdges(
           // `defineConfig` from core). The witness licenses a name-match
           // scoped to the TARGET module's package (unique-within-package only).
           if (!dstId) {
-            dstId = lookupInPackage(pkgById.get(moduleId) ?? "", exported);
+            dstId = this.lookupInPackage(pkgById.get(moduleId) ?? "", exported);
           }
         } else {
           externallyBound = true;
@@ -1074,52 +1346,56 @@ export function resolveEdges(
       // Fall back to same-file/same-package name resolution if no import
       // binding pinned a target (keeps unique-name bare calls working as
       // before) — unless the binding is witnessed EXTERNAL (stay unresolved).
-      if (!dstId && !externallyBound) dstId = resolveByName(e.src_file, e.dst_name);
+      if (!dstId && !externallyBound) dstId = this.resolveByName(e.src_file, e.dst_name);
     } else {
-      dstId = resolveByName(e.src_file, e.dst_name);
+      dstId = this.resolveByName(e.src_file, e.dst_name);
     }
 
     if (dstId) {
-      resolved.push({
-        src: srcId,
-        dst: dstId,
-        kind: e.kind,
-        weight: e.weight ?? 1,
-        last_seen: now,
-      });
       // Per-occurrence call site: record (file, line, col) for a RESOLVED call
       // edge whenever the native side carried line/col. One edge record == one
       // call occurrence, so this is exactly that occurrence's position; the
       // file is the edge's `src_file`. Absent line/col (import edges, older
       // binaries) → no site, gracefully.
-      if (
+      const site: CallSite | null =
         isCallEdgeKind(e.kind) &&
         typeof e.line === "number" &&
         Number.isFinite(e.line) &&
         typeof e.col === "number" &&
         Number.isFinite(e.col)
-      ) {
-        sites.push({
-          dst: dstId,
+          ? {
+              dst: dstId,
+              src: srcId,
+              kind: e.kind,
+              file: e.src_file,
+              line: e.line,
+              col: e.col,
+            }
+          : null;
+      return {
+        edge: {
           src: srcId,
+          dst: dstId,
           kind: e.kind,
-          file: e.src_file,
-          line: e.line,
-          col: e.col,
-        });
-      }
-    } else {
-      unresolved.push({
+          weight: e.weight ?? 1,
+          last_seen: now,
+        },
+        resolved: true,
+        site,
+      };
+    }
+    return {
+      edge: {
         src: srcId,
         dst: unresolvedEdgeId(e.dst_name),
         kind: e.kind,
         weight: e.weight ?? 1,
         last_seen: now,
-      });
-    }
+      },
+      resolved: false,
+      site: null,
+    };
   }
-
-  return { resolved, unresolved, sites };
 }
 
 /**
@@ -1152,6 +1428,15 @@ export function resolveEdges(
  * the import-witnessed ingest paths, which this cheap pass cannot re-run).
  * Without a `repoRoot` — or in a non-workspace repo — everything is one
  * implicit package and behavior is unchanged.
+ *
+ * IMPORT EDGES ARE EXCLUDED. An unresolved `import` edge's dst is `?:` plus a
+ * module SPECIFIER (`?:config`, `?:preact`), not an entity name — the main
+ * resolver only ever resolves imports through the SpecifierResolver and
+ * deliberately leaves external specifiers unresolved ("a wrong resolution is
+ * worse than an orphan"). Name-matching a specifier here rewired a repo's
+ * import of the npm package `config` onto a local function named `config`,
+ * polluting refs/importers/impact until the next full reingest. Imports stay
+ * unresolved until a full/file reingest re-runs the SpecifierResolver.
  */
 export function reresolveAllEdges(db: Db, repoRoot?: string): number {
   // 1. Build the per-package indexes from EVERY node currently in the graph.
@@ -1206,9 +1491,12 @@ export function reresolveAllEdges(db: Db, repoRoot?: string): number {
     weight: number;
     last_seen: number | null;
   }
+  // `kind != 'import'` mirrors the doc-block exclusion above: an import's
+  // `?:` payload is a module specifier, which the name indexes must never see.
+  // Only `import` is excluded — every other EdgeKind carries an entity name.
   const unresolved = db.handle
     .query<UnresolvedRow, [string]>(
-      "SELECT src, dst, kind, weight, last_seen FROM edges WHERE dst LIKE ?",
+      "SELECT src, dst, kind, weight, last_seen FROM edges WHERE dst LIKE ? AND kind != 'import'",
     )
     .all(`${UNRESOLVED_PREFIX}%`);
 
@@ -1217,6 +1505,9 @@ export function reresolveAllEdges(db: Db, repoRoot?: string): number {
     // Guard: only `?:`-prefixed dsts (LIKE '?:%' is exact for our ids, but the
     // `?` is a SQL-LIKE wildcard-free literal here; keep the slice precise).
     if (!e.dst.startsWith(UNRESOLVED_PREFIX)) continue;
+    // Belt-and-suspenders with the SQL filter: never name-resolve an import's
+    // specifier, even if a future query change drops the WHERE clause.
+    if (e.kind === "import") continue;
     const name = e.dst.slice(UNRESOLVED_PREFIX.length);
     // Scope the lookup to the SOURCE node's package (an unknown src — deleted
     // node — falls back to the root package, matching resolveEdges' default).

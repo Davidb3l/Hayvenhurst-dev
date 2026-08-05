@@ -79,11 +79,24 @@ const FIXTURE = new TextEncoder().encode("hayven-tiny-gguf-fixture\n");
 const FIXTURE_SHA = sha256(FIXTURE);
 const URL = "stub://models/tiny.gguf";
 
+let prevHome: string | undefined;
+
 beforeEach(() => {
   tmp = mkdtempSync(join(tmpdir(), "hayven-install-"));
   hayvenDir = join(tmp, ".hayven");
+  // Weights install into the GLOBAL store now, so the per-test isolation lever
+  // is `$HAYVEN_HOME`, not the `hayvenDir` argument. Nesting a per-test sandbox
+  // inside the process-wide one (see tests/_sandbox_preload.ts) keeps
+  // `globalHayvenDir()` === `hayvenDir` here, so each test still gets a fresh
+  // empty store; without it, the first test's install would leave the model
+  // present for every later test and the idempotency/mismatch cases would be
+  // testing nothing.
+  prevHome = process.env["HAYVEN_HOME"];
+  process.env["HAYVEN_HOME"] = tmp;
 });
 afterEach(() => {
+  if (prevHome === undefined) delete process.env["HAYVEN_HOME"];
+  else process.env["HAYVEN_HOME"] = prevHome;
   rmSync(tmp, { recursive: true, force: true });
 });
 

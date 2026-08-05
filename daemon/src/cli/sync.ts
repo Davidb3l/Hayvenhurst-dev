@@ -4,8 +4,10 @@
 // Compares our Merkle snapshot against the peer's, pulls segments we're
 // missing or that differ, and pushes any segments the peer is missing. One
 // round-trip per divergent segment plus the initial root + leaves exchange.
+import { loadOrCreateWriterId, writerIdToHex } from "../crdt/hlc.ts";
 import { computeMerkle, diffSnapshots, type MerkleSnapshot } from "../crdt/merkle.ts";
 import { OpLog, splitSegmentBatches, type CrdtType } from "../crdt/oplog.ts";
+import { parsePeerHandshake, recordPeer, SYNC_PROTOCOL_VERSION } from "../crdt/peers.ts";
 import {
   CLI_PROBE_TIMEOUT_MS,
   CLI_REQUEST_TIMEOUT_MS,
@@ -365,15 +367,59 @@ async function runSyncWith(
    *  carry them, or a shared peer answers for its primary project. */
   peerHeaders: Record<string, string> = {},
 ): Promise<number> {
+  // OUR identity, reused for both halves of the exchange: it is stamped into
+  // every peer-directed request so the far side can record US (the inbound
+  // half of RFC-001 §4), and it is the self-check that stops us enrolling our
+  // own local daemon as a peer.
+  const selfWriterId = writerIdToHex(loadOrCreateWriterId(ctx.paths.configFile));
+
   // Round-trip 1: roots.
   const ourRoots = computeMerkle(oplog);
-  const theirRoots = await fetchJson<Record<CrdtType, string>>(
+  const merkleResponse = await fetchJson<Record<string, unknown>>(
     `${peerUrl}/api/sync/merkle`,
     peerHeaders,
   );
   summary.roundTrips += 1;
 
+  // ADDITIVE, so absence is "unknown, assume nothing" and NEVER an error: an
+  // older peer omits `peer` entirely and must still sync. `parsePeerHandshake`
+  // returns null for both "missing" and "malformed" and we simply record
+  // nothing — identity is metadata layered on top of segment exchange and must
+  // never be able to break it.
+  //
+  // PARSED here, RECORDED only on success. The server side deliberately
+  // records a peer only after an exchange actually lands (see the notes on
+  // `recordInboundPeer` call sites in routes/sync.ts), and the outbound half
+  // must define "synced" the same way: `last_synced` advancing for a sync that
+  // subsequently failed would make the registry lie about fleet health. Both
+  // successful exits below call this — roots-already-match IS a successful
+  // sync (state verified identical), and so is a completed transfer.
+  const handshake = parsePeerHandshake(merkleResponse["peer"]);
+  const recordPeerOnSuccess = (): void => {
+    if (handshake === null) return;
+    recordPeer(ctx.paths.peersDir, {
+      writerId: handshake.writer_id,
+      url: peerUrl,
+      protocol: handshake.protocol,
+      selfWriterId,
+    });
+  };
+
+  // Strip `peer` back off before this is used as a root map: everything
+  // downstream (`rootsMatch`, `theirSnap.roots`) treats the object as
+  // type→hash, and leaking a non-CrdtType key into it is how an additive field
+  // turns into a phantom segment type.
+  const theirRoots: Record<CrdtType, string> = {
+    lww: String(merkleResponse["lww"] ?? ""),
+    gset: String(merkleResponse["gset"] ?? ""),
+    orset: String(merkleResponse["orset"] ?? ""),
+  };
+
   if (rootsMatch(ourRoots.roots, theirRoots)) {
+    // Up to date is a SUCCESSFUL sync (we verified both sides identical), and
+    // it is the overwhelmingly common case — not recording here would leave a
+    // healthy fleet permanently invisible to `hayven crdt peers`.
+    recordPeerOnSuccess();
     summary.finishedAtMs = Date.now();
     process.stdout.write(renderSummary(summary, /* upToDate */ true));
     return 0;
@@ -408,12 +454,17 @@ async function runSyncWith(
   // batch per call, so we split before pushing (a whole-segment push would
   // double-frame and corrupt).
   for (const target of diff.pull) {
-    const bytes = await pullSegment(peerUrl, target.type, target.path, peerHeaders);
+    const bytes = await pullSegment(peerUrl, target.type, target.path, peerHeaders, selfWriterId);
     summary.pulledSegments += 1;
     summary.pulledBytes += bytes.length;
     summary.roundTrips += 1;
     for (const batch of splitSegmentBatches(bytes)) {
       try {
+        // NO `peer_writer_id` here on purpose: this push goes to OUR OWN local
+        // daemon, and stamping our identity on it would make the daemon record
+        // itself as one of its own peers on the very first sync — poisoning
+        // every later answer to "who am I synced with?". `recordPeer`'s
+        // self-check is the backstop; not sending it is the fix.
         await postJson(
           `${localUrl}/api/sync/push`,
           {
@@ -450,6 +501,11 @@ async function runSyncWith(
             type: target.type,
             path: target.path,
             batch: bufferToBase64(batch),
+            // The INBOUND half of RFC-001 §4: without this the peer serves our
+            // push and never learns who pushed, which is exactly the anonymity
+            // this stage exists to remove.
+            peer_writer_id: selfWriterId,
+            peer_protocol: SYNC_PROTOCOL_VERSION,
           },
           peerHeaders,
         );
@@ -465,6 +521,11 @@ async function runSyncWith(
     }
   }
 
+  // Only now has the sync actually COMPLETED (refused segments included: a
+  // refusal is a policy decision by a healthy peer, reported and survived, not
+  // a failed exchange). A throw anywhere above skips this, so a sync that died
+  // mid-transfer leaves `last_synced` untouched — matching the server side.
+  recordPeerOnSuccess();
   summary.finishedAtMs = Date.now();
   process.stdout.write(renderSummary(summary, /* upToDate */ false));
   return 0;
@@ -508,6 +569,8 @@ async function pullSegment(
   type: CrdtType,
   path: string,
   peerHeaders: Record<string, string> = {},
+  /** Our own writer ID, so the serving peer can record who pulled from it. */
+  selfWriterId?: string,
 ): Promise<Uint8Array> {
   // Walk offsets until x-segment-eof is "1".
   const chunks: Uint8Array[] = [];
@@ -517,7 +580,17 @@ async function pullSegment(
     const res = await reachableFetch(`${peerUrl}/api/sync/batch`, {
       method: "POST",
       headers: { "content-type": "application/json", ...peerHeaders },
-      body: JSON.stringify({ type, path, offset }),
+      body: JSON.stringify(
+        selfWriterId === undefined
+          ? { type, path, offset }
+          : {
+              type,
+              path,
+              offset,
+              peer_writer_id: selfWriterId,
+              peer_protocol: SYNC_PROTOCOL_VERSION,
+            },
+      ),
     });
     if (!res.ok) throw new Error(`POST /api/sync/batch → ${res.status}`);
     const url = `${peerUrl}/api/sync/batch`;

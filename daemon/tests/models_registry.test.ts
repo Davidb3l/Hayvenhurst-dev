@@ -7,8 +7,10 @@ import { join } from "node:path";
 import {
   GGUF_FILENAME,
   MODEL_REGISTRY,
+  globalModelsDir,
   isModelPresent,
   modelDir,
+  modelDirIn,
   modelDirName,
   modelPath,
   modelsDir,
@@ -132,16 +134,27 @@ describe("model registry", () => {
     expect(modelDirName("ns/model:tag")).toBe("ns_model_tag");
   });
 
-  test("modelDir is <hayvenDir>/models/<dirname>; null for unknown", () => {
-    expect(modelDir("/home/x/.hayven", "gemma4:e2b")).toBe(
+  test("modelDirIn is <hayvenDir>/models/<dirname>; null for unknown", () => {
+    // The pure, unresolved join. `modelDir` (below) is the RESOLVING accessor.
+    expect(modelDirIn("/home/x/.hayven", "gemma4:e2b")).toBe(
       join(modelsDir("/home/x/.hayven"), "gemma4_e2b"),
+    );
+    expect(modelDirIn("/home/x/.hayven", "nope:0b")).toBeNull();
+  });
+
+  test("modelDir defaults to the GLOBAL store when no copy exists anywhere", () => {
+    // Weights are shared: with nothing on disk, the project argument does NOT
+    // pick the target — the global store does, so a pull lands once and every
+    // project reads it.
+    expect(modelDir("/home/x/.hayven", "gemma4:e2b")).toBe(
+      join(globalModelsDir(), "gemma4_e2b"),
     );
     expect(modelDir("/home/x/.hayven", "nope:0b")).toBeNull();
   });
 
-  test("modelPath points at model.gguf inside the model dir", () => {
+  test("modelPath points at model.gguf inside the resolved model dir", () => {
     expect(modelPath("/home/x/.hayven", "gemma4:e2b")).toBe(
-      join(modelsDir("/home/x/.hayven"), "gemma4_e2b", GGUF_FILENAME),
+      join(globalModelsDir(), "gemma4_e2b", GGUF_FILENAME),
     );
   });
 
@@ -158,16 +171,18 @@ describe("model registry", () => {
     const dir = mkdtempSync(join(tmpdir(), "hayven-models-"));
     const hayvenDir = join(dir, ".hayven");
     try {
-      const md = modelDir(hayvenDir, "gemma4:e2b")!;
+      // `modelDirIn`, not `modelDir`: this test is about the artifact gate, and
+      // the resolving accessor would send the write to the global store.
+      const md = modelDirIn(hayvenDir, "gemma4:e2b")!;
       expect(isModelPresent(hayvenDir, "gemma4:e2b")).toBe(false); // nothing on disk
 
       mkdirSync(md, { recursive: true });
-      writeFileSync(modelPath(hayvenDir, "gemma4:e2b")!, "stub-weights");
+      writeFileSync(join(md, GGUF_FILENAME), "stub-weights");
       // model.gguf alone → present (no tokenizer sidecar needed).
       expect(isModelPresent(hayvenDir, "gemma4:e2b")).toBe(true);
 
       // Removing the weights flips it back to not-present.
-      rmSync(modelPath(hayvenDir, "gemma4:e2b")!);
+      rmSync(join(md, GGUF_FILENAME));
       expect(isModelPresent(hayvenDir, "gemma4:e2b")).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });

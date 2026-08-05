@@ -130,13 +130,13 @@ describe("SpecifierResolver — relative + extensionless", () => {
     // resolve to that real entity id. Ids carry the monorepo-safe `viewer/`
     // prefix (scopeForFile retains the pre-`src/` path).
     const noModuleNodes: GraphNode[] = [
-      mod("viewer/src/components/SearchResults.tsx", "viewer/components/SearchResults"),
-      entity("viewer/src/components/useQuery.ts", "viewer/components/useQuery", "useQuery"),
+      mod("viewer/src/components/SearchResults.tsx", "viewer/src/components/SearchResults"),
+      entity("viewer/src/components/useQuery.ts", "viewer/src/components/useQuery", "useQuery"),
       // A sibling entity in the same file (must not perturb the derived mapping).
-      entity("viewer/src/components/useQuery.ts", "viewer/components/useQuery/sub", "sub"),
+      entity("viewer/src/components/useQuery.ts", "viewer/src/components/useQuery/sub", "sub"),
     ];
     const rr = new SpecifierResolver(noModuleNodes, "");
-    expect(rr.resolve("viewer/src/components/SearchResults.tsx", "./useQuery")).toBe("viewer/components/useQuery");
+    expect(rr.resolve("viewer/src/components/SearchResults.tsx", "./useQuery")).toBe("viewer/src/components/useQuery");
   });
 
   it("does NOT invent a target for a module-less file with no matching id", () => {
@@ -450,7 +450,7 @@ describe("resolveEdges — Astro template component-usage edges", () => {
     // `Stats.tsx`'s default export is a function node sharing the file's derived
     // module id `viewer/components/Stats` (matches the real graph — see dogfood;
     // scopeForFile retains the monorepo-safe pre-`src/` prefix).
-    entity("viewer/src/components/Stats.tsx", "viewer/components/Stats", "Stats"),
+    entity("viewer/src/components/Stats.tsx", "viewer/src/components/Stats", "Stats"),
     mod("viewer/src/pages/index.astro", "viewer/pages/index"),
   ];
 
@@ -484,6 +484,6 @@ describe("resolveEdges — Astro template component-usage edges", () => {
     ];
     const { resolved } = resolveEdges(nodes, raw, { repoRoot: root() });
     const callEdge = resolved.find((e) => e.kind === "static_call");
-    expect(callEdge?.dst).toBe("viewer/components/Stats");
+    expect(callEdge?.dst).toBe("viewer/src/components/Stats");
   });
 });

@@ -1,11 +1,18 @@
 import { describe, expect, it } from "bun:test";
 
-import { deriveEntityId, nodeMarkdownPath, scopeForFile, unresolvedEdgeId } from "../src/graph/idScheme.ts";
+import {
+  deriveEntityId,
+  legacyScopeForFile,
+  nodeMarkdownPath,
+  remapLegacyId,
+  scopeForFile,
+  unresolvedEdgeId,
+} from "../src/graph/idScheme.ts";
 
 describe("scopeForFile", () => {
-  it("elides the first `src/` segment for a root-level src (single-repo shape unchanged)", () => {
-    expect(scopeForFile("src/auth/login.ts")).toBe("auth");
-    expect(scopeForFile("src/auth/sub/login.ts")).toBe("auth/sub");
+  it("is the file's directory path, verbatim (schema v8 — no elision)", () => {
+    expect(scopeForFile("src/auth/login.ts")).toBe("src/auth");
+    expect(scopeForFile("src/auth/sub/login.ts")).toBe("src/auth/sub");
   });
 
   it("falls back to the file directory when there is no `src/`", () => {
@@ -17,31 +24,111 @@ describe("scopeForFile", () => {
     expect(scopeForFile("./README.md")).toBe("");
   });
 
-  // Monorepo P0 (bench/monorepo-astro-RESULTS.md §2a): the OLD rule dropped
-  // everything before the first `src/`, so every package's `src/` root
+  // Monorepo P0 (bench/monorepo-astro-RESULTS.md §2a): an even older rule
+  // dropped everything before the first `src/`, so every package's `src/` root
   // collapsed onto the same scope — `packages/{vercel,netlify}/src/lib/nft.ts`
   // both became `lib/nft`, ids are the PK, and 22% of astro's files silently
-  // vanished (337 `src/pages/index.astro` → ONE node). The path BEFORE `src/`
-  // must be retained.
-  it("keeps the pre-`src/` package prefix (monorepo collision fix)", () => {
-    expect(scopeForFile("packages/vercel/src/lib/nft.ts")).toBe("packages/vercel/lib");
-    expect(scopeForFile("packages/netlify/src/lib/nft.ts")).toBe("packages/netlify/lib");
+  // vanished (337 `src/pages/index.astro` → ONE node). Retaining the WHOLE path
+  // necessarily retains the pre-`src/` prefix, so that fix is subsumed, not
+  // regressed.
+  it("keeps the pre-`src/` package prefix (monorepo collision fix, still held)", () => {
+    expect(scopeForFile("packages/vercel/src/lib/nft.ts")).toBe("packages/vercel/src/lib");
+    expect(scopeForFile("packages/netlify/src/lib/nft.ts")).toBe("packages/netlify/src/lib");
     expect(scopeForFile("packages/vercel/src/lib/nft.ts")).not.toBe(
       scopeForFile("packages/netlify/src/lib/nft.ts"),
     );
     // Files directly under a package's src/.
-    expect(scopeForFile("packages/astro/src/index.ts")).toBe("packages/astro");
+    expect(scopeForFile("packages/astro/src/index.ts")).toBe("packages/astro/src");
   });
 
-  it("elides only the FIRST `src/` segment (nested src stays)", () => {
-    expect(scopeForFile("packages/a/src/gen/src/x.ts")).toBe("packages/a/gen/src");
+  it("keeps EVERY `src` segment, including nested ones", () => {
+    expect(scopeForFile("packages/a/src/gen/src/x.ts")).toBe("packages/a/src/gen/src");
+  });
+
+  // KNOWN_ISSUES #1 — THE bug this scheme change exists to fix. Under the old
+  // elision both of these returned `a`, so both files derived the module id
+  // `a/b`; ids are the `nodes` PRIMARY KEY, so one file's symbols were silently
+  // overwritten by the other's.
+  it("KNOWN_ISSUES #1: `a/src/b.ts` and `a/b.ts` no longer share a scope", () => {
+    expect(scopeForFile("a/src/b.ts")).toBe("a/src");
+    expect(scopeForFile("a/b.ts")).toBe("a");
+    expect(scopeForFile("a/src/b.ts")).not.toBe(scopeForFile("a/b.ts"));
+  });
+
+  it("KNOWN_ISSUES #1: the scope is injective — distinct dirs, distinct scopes", () => {
+    // A spread of shapes that all collapsed onto `a` (or onto each other) under
+    // the elision. Every one must now be distinct.
+    const files = [
+      "a/b.ts",
+      "a/src/b.ts",
+      "src/a/b.ts",
+      "a/src/src/b.ts",
+      "src/b.ts",
+      "b.ts",
+    ];
+    const scopes = files.map(scopeForFile);
+    expect(new Set(scopes).size).toBe(files.length);
+  });
+});
+
+describe("legacyScopeForFile (frozen pre-v8 rule, for the migration only)", () => {
+  it("reproduces the elision the v7 index was written with", () => {
+    expect(legacyScopeForFile("src/auth/login.ts")).toBe("auth");
+    expect(legacyScopeForFile("packages/vercel/src/lib/nft.ts")).toBe("packages/vercel/lib");
+    expect(legacyScopeForFile("lib/util/x.py")).toBe("lib/util");
+    expect(legacyScopeForFile("index.ts")).toBe("");
+  });
+
+  it("still exhibits the collision — that is the point of keeping it", () => {
+    // It must reproduce the BUG faithfully, or the migration cannot recognise
+    // the ids a v7 index actually stored.
+    expect(legacyScopeForFile("a/src/b.ts")).toBe(legacyScopeForFile("a/b.ts"));
+  });
+});
+
+describe("remapLegacyId", () => {
+  it("rewrites a v7 id into its v8 spelling using the node's file", () => {
+    expect(remapLegacyId("auth/login", "src/auth/login.ts")).toBe("src/auth/login");
+    expect(remapLegacyId("auth/login/Session.refresh", "src/auth/login.ts")).toBe(
+      "src/auth/login/Session.refresh",
+    );
+    expect(remapLegacyId("packages/vercel/lib/nft/copyDeps", "packages/vercel/src/lib/nft.ts")).toBe(
+      "packages/vercel/src/lib/nft/copyDeps",
+    );
+  });
+
+  it("is identity for a file whose scope never had a `src/` to elide", () => {
+    expect(remapLegacyId("lib/util/x/helper", "lib/util/x.py")).toBe("lib/util/x/helper");
+  });
+
+  it("handles top-level files (empty scope both sides)", () => {
+    expect(remapLegacyId("main", "index.ts")).toBe("main");
+  });
+
+  // The refusal half is the load-bearing one: guessing at an id we do not
+  // recognise is how a migration silently repoints a user's note onto the
+  // wrong symbol.
+  it("returns null for an id that does not sit under its file's legacy scope", () => {
+    expect(remapLegacyId("?:someUnresolvedName", "src/auth/login.ts")).toBeNull();
+    expect(remapLegacyId("totally/unrelated", "src/auth/login.ts")).toBeNull();
+  });
+
+  it("returns null rather than producing an empty local part", () => {
+    expect(remapLegacyId("auth", "src/auth/login.ts")).toBeNull();
+  });
+
+  // The two spellings KNOWN_ISSUES #1 is about must remap to DIFFERENT ids, or
+  // the migration would rewrite two anchors onto one symbol.
+  it("KNOWN_ISSUES #1: the two colliding spellings remap apart", () => {
+    expect(remapLegacyId("a/b/helper", "a/src/b.ts")).toBe("a/src/b/helper");
+    expect(remapLegacyId("a/b/helper", "a/b.ts")).toBe("a/b/helper");
   });
 });
 
 describe("deriveEntityId", () => {
   it("composes scope + qualified_name when no moduleName is given (module nodes)", () => {
-    expect(deriveEntityId("src/auth/login.ts", "loginHandler")).toBe("auth/loginHandler");
-    expect(deriveEntityId("src/auth/login.ts", "Session.refresh")).toBe("auth/Session.refresh");
+    expect(deriveEntityId("src/auth/login.ts", "loginHandler")).toBe("src/auth/loginHandler");
+    expect(deriveEntityId("src/auth/login.ts", "Session.refresh")).toBe("src/auth/Session.refresh");
   });
 
   it("handles top-level files (no scope)", () => {
@@ -49,7 +136,7 @@ describe("deriveEntityId", () => {
   });
 
   it("falls back to filename when qualified_name is empty", () => {
-    expect(deriveEntityId("src/util/x.py", "")).toBe("util/x");
+    expect(deriveEntityId("src/util/x.py", "")).toBe("src/util/x");
   });
 
   it("monorepo: sibling packages' same-named files derive DISTINCT ids", () => {
@@ -61,8 +148,8 @@ describe("deriveEntityId", () => {
       moduleName: "nft",
       kind: "function",
     });
-    expect(vercel).toBe("packages/vercel/lib/nft/copyDependenciesToFunction");
-    expect(netlify).toBe("packages/netlify/lib/nft/copyDependenciesToFunction");
+    expect(vercel).toBe("packages/vercel/src/lib/nft/copyDependenciesToFunction");
+    expect(netlify).toBe("packages/netlify/src/lib/nft/copyDependenciesToFunction");
     expect(vercel).not.toBe(netlify);
   });
 
@@ -72,8 +159,8 @@ describe("deriveEntityId", () => {
       // Without disambiguation both collapse to `parse/do_something` (PK collision).
       const a = deriveEntityId("src/parse/hash.rs", "do_something", { moduleName: "hash" });
       const b = deriveEntityId("src/parse/extract.rs", "do_something", { moduleName: "extract" });
-      expect(a).toBe("parse/hash/do_something");
-      expect(b).toBe("parse/extract/do_something");
+      expect(a).toBe("src/parse/hash/do_something");
+      expect(b).toBe("src/parse/extract/do_something");
       expect(a).not.toBe(b);
     });
 
@@ -82,13 +169,13 @@ describe("deriveEntityId", () => {
       // Prepending would produce `parse/hash/hash`.
       expect(
         deriveEntityId("src/parse/hash.rs", "hash", { moduleName: "hash" }),
-      ).toBe("parse/hash");
+      ).toBe("src/parse/hash");
     });
 
     it("preserves dotted qualified_names for methods on classes", () => {
       expect(
         deriveEntityId("src/auth/login.ts", "Session.refresh", { moduleName: "login" }),
-      ).toBe("auth/login/Session.refresh");
+      ).toBe("src/auth/login/Session.refresh");
     });
 
     it("does not double-prefix if the qualified_name already starts with `<module>/`", () => {
@@ -97,7 +184,7 @@ describe("deriveEntityId", () => {
       // is unambiguous (unlike a dot), so this stays a pure de-dup.
       expect(
         deriveEntityId("src/parse/hash.rs", "hash/do_something", { moduleName: "hash" }),
-      ).toBe("parse/hash/do_something");
+      ).toBe("src/parse/hash/do_something");
     });
 
     // BL-16: a leading `<module>.` on a TOP-LEVEL entity is a redundant module
@@ -109,20 +196,20 @@ describe("deriveEntityId", () => {
       // OLD behavior (pre-BL-16) returned `parse/hash.MyStruct`.
       expect(
         deriveEntityId("src/parse/hash.rs", "hash.MyStruct", { moduleName: "hash", kind: "struct" }),
-      ).toBe("parse/hash/MyStruct");
+      ).toBe("src/parse/hash/MyStruct");
       // Default (no kind) treats a leading `<module>.` as a qualifier too — the
       // common top-level case — so callers that don't thread kind still get the
       // fixed, disambiguated id.
       expect(
         deriveEntityId("src/parse/hash.rs", "hash.MyStruct", { moduleName: "hash" }),
-      ).toBe("parse/hash/MyStruct");
+      ).toBe("src/parse/hash/MyStruct");
     });
 
     it("BL-16: a real Class.method still collapses (dot kept, module-prefixed)", () => {
       // The dot here is a class separator, not a module qualifier.
       expect(
         deriveEntityId("src/auth/login.ts", "Session.refresh", { moduleName: "login", kind: "method" }),
-      ).toBe("auth/login/Session.refresh");
+      ).toBe("src/auth/login/Session.refresh");
     });
 
     it("BL-16: a method whose class name coincides with the module name keeps the dotted name", () => {
@@ -131,7 +218,7 @@ describe("deriveEntityId", () => {
       // a real `Class.method`, so we get `parse/hash/hash.foo`.
       expect(
         deriveEntityId("src/parse/hash.rs", "hash.foo", { moduleName: "hash", kind: "method" }),
-      ).toBe("parse/hash/hash.foo");
+      ).toBe("src/parse/hash/hash.foo");
     });
 
     // idScheme collision fix: a FUNCTION whose name equals its module basename
@@ -147,15 +234,15 @@ describe("deriveEntityId", () => {
         moduleName: "sympify",
         kind: "function",
       });
-      expect(moduleId).toBe("parse/sympify");
-      expect(fnId).toBe("parse/sympify/sympify");
+      expect(moduleId).toBe("src/parse/sympify");
+      expect(fnId).toBe("src/parse/sympify/sympify");
       expect(fnId).not.toBe(moduleId);
     });
 
     it("idScheme collision: a class/struct named like its module is also distinct", () => {
       expect(
         deriveEntityId("src/parse/widget.ts", "widget", { moduleName: "widget", kind: "class" }),
-      ).toBe("parse/widget/widget");
+      ).toBe("src/parse/widget/widget");
     });
 
     it("idScheme collision: a method named like the module keeps its dotted qn and prefixes", () => {
@@ -165,7 +252,7 @@ describe("deriveEntityId", () => {
           moduleName: "sympify",
           kind: "method",
         }),
-      ).toBe("parse/sympify/Session.sympify");
+      ).toBe("src/parse/sympify/Session.sympify");
     });
   });
 });

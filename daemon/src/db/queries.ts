@@ -5,6 +5,9 @@
  * wrapper. We avoid an ORM on purpose — the schema is tiny and stable.
  */
 import { Database, type SQLQueryBindings, type Statement } from "bun:sqlite";
+import { rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import type { GraphEdge, GraphNode, NodeKind } from "../graph/types.ts";
 import {
@@ -22,7 +25,7 @@ import {
   type IndexIntegrity,
   type InFlightIngest,
 } from "./index_health.ts";
-import { assertSchemaCompatible, migrate, type MigrationResult } from "./migrations.ts";
+import { assertSchemaCompatible, ftsAvailable, migrate, type MigrationResult } from "./migrations.ts";
 import { FTS_SQL, FTS_TRIGGERS_SQL } from "./schema.ts";
 
 export interface NodeRow {
@@ -195,7 +198,14 @@ export class Db {
   }
 
   migrate(): MigrationResult {
-    return migrate(this.handle);
+    const result = migrate(this.handle);
+    // Seed the FTS-availability cache now (outside any caller's transaction)
+    // rather than letting `hasFts()` probe lazily inside the first
+    // `clearGraph`/`deleteNodesByFile` write transaction — the probe runs a
+    // transient CREATE/DROP VIRTUAL TABLE, which is safe but has no business
+    // happening mid-wipe when it can happen here.
+    if (this.ftsProbe === null) this.ftsProbe = ftsAvailable(this.handle);
+    return result;
   }
 
   close(): void {
@@ -221,6 +231,12 @@ export class Db {
    * run inside a transaction so a throw rolls back the DROP (triggers restored);
    * `migrate()` also re-ensures them on open as a backstop. */
   private withoutFtsTriggers<T>(fn: () => T): T {
+    // NO-FTS DEGRADATION: `migrate()` only creates `nodes_fts` and its triggers
+    // when the SQLite build has FTS5 (`ftsAvailable`). On such a build there is
+    // nothing to drop and — critically — `FTS_TRIGGERS_SQL` in the finally
+    // block would THROW (the triggers reference the missing FTS table), so the
+    // whole guard must be skipped, not just tolerated.
+    if (!this.hasFts()) return fn();
     this.handle.exec(
       "DROP TRIGGER IF EXISTS nodes_fts_ai;" +
         "DROP TRIGGER IF EXISTS nodes_fts_ad;" +
@@ -231,6 +247,19 @@ export class Db {
     } finally {
       this.handle.exec(FTS_TRIGGERS_SQL);
     }
+  }
+
+  /**
+   * Whether this handle's SQLite build supports FTS5+trigram, probed once and
+   * cached for the life of the handle (the answer is a property of the linked
+   * SQLite library, so it cannot change under a live process). Mirrors the
+   * `ftsAvailable` guard `migrate()` uses, so every FTS touch point degrades
+   * the same way on a no-FTS build instead of throwing mid-transaction.
+   */
+  private ftsProbe: boolean | null = null;
+  private hasFts(): boolean {
+    if (this.ftsProbe === null) this.ftsProbe = ftsAvailable(this.handle);
+    return this.ftsProbe;
   }
 
   /**
@@ -245,8 +274,13 @@ export class Db {
   clearGraph(): void {
     this.transaction(() => {
       this.withoutFtsTriggers(() => {
+        // NO-FTS DEGRADATION: on a build without FTS5, `nodes_fts` was never
+        // created (migrate() guards it behind `ftsAvailable`), and `FTS_SQL`
+        // would throw inside this transaction — wedging the first full
+        // reingest. The plain-table wipe still runs; only the FTS clear +
+        // recreate is skipped.
         this.handle.exec("DELETE FROM edges; DELETE FROM nodes; DROP TABLE IF EXISTS nodes_fts;");
-        this.handle.exec(FTS_SQL); // recreate the empty FTS table
+        if (this.hasFts()) this.handle.exec(FTS_SQL); // recreate the empty FTS table
       });
       // ATOMICITY (the empty-index-reports-fresh bug): stamp the in-progress
       // marker in the SAME transaction as the wipe, so there is no instant at
@@ -545,9 +579,14 @@ export class Db {
       // single scan instead (measured ~40× faster on a 135K-node index). MUST
       // run BEFORE deleting the nodes (the subquery reads them).
       this.withoutFtsTriggers(() => {
-        this.handle
-          .query("DELETE FROM nodes_fts WHERE id IN (SELECT id FROM nodes WHERE file = ?)")
-          .run(file);
+        // NO-FTS DEGRADATION: on a build without FTS5 the `nodes_fts` table was
+        // never created, so the set-based FTS delete must be skipped (there are
+        // no FTS rows to reclaim, and the statement would throw mid-transaction).
+        if (this.hasFts()) {
+          this.handle
+            .query("DELETE FROM nodes_fts WHERE id IN (SELECT id FROM nodes WHERE file = ?)")
+            .run(file);
+        }
         this.handle.query("DELETE FROM nodes WHERE file = ?").run(file);
       });
       return before?.c ?? 0;
@@ -713,29 +752,22 @@ export class Db {
     if (files.length === 0) return 0;
     return this.transaction(() => {
       let removed = 0;
-      // Batched `file IN (…)` rather than one statement per file. There is no
-      // index on `call_sites(file)`, so EVERY delete here is a full table scan;
-      // the old per-file loop also ran a COUNT scan per file, i.e. 2N scans for
-      // N files. A FULL ingest now routes through this method (see
-      // `graph/ingest.ts` — the unconditional `clearCallSites()` wiped the whole
-      // table on every incremental save), and N there is the entire repo's file
-      // count, so per-file scanning would be quadratic. Chunking bounds it to
-      // 2·ceil(N/500) scans. FOLLOW-UP for the schema lane: an index on
-      // `call_sites(file)` would make this O(matched rows).
+      // Batched `file IN (…)` rather than one statement per file. The
+      // `call_sites_file` index (schema.ts) serves this predicate, so each
+      // DELETE is O(matched rows), not a table scan. Chunking is kept ONLY for
+      // SQLite's bound-parameter ceiling (a FULL ingest routes the entire
+      // repo's file list through here — see `graph/ingest.ts`), not for scan
+      // cost. The old pre-index per-chunk COUNT probe is gone: `call_sites`
+      // has NO triggers, so `run().changes` reports exactly the base rows
+      // deleted (the trigger-inflation caveat in fleet_memory.ts does not
+      // apply here).
       const CHUNK = 500;
       for (let i = 0; i < files.length; i += CHUNK) {
         const chunk = files.slice(i, i + CHUNK);
         const placeholders = chunk.map(() => "?").join(",");
-        const before =
-          this.handle
-            .query<{ c: number }, string[]>(
-              `SELECT COUNT(*) AS c FROM call_sites WHERE file IN (${placeholders})`,
-            )
-            .get(...chunk)?.c ?? 0;
-        this.handle
+        removed += this.handle
           .query<unknown, string[]>(`DELETE FROM call_sites WHERE file IN (${placeholders})`)
-          .run(...chunk);
-        removed += before;
+          .run(...chunk).changes;
       }
       return removed;
     });
@@ -1164,4 +1196,168 @@ export function edgeRowToGraphEdge(row: EdgeRow): GraphEdge {
     weight: row.weight,
     last_seen: row.last_seen ?? 0,
   };
+}
+
+/**
+ * A THROWAWAY on-disk overflow store for one ingest run.
+ *
+ * WHY THIS EXISTS (KNOWN_ISSUES #2): `graph/ingest.ts::runIngest` used to hold
+ * BOTH the whole repo's `GraphNode[]` and its whole `RawEdge[]` in heap for the
+ * entire run, because edge resolution cannot begin until the last node has been
+ * seen (the per-package ambiguity sentinel is only correct over the COMPLETE
+ * node set — see `resolveEdges`) and the markdown writer ran after the native
+ * exit gate. Heap therefore grew linearly with repo size with no ceiling but the
+ * hard caps, and a very large repo could exhaust memory mid-ingest. Measured on
+ * a 92k-node fixture: the two arrays alone were 113 MB of a 235 MB peak heap.
+ *
+ * This moves those two collections to DISK while preserving, exactly:
+ *   - CONTENT. Rows are stored as a JSON round-trip of the WHOLE record, never
+ *     as a hand-written column list. That is deliberate: the resolver's
+ *     correctness depends on optional, additively-introduced fields
+ *     (`receiver_chain`, `local`, `import_aliases`, `line`/`col`), and a
+ *     field-by-field spill is exactly how a future added field would go missing
+ *     and silently cost real edges. `JSON.parse(JSON.stringify(x))` cannot drift.
+ *   - ORDER. `seq INTEGER PRIMARY KEY` is the insertion counter and every read
+ *     is `ORDER BY seq`, so a streamed pass sees records in the same order the
+ *     in-memory array did. Edge resolution is order-sensitive in one place (the
+ *     aggregation that folds occurrences into one weighted row), so this is not
+ *     a nicety.
+ *
+ * It is NOT the project index and must never be confused with one: a private
+ * file under the system temp dir, no schema version, no migrations, deleted in
+ * a `finally`. Durability is worthless here, so journalling and fsync are off —
+ * a crashed ingest re-runs from source.
+ */
+export class IngestSpill {
+  private readonly db: Database;
+  /** Absolute path of the temp database file (exposed for error messages/tests). */
+  readonly path: string;
+  private nodeSeq = 0;
+  private edgeSeq = 0;
+  private destroyed = false;
+
+  private constructor(path: string) {
+    this.path = path;
+    this.db = new Database(path, { create: true });
+    // Throwaway store: durability is worthless (a crashed ingest re-parses from
+    // source), and journalling/fsync is the entire I/O cost of spilling.
+    this.db.exec("PRAGMA journal_mode = OFF");
+    this.db.exec("PRAGMA synchronous = OFF");
+    // `seq` is the insertion counter AND the primary key, so `ORDER BY seq`
+    // replays the exact order the in-memory arrays had. `k` (edge kind) is
+    // broken out of the JSON only so the import pre-pass can filter in SQL;
+    // the authoritative value is still the one inside `j`.
+    this.db.exec("CREATE TABLE n (seq INTEGER PRIMARY KEY, j TEXT NOT NULL)");
+    this.db.exec("CREATE TABLE e (seq INTEGER PRIMARY KEY, k TEXT NOT NULL, j TEXT NOT NULL)");
+  }
+
+  /**
+   * Create a spill file under the system temp dir (honors `TMPDIR`). The name
+   * carries the pid and a random suffix so concurrent ingests — the daemon runs
+   * several projects at once — never collide on one file.
+   */
+  static open(label = "ingest"): IngestSpill {
+    const unique = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    return new IngestSpill(join(tmpdir(), `hayven-spill-${label}-${unique}.sqlite`));
+  }
+
+  /** Append node records, in order, in one transaction. */
+  appendNodes(rows: Iterable<unknown>): void {
+    this.append("n", rows, null);
+  }
+
+  /** Append raw edge records, in order, in one transaction. `kind` is mirrored
+   *  into its own column so {@link edges} can filter without parsing every row. */
+  appendEdges(rows: Iterable<{ kind: string }>): void {
+    this.append("e", rows, (r) => (r as { kind: string }).kind);
+  }
+
+  private append(
+    table: "n" | "e",
+    rows: Iterable<unknown>,
+    kindOf: ((row: unknown) => string) | null,
+  ): void {
+    const sql =
+      kindOf === null
+        ? "INSERT INTO n (seq, j) VALUES (?, ?)"
+        : "INSERT INTO e (seq, k, j) VALUES (?, ?, ?)";
+    const stmt = this.db.query<unknown, SQLQueryBindings[]>(sql);
+    try {
+      this.db.transaction(() => {
+        for (const row of rows) {
+          const json = JSON.stringify(row);
+          if (kindOf === null) stmt.run(++this.nodeSeq, json);
+          else stmt.run(++this.edgeSeq, kindOf(row), json);
+        }
+      })();
+    } catch (err) {
+      // A spill write fails for exactly one interesting reason — the temp
+      // filesystem is full — and the raw SQLite message names a path the user
+      // has never heard of. Say what this file is and how big the run got, so
+      // "ingest failed" is diagnosable rather than mysterious.
+      throw new Error(
+        `ingest spill write failed (${(err as Error).message}). The spill is a ` +
+          `throwaway overflow file at ${this.path}; this usually means the temp ` +
+          `filesystem is full. Set TMPDIR to a volume with room, or lower the ` +
+          `HAYVEN_MAX_INGEST_NODES / HAYVEN_MAX_INGEST_EDGES caps.`,
+      );
+    }
+  }
+
+  /** How many records have been spilled to each table. */
+  get counts(): { nodes: number; edges: number } {
+    return { nodes: this.nodeSeq, edges: this.edgeSeq };
+  }
+
+  /** Replay node records in insertion order, `batchSize` at a time. */
+  *nodes<T>(batchSize = 1000): Generator<T[]> {
+    yield* this.replay<T>("n", batchSize, undefined);
+  }
+
+  /** Replay raw edge records in insertion order, `batchSize` at a time,
+   *  optionally restricted to one edge `kind`. */
+  *edges<T>(batchSize = 1000, kind?: string): Generator<T[]> {
+    yield* this.replay<T>("e", batchSize, kind);
+  }
+
+  /**
+   * Keyset pagination on `seq` (never OFFSET, which re-scans). Each page is
+   * parsed, yielded, and dropped, so the caller's heap holds one page — that is
+   * the whole point of the spill.
+   */
+  private *replay<T>(table: "n" | "e", batchSize: number, kind: string | undefined): Generator<T[]> {
+    const size = Math.max(1, batchSize);
+    const sql =
+      kind === undefined
+        ? `SELECT seq, j FROM ${table} WHERE seq > ? ORDER BY seq LIMIT ${size}`
+        : `SELECT seq, j FROM ${table} WHERE seq > ? AND k = ? ORDER BY seq LIMIT ${size}`;
+    const stmt = this.db.query<{ seq: number; j: string }, SQLQueryBindings[]>(sql);
+    let after = 0;
+    for (;;) {
+      const rows = kind === undefined ? stmt.all(after) : stmt.all(after, kind);
+      if (rows.length === 0) return;
+      after = rows[rows.length - 1]!.seq;
+      yield rows.map((r) => JSON.parse(r.j) as T);
+    }
+  }
+
+  /** Close and UNLINK the temp file. Idempotent and never throws — call it from
+   *  a `finally`, including on the abort paths, so a refused run leaves nothing
+   *  behind on the temp filesystem. */
+  destroy(): void {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    try {
+      this.db.close();
+    } catch {
+      // best-effort
+    }
+    for (const suffix of ["", "-wal", "-shm"]) {
+      try {
+        rmSync(this.path + suffix, { force: true });
+      } catch {
+        // best-effort — a leftover temp file is not worth failing an ingest over
+      }
+    }
+  }
 }

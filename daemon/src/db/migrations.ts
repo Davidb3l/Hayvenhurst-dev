@@ -6,6 +6,7 @@
  */
 import type { Database } from "bun:sqlite";
 
+import { remapLegacyId } from "../graph/idScheme.ts";
 import { INGEST_IN_PROGRESS_KEY, inProgressSince, readInFlight } from "./index_health.ts";
 import {
   FTS_FLEET_MEMORY_SQL,
@@ -29,6 +30,30 @@ export interface MigrationResult {
    * cutover ran on this start.
    */
   crdtCutover: { droppedObservations: number; droppedClaims: number } | null;
+  /**
+   * Set when the v7 → v8 entity-id scheme change ran (KNOWN_ISSUES #1). The
+   * caller should tell the user the index now needs a full re-ingest, because
+   * the graph was dropped and nothing else will say so until they run a query
+   * and get nothing. `null` when no id-scheme migration ran on this start.
+   */
+  idScheme: IdSchemeMigration | null;
+}
+
+/** What the v7 → v8 id-scheme migration did. */
+export interface IdSchemeMigration {
+  /** Node rows whose id changed spelling — i.e. the size of the remap table. */
+  remapped: number;
+  /** `fleet_memory` rows whose `node_id` anchor was rewritten. */
+  memoryNodeIds: number;
+  /** `fleet_memory` rows whose `scope_json` array was rewritten. */
+  memoryScopes: number;
+  /**
+   * Old ids skipped because two of them remapped onto ONE new id, so rewriting
+   * would have merged two distinct anchors. Anchors on these are left as-is.
+   */
+  ambiguous: number;
+  /** Graph rows discarded (they keyed off the old ids). */
+  droppedNodes: number;
 }
 
 /**
@@ -46,6 +71,17 @@ export function migrate(db: Database): MigrationResult {
   // shape of the bug that re-armed today's incident, so this is a hard refusal.
   assertSchemaCompatible(db, fromVersion);
   let appliedFts = false;
+
+  // v7 → v8 (entity-id scheme, KNOWN_ISSUES #1). MUST run BEFORE `SCHEMA_SQL`
+  // and before the FTS block below, for two reasons:
+  //   - it reads `nodes` to learn which FILE each old id belonged to, which is
+  //     the only way to rewrite `fleet_memory`'s anchors; that table must still
+  //     hold the OLD ids when we look;
+  //   - it DROPS the id-keyed tables, and the `CREATE … IF NOT EXISTS` in
+  //     `SCHEMA_SQL`/`FTS_SQL` immediately after is what recreates them empty.
+  // Running it after would either read a table we just rebuilt or leave the
+  // dropped tables missing until the next start.
+  const idScheme = migrateIdSchemeV8(db, fromVersion);
 
   db.exec(SCHEMA_SQL);
 
@@ -97,7 +133,249 @@ export function migrate(db: Database): MigrationResult {
   const crdtCutover = fromVersion < 2 && fromVersion > 0 ? cutoverV1toV2(db) : null;
 
   setUserVersion(db, SCHEMA_VERSION);
-  return { fromVersion, toVersion: SCHEMA_VERSION, appliedFts, crdtCutover };
+  return { fromVersion, toVersion: SCHEMA_VERSION, appliedFts, crdtCutover, idScheme };
+}
+
+/**
+ * v7 → v8: the entity-id scheme change (KNOWN_ISSUES #1).
+ *
+ * `scopeForFile` stopped eliding the first `src/` path segment, so every stored
+ * id changes spelling (`auth/login` → `src/auth/login`). Three consequences,
+ * handled in this order INSIDE ONE TRANSACTION:
+ *
+ *  1. REWRITE the anchors that cannot be rebuilt. `fleet_memory` is
+ *     agent/user-AUTHORED knowledge — no markdown mirror, no CRDT op log, SQLite
+ *     is the only copy — and its `node_id`/`scope_json` point at ids. We remap
+ *     them via {@link remapLegacyId}, using each node's `file` to recover which
+ *     path produced the old id. This MUST precede step 2: `nodes` is the only
+ *     record of that old-id → file mapping, and step 2 destroys it.
+ *  2. DROP the id-keyed graph. `nodes`, `edges`, `call_sites`, `nodes_fts` and
+ *     `merge_rejections` are all keyed by ids that are now wrong. All five are
+ *     re-derived from a parse of the working tree, so dropping them costs one
+ *     re-ingest and nothing else. We do NOT rewrite them in place: a full
+ *     re-ingest has to happen regardless (the `.hayven/nodes/**.md` files are
+ *     named FROM the id and only the ingest's orphan sweep renames them), so an
+ *     in-place PK rewrite would be a second, riskier way to produce rows the
+ *     very next ingest replaces anyway.
+ *  3. STAMP the version, in the same transaction.
+ *
+ * WHY ONE TRANSACTION, AND WHY THE STAMP IS INSIDE IT. This codebase already
+ * carries the scar of a destructive step that could half-apply and then report
+ * itself healthy (`ingest_in_progress`, `checkIndexIntegrity`, the `dropDerived`
+ * tripwires). Rather than add a second marker discipline to get back to
+ * "detectable", we make a partial migration UNREPRESENTABLE: `PRAGMA
+ * user_version` is transactional in SQLite (it lives in the database header and
+ * rolls back with the enclosing transaction — verified against this build, not
+ * assumed), so the anchor rewrite, the drop and the version bump commit or
+ * abort as a unit. A crash mid-migration leaves a v7 index with its graph and
+ * anchors untouched, and the migration simply re-runs on the next start.
+ *
+ * WHY IT IS SAFE TO LEAVE THE INDEX EMPTY afterwards. Step 2 leaves zero nodes
+ * while `stats.last_ingest_nodes` still records the count of the last successful
+ * ingest. That is exactly the `empty-but-claims-content` condition
+ * `readIndexIntegrity` already tests for, so the index reports itself UNUSABLE
+ * (not "fresh and empty") to every reader, and `cli/ingest.ts` refuses the
+ * incremental path and does a full rebuild — which is precisely the forced
+ * reindex this migration requires. We deliberately reuse that existing detector
+ * instead of introducing a new flag no other code path knows to check.
+ * `last_ingest_nodes` is therefore load-bearing here and must survive the stats
+ * clear, which is why the clear reuses {@link REINDEX_PRESERVED_STAT_KEYS}.
+ *
+ * NOT MIGRATED, deliberately — `claims`. Its anchors are node ids too, but the
+ * SQL `claims` table is a write-only cache with no reader: the OR-Set CRDT op
+ * log under `.hayven/crdt/orset/` is authoritative for every claims read path.
+ * Rewriting the SQL rows would change nothing a user can observe while implying
+ * a guarantee we cannot make, and the op log itself has no migration machinery
+ * at all. Claims are ephemeral by construction (an absolute TTL deadline,
+ * default one hour) so old-id claims simply expire. The real cost is bounded and
+ * stated: for up to one TTL after this migration, an old-id claim will not
+ * overlap-match a new-id claim, so two agents could hold what is really the same
+ * entity under two spellings.
+ */
+function migrateIdSchemeV8(db: Database, fromVersion: number): IdSchemeMigration | null {
+  // fromVersion 0 is a BRAND-NEW database (no `nodes` table yet, nothing
+  // written under the old scheme). >= 8 has already been migrated. Only an
+  // existing pre-v8 index needs this.
+  if (fromVersion <= 0 || fromVersion >= 8) return null;
+  if (!tableExists(db, "nodes")) return null;
+
+  // Build the old-id → new-id table from the surviving node rows. A node whose
+  // `file` is null cannot be remapped (nothing says which path produced its id)
+  // and is skipped; so is any id `remapLegacyId` does not recognise.
+  const rows = db
+    .query<{ id: string; file: string | null }, []>("SELECT id, file FROM nodes")
+    .all();
+  const remap = new Map<string, string>();
+  const newIdOwners = new Map<string, number>();
+  for (const row of rows) {
+    if (row.file === null || row.file.length === 0) continue;
+    const next = remapLegacyId(row.id, row.file);
+    // Count the id this node will OCCUPY after the migration — which for a node
+    // whose spelling does not change is its existing id. Counting only the
+    // CHANGED ones misses the asymmetric collision: `a/src.ts::function b` keeps
+    // the id `a/src/b` while `a/src/b.ts::module b` remaps ONTO it from `a/b`.
+    // Only one of the two appears in the remap table, so a guard that looked
+    // just at remap targets saw no contest and merged the anchors anyway.
+    const occupied = next ?? row.id;
+    newIdOwners.set(occupied, (newIdOwners.get(occupied) ?? 0) + 1);
+    if (next === null || next === row.id) continue;
+    remap.set(row.id, next);
+  }
+
+  // AMBIGUITY GUARD. Two distinct old ids can land on one new id when a repo
+  // holds both a FILE and a DIRECTORY of the same name (`a/src.ts::function b`
+  // and `a/src/b.ts::module b` both spell `a/src/b`). That collision predates
+  // this change and is not what it fixes — but silently applying the remap
+  // would MERGE two anchors onto one symbol, turning a stale note into a
+  // confidently misattributed one. Leave both old ids alone instead: a note
+  // pointing at an id that no longer exists is visibly unanchored, which is a
+  // better failure than one pointing at the wrong function.
+  let ambiguous = 0;
+  for (const [oldId, newId] of [...remap]) {
+    if ((newIdOwners.get(newId) ?? 0) > 1) {
+      remap.delete(oldId);
+      ambiguous++;
+    }
+  }
+
+  const keepKeys = REINDEX_PRESERVED_STAT_KEYS.map((k) => `'${k}'`).join(", ");
+  const result: IdSchemeMigration = {
+    remapped: remap.size,
+    memoryNodeIds: 0,
+    memoryScopes: 0,
+    ambiguous,
+    droppedNodes: rows.length,
+  };
+
+  db.exec("BEGIN");
+  try {
+    if (tableExists(db, "fleet_memory")) {
+      const rewrite = rewriteFleetMemoryAnchors(db, remap);
+      result.memoryNodeIds = rewrite.nodeIds;
+      result.memoryScopes = rewrite.scopes;
+    }
+
+    // Drop the id-keyed graph. Triggers first, then the FTS shadow, then the
+    // base tables — the same order `dropDerived` uses, so a trigger is never
+    // left referencing a table that is already gone. `SCHEMA_SQL`/`FTS_SQL` in
+    // the caller recreate all of these empty.
+    db.exec(`
+      DROP TRIGGER IF EXISTS nodes_fts_ai;
+      DROP TRIGGER IF EXISTS nodes_fts_ad;
+      DROP TRIGGER IF EXISTS nodes_fts_au;
+      DROP TABLE  IF EXISTS nodes_fts;
+      DROP TABLE  IF EXISTS merge_rejections;
+      DROP TABLE  IF EXISTS call_sites;
+      DROP TABLE  IF EXISTS edges;
+      DROP TABLE  IF EXISTS nodes;
+    `);
+
+    // Same rule as `dropDerived`: clear the stats that assert a SUCCESSFUL
+    // ingest (`last_ingest_at`, `last_ingest_git_head`, the warning counters)
+    // because that ingest's output no longer exists — leaving `last_ingest_at`
+    // is what makes staleness lie. `last_ingest_nodes` and the in-progress
+    // marker are PRESERVED: the first is the detector that makes this empty
+    // graph read as damaged rather than fresh (see the docstring), the second
+    // belongs to whatever ingest may be running.
+    if (tableExists(db, "stats")) {
+      db.exec(`DELETE FROM stats WHERE key NOT IN (${keepKeys})`);
+      // Audit trail: a plain historical fact, so it never needs clearing and
+      // cannot go stale the way a "reindex required" flag would.
+      const stamp = db.query<never, [string, string]>(
+        "INSERT INTO stats (key, value) VALUES (?, ?) " +
+          "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      );
+      stamp.run("id_scheme_v8_migrated_at", String(Date.now()));
+      stamp.run("id_scheme_v8_anchors_rewritten", String(result.memoryNodeIds + result.memoryScopes));
+    }
+
+    // The version stamp lives INSIDE the transaction on purpose — it is what
+    // makes "anchors rewritten but graph not dropped" (and every other partial
+    // state) unrepresentable rather than merely detectable.
+    setUserVersion(db, 8);
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+  return result;
+}
+
+/**
+ * Rewrite `fleet_memory`'s two id-bearing columns through `remap`.
+ *
+ * `node_id` is a single id. `scope_json` is a JSON array of ids, rewritten
+ * element-wise so an array that mixes remappable and unrecognised ids keeps the
+ * unrecognised ones verbatim rather than being dropped wholesale.
+ *
+ * Rows are UPDATEd, never deleted-and-reinserted: `fleet_memory` writes go
+ * through `INSERT OR REPLACE` elsewhere and the FTS triggers are tuned to net
+ * that into an upsert, whereas a plain UPDATE fires NEITHER trigger — which is
+ * exactly right here, because `fleet_memory_fts` indexes only `id` and `note`
+ * and neither of those changes. Doing this as delete+insert would churn the FTS
+ * index for no reason and put the only copy of the user's notes through a
+ * needless round trip.
+ */
+function rewriteFleetMemoryAnchors(
+  db: Database,
+  remap: Map<string, string>,
+): { nodeIds: number; scopes: number } {
+  let nodeIds = 0;
+  let scopes = 0;
+  if (remap.size === 0) return { nodeIds, scopes };
+
+  const setNodeId = db.query<never, [string, string]>(
+    "UPDATE fleet_memory SET node_id = ? WHERE id = ?",
+  );
+  const setScope = db.query<never, [string, string]>(
+    "UPDATE fleet_memory SET scope_json = ? WHERE id = ?",
+  );
+
+  const rows = db
+    .query<{ id: string; node_id: string | null; scope_json: string | null }, []>(
+      "SELECT id, node_id, scope_json FROM fleet_memory",
+    )
+    .all();
+
+  for (const row of rows) {
+    if (row.node_id !== null) {
+      const next = remap.get(row.node_id);
+      if (next !== undefined) {
+        setNodeId.run(next, row.id);
+        nodeIds++;
+      }
+    }
+    if (row.scope_json === null || row.scope_json.length === 0) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(row.scope_json);
+    } catch {
+      continue; // unparseable scope — leave it exactly as the user's row had it.
+    }
+    if (!Array.isArray(parsed)) continue;
+    let changed = false;
+    const next = parsed.map((entry) => {
+      if (typeof entry !== "string") return entry;
+      const mapped = remap.get(entry);
+      if (mapped === undefined) return entry;
+      changed = true;
+      return mapped;
+    });
+    if (!changed) continue;
+    setScope.run(JSON.stringify(next), row.id);
+    scopes++;
+  }
+  return { nodeIds, scopes };
+}
+
+/** True when a table (or virtual table) of this name exists. */
+function tableExists(db: Database, name: string): boolean {
+  const row = db
+    .query<{ n: number }, [string]>(
+      "SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name=?",
+    )
+    .get(name);
+  return (row?.n ?? 0) > 0;
 }
 
 /**

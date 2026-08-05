@@ -11,10 +11,11 @@
  * `/node/*` path to that shell so deep-links work.
  */
 import { existsSync, statSync } from "node:fs";
-import { join, relative, resolve } from "node:path";
+import { join, resolve } from "node:path";
 
 import { Elysia } from "elysia";
 
+import { containWithinRoot } from "../../db/context_pack.ts";
 import type { ServerDependencies } from "../server.ts";
 
 /**
@@ -52,21 +53,57 @@ function mimeFor(path: string): string {
  * Resolve a request path under a root, defending against directory traversal.
  * Returns null when the resolved path escapes the root or doesn't exist as a
  * regular file. Directories become `<dir>/index.html`.
+ *
+ * CONTAINMENT IS NOT DONE HERE. It goes through {@link containWithinRoot}, the
+ * same helper the packer's path gate uses. This route used to run its own
+ * `relative()`-with-`..`-prefix test and no realpath hop, which is a purely
+ * LEXICAL answer: a symlink planted inside the built viewer directory pointed
+ * anywhere on disk and was served, because `resolve()` never follows links and
+ * `relative()` only compares strings. It was also the THIRD copy of a
+ * containment check in this codebase, and the other two had already drifted
+ * apart in exactly this way — so the fix is to delete the copy, not to patch it.
+ *
+ * What is NOT shared is policy: the packer's gate additionally applies a
+ * credential denylist and an indexer-parity extension rule, both of which would
+ * refuse `.css`, `.html`, `.woff2` and every other legitimate viewer asset.
+ * Containment is the part that is universal; what may be served is not.
  */
 function resolveStatic(root: string, requestPath: string): string | null {
   const stripped = requestPath.replace(/^\/+/, "");
-  const candidate = resolve(root, stripped);
-  const rel = relative(root, candidate);
-  if (rel.startsWith("..") || rel.startsWith(`..${"/"}`)) return null;
+  // `resolve(root, "")` is the root itself, which is a legitimate request
+  // (`GET /` → the root index.html), but `containWithinRoot` refuses an empty
+  // candidate outright, so spell the root as ".".
+  const hit = containWithinRoot(root, stripped.length > 0 ? stripped : ".");
+  if (hit === null || !hit.exists) return null;
 
-  if (!existsSync(candidate)) return null;
-
-  const st = statSync(candidate);
-  if (st.isDirectory()) {
-    const indexPath = join(candidate, "index.html");
-    return existsSync(indexPath) ? indexPath : null;
+  // `hit.abs` is already realpath'd, so this stat describes the real target.
+  let st: ReturnType<typeof statSync>;
+  try {
+    st = statSync(hit.abs);
+  } catch {
+    return null;
   }
-  return st.isFile() ? candidate : null;
+  if (st.isDirectory()) {
+    // Re-gated rather than joined: `<dir>/index.html` may itself be a symlink
+    // out of the tree, and the whole point of this change is that a path is
+    // never served on the strength of its spelling.
+    const index = containWithinRoot(root, join(hit.rel, "index.html"));
+    if (index === null || !index.exists) return null;
+    try {
+      return statSync(index.abs).isFile() ? index.abs : null;
+    } catch {
+      return null;
+    }
+  }
+  return st.isFile() ? hit.abs : null;
+}
+
+/** The viewer's own build artifacts, resolved through the same containment gate
+ *  as a client request. The SPA shells are server-chosen, not client-named, but
+ *  they live in the same writable build directory a planted symlink would target
+ *  — and a second, ungated `join()` is exactly the divergence this fix removes. */
+function resolveShell(root: string, ...parts: string[]): string | null {
+  return resolveStatic(root, parts.join("/"));
 }
 
 export function viewerRoutes(deps: ServerDependencies) {
@@ -97,8 +134,7 @@ export function viewerRoutes(deps: ServerDependencies) {
       }
       const url = new URL(request.url);
       const direct = resolveStatic(root, url.pathname);
-      const shellPath = join(root, "node", "index.html");
-      const target = direct ?? (existsSync(shellPath) ? shellPath : null);
+      const target = direct ?? resolveShell(root, "node", "index.html");
       if (!target) {
         set.status = 404;
         return { error: "viewer node shell not found" };
@@ -129,8 +165,8 @@ export function viewerRoutes(deps: ServerDependencies) {
       const target = resolveStatic(root, url.pathname);
       if (!target) {
         // Try the index.html as a last-resort root fallback.
-        const indexPath = join(root, "index.html");
-        if (url.pathname === "/" && existsSync(indexPath)) {
+        const indexPath = url.pathname === "/" ? resolveShell(root, "index.html") : null;
+        if (indexPath !== null) {
           set.headers["content-type"] = "text/html; charset=utf-8";
           set.headers["cache-control"] = "no-cache";
           return Bun.file(indexPath);

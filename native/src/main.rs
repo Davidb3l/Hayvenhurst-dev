@@ -19,7 +19,7 @@ use hayven_native::infer::{self, InferOptions, DEFAULT_MAX_TOKENS, DEFAULT_TEMP}
 use hayven_native::parse::language::Language;
 use hayven_native::parse::ParseOptions;
 use hayven_native::proto::Record;
-use hayven_native::{parse, serialize, watch, VERSION};
+use hayven_native::{ignore_query, parse, serialize, watch, VERSION};
 
 /// Native performance companion for the Hayvenhurst daemon. Wraps
 /// Tree-sitter parsing, OS-level file watching, and CRDT wire
@@ -162,6 +162,17 @@ enum Cmd {
         temp: f64,
     },
 
+    /// Batch "would the walker exclude this path?" oracle. Reads one NDJSON
+    /// request per stdin line and writes one NDJSON response per line:
+    ///   `{"op":"check_ignored","root":…,"paths":[…]}` → `{"ignored":[bool]}`
+    ///
+    /// Exists so the daemon's context PACKER — which reads raw files into a
+    /// model prompt and cannot await a subprocess per read — can consult the
+    /// SAME `ignore`-crate configuration the indexer walks with, instead of
+    /// hand-rolling gitignore semantics in TypeScript. See
+    /// `src/ignore_query.rs` for the wire and what a `true` verdict covers.
+    CheckIgnored,
+
     /// Print diagnostics: version, supported languages, hardware.
     Doctor,
 }
@@ -220,6 +231,7 @@ fn main() -> ExitCode {
             max_tokens,
             temp,
         }) as u8),
+        Cmd::CheckIgnored => ExitCode::from(ignore_query::run() as u8),
         Cmd::Doctor => {
             run_doctor();
             ExitCode::from(0)

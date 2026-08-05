@@ -20,40 +20,53 @@
 // data over delete" and "do not silently drop data that changes merge
 // results", so this module is deliberately observe-and-shout only.
 //
-// ── T5 VERDICT: PRUNING IS A PROTOCOL CHANGE. STILL NOT IMPLEMENTED. ────────
+// ── VERDICT: PRUNING WILL NOT BE BUILT. SEE docs/RFC-001. ───────────────────
 //
-// The candidate design was: peers exchange `oldest_retained_day` in the Merkle
-// handshake; `diffSnapshots` ignores every day below `max(mine, theirs)`; and a
-// peer prunes a day only once EVERY KNOWN PEER has acknowledged it. Assessed
-// against the code as it stands, that design cannot be built here, and the
-// blocker is the third clause rather than the first two:
+// An earlier revision of this note (the "T5 verdict") sketched an
+// acknowledgement protocol in full: peers exchange `oldest_retained_day` in the
+// Merkle handshake, `diffSnapshots` floors at `max(mine, theirs)`, and a peer
+// prunes a day only once EVERY KNOWN PEER has acknowledged it. It concluded the
+// design was blocked on missing substrate — no peer identity, no ack store —
+// and estimated the cost of building it.
 //
-//   1. The handshake half IS cheap. `GET /api/sync/merkle` returns
-//      `Record<CrdtType, string>`; adding an `oldest_retained_day` field is
-//      backward-compatible (old peers ignore unknown fields) and the
-//      `diffSnapshots` floor is a few lines. Roughly a day of work.
-//   2. "Every known peer has acknowledged it" has NO SUBSTRATE. There is no
-//      peer set: `config.sync_peers` is declared in `config/defaults.ts` and
-//      read by nothing. There is no peer identity, no ack store, no
-//      last-seen-per-peer table, and no peer-initiated callback. `hayven sync
-//      <peer_url>` is a ONE-SHOT, initiator-driven CLI invocation against a URL
-//      typed on the command line; the responding daemon does not even learn who
-//      called it. So "every known peer" evaluates over the empty set, which
-//      makes the safety condition vacuously true — i.e. the design would prune
-//      immediately and reintroduce exactly the divergence it exists to prevent.
-//   3. Shipping only half of it is WORSE than shipping none. A peer that prunes
-//      while advertising a floor an OLD peer does not read gets its data pushed
-//      straight back by that old peer, forever, on every sync — the pull/push
-//      loop above with extra steps. So the floor must be understood by BOTH
-//      ends before either end may prune, which makes this a two-sided,
-//      version-gated rollout.
+// **That framing is superseded. Do not implement it, and do not cost it.**
+// `docs/RFC-001-peer-sync-and-retention.md` is the current decision.
 //
-// The honest cost is therefore: a durable peer registry (identity + last-acked
-// day per peer, persisted), an ack exchange, a `MIN_COMPATIBLE_DAEMON_VERSION`
-// bump so a pruning peer refuses to prune against a peer that predates the
-// floor field, and a migration for existing logs. That is its own release
-// cycle, not a patch in a gap-closing round, and attempting it inside this pass
-// would risk silent, unrecoverable data loss across replicas. It is NOT done.
+// WHAT CHANGED: the premise was finally MEASURED instead of assumed. On a real
+// install with five registered projects and two months of daily use, the
+// largest CRDT directory was 12 KB and the total across every log was 2,098
+// bytes — a projected ~12 KB/year, or roughly 42,600 years to reach the 512 MiB
+// `warnTotalBytes` threshold below. A user generating a HUNDRED TIMES more CRDT
+// traffic still needs about four centuries to trip that warning.
+//
+// So the growth is unbounded in the formal sense and irrelevant in every
+// practical one. Pruning carries a permanent-data-loss risk — operations are
+// the durable record of graph history, and a peer that prunes a day nobody else
+// kept has destroyed it irrecoverably — and that risk requires a proportionate
+// benefit, which does not exist at 12 KB/year. `KNOWN_ISSUES` #3 is closed as
+// "will not fix", with the measurement recorded so the next reader does not
+// redesign this from the same stale premise. This note is that record: the
+// reasoning error was that a written-down design read as an established
+// requirement, and the solution was re-derived without ever re-testing the
+// problem.
+//
+// IF GROWTH EVER DOES BECOME REAL (RFC-001 §3), the options in ascending order
+// of risk are: (1) fix the LOADING strategy, not the data — lazy/streamed
+// hydrate, no coordination and nothing destroyed; (2) compress cold segments in
+// place, still Merkle-comparable after decompression; (3) snapshot plus tail;
+// and only then (4) actual deletion with peer acknowledgement. Three
+// non-destructive options exist and none of them were considered before a
+// destructive protocol was designed. RFC-001 §5 records the one condition that
+// would reopen this: a measurement, from a genuinely heavy multi-agent
+// workload, that differs by orders of magnitude. An assumption will not do.
+//
+// WHAT WAS BUILT INSTEAD: the one genuinely useful thing that surfaced —
+// PEER IDENTITY (RFC-001 §4, `crdt/peers.ts`). It stands entirely on its own
+// and has no relationship to pruning: `config.sync_peers` was dead
+// configuration and a daemon could not answer "who am I synced with?". It now
+// can. Note what it deliberately is NOT: there is no `acked_through_day`, no
+// retention horizon, and no policy of any kind. It records who has synced. Do
+// not grow an ack protocol back out of it.
 //
 // What IS enforced here is the hard inbound cap in `oplog.ts`
 // (`maxPushBatchBytes` / `maxSegmentBytes` / the segment-day window), which

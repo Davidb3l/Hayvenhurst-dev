@@ -221,16 +221,24 @@ describe("T6 — `hayven crdt retention` is a PULL surface for the same numbers"
 
 describe("T5 — pruning is NOT implemented, and the code says so", () => {
   it("nothing in the retention module deletes a segment", () => {
-    // A guard against a future well-meaning patch quietly adding a prune
-    // without the peer handshake — which would diverge our Merkle root from
-    // every peer that kept the data, and they would push it straight back.
+    // A guard against a future well-meaning patch quietly adding a prune.
+    //
+    // The REASON pruning is refused has changed, and the banner assertion moved
+    // with it. It used to be "this needs a peer acknowledgement protocol we do
+    // not have". The premise was then measured: the log grows ~12 KB/year, so
+    // reaching the warning threshold takes ~42,600 years, and no deletion is
+    // warranted at all. See docs/RFC-001. The no-delete assertions below are
+    // the load-bearing half and are unchanged — they fail whatever the stated
+    // rationale happens to be, which is the point of pinning behaviour rather
+    // than prose.
     const src = Bun.file(
       join(import.meta.dir, "../src/crdt/retention.ts"),
     );
     return src.text().then((text) => {
       expect(text).not.toContain("unlinkSync");
       expect(text).not.toContain("rmSync");
-      expect(text).toContain("PRUNING IS A PROTOCOL CHANGE");
+      expect(text).toContain("PRUNING WILL NOT BE BUILT");
+      expect(text).toContain("RFC-001");
     });
   });
 });

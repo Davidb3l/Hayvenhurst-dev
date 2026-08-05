@@ -14,6 +14,17 @@
  *   the single declared (downloadable) artifact and the only file presence is
  *   keyed on (see TOKENIZER note).
  *
+ * WEIGHTS ARE GLOBAL, NOT PER-PROJECT. The `<.hayven>` above is the GLOBAL
+ * `~/.hayven` (see `globalModelsDir`). Weights are immutable and content-
+ * addressed — every artifact below pins a real sha256 — so the same id is the
+ * same bytes in every project. They were per-project until a user ended up with
+ * a 3.1 GB GGUF in ONE project's `.hayven/models/` (an archived clone the
+ * daemon does not even serve) that no other project could see; five registered
+ * projects would have meant ~15.5 GB of identical weights. Resolution now reads
+ * GLOBAL FIRST and falls back to a project's own legacy copy, so an existing
+ * per-project download is still found and never re-fetched. `modelDir` is the
+ * single resolver both readers and `pull` go through — see it for why.
+ *
  * REAL COORDINATES: the `url`/`sha256` below point at concrete, currently-
  * available Gemma GGUF artifacts on Hugging Face. The sha256 values are the
  * **published LFS oids** read from the HF tree API for each blob, so `pull`
@@ -71,6 +82,8 @@
  */
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+
+import { canonicalRoot, globalHayvenDir } from "../util/paths.ts";
 
 /** The canonical filename of a model's primary weights inside its model dir. */
 export const GGUF_FILENAME = "model.gguf";
@@ -226,6 +239,21 @@ export function modelsDir(hayvenDir: string): string {
 }
 
 /**
+ * The GLOBAL model store: `~/.hayven/models/` (honouring `$HAYVEN_HOME`).
+ *
+ * WHY GLOBAL. Weights are immutable, content-addressed (every registry artifact
+ * pins a sha256) and byte-identical for every project, so a per-project store
+ * bought nothing and cost a full re-download per repo — one user had a 3.1 GB
+ * GGUF sitting in a single project's `.hayven/models/`, and pulling it in their
+ * other four registered projects would have cost ~15.5 GB of identical bytes.
+ * Worse, the copy landed in an archived clone the daemon does not even serve,
+ * so nothing else could see it.
+ */
+export function globalModelsDir(): string {
+  return modelsDir(globalHayvenDir());
+}
+
+/**
  * Per-model directory NAME (not a path): the id with the two structural
  * separators `:` and `/` replaced by `_` so it is a single safe path segment.
  * e.g. "gemma4:e2b" → "gemma4_e2b".
@@ -235,17 +263,142 @@ export function modelDirName(id: string): string {
 }
 
 /**
- * The per-model directory for an id, or null for an unknown id.
- * `<.hayven>/models/<dirname>/` per the model-layout contract.
+ * The per-model directory for an id INSIDE a specific `.hayven`, or null for an
+ * unknown id. Pure path join — NO existence check, NO global/project
+ * resolution. `<.hayven>/models/<dirname>/` per the model-layout contract.
+ *
+ * This is the low-level spelling. Everything that wants "where are this model's
+ * weights" must go through {@link modelDir} instead, so a reader and a writer
+ * can never disagree about which copy they mean.
  */
-export function modelDir(hayvenDir: string, id: string): string | null {
+export function modelDirIn(hayvenDir: string, id: string): string | null {
   const entry = MODEL_REGISTRY[id];
   return entry ? join(modelsDir(hayvenDir), modelDirName(id)) : null;
 }
 
+/** Scope of a model copy on disk. */
+export type ModelScope = "global" | "project";
+
+/** One candidate home for a model's weights. */
+export interface ModelLocation {
+  readonly scope: ModelScope;
+  /** The `.hayven` this location belongs to. */
+  readonly hayvenDir: string;
+  /** `<hayvenDir>/models/<dirname>/`. */
+  readonly dir: string;
+  /** True iff EVERY declared artifact of the id exists in `dir`. */
+  readonly present: boolean;
+}
+
+/**
+ * The `.hayven` homes a model may live in, in RESOLUTION ORDER: the global
+ * store first, then the project's own `.hayven` (the legacy per-project
+ * location) when it is a different directory.
+ *
+ * The project arm is BACK-COMPAT, not a second canonical home: a user who
+ * pulled before weights went global has GBs already on disk, and silently
+ * re-downloading them because we only looked in the new place is precisely the
+ * waste this change exists to end. Reads therefore still find that copy.
+ *
+ * The dedupe matters: when the cwd resolves to `$HOME`, the "project" `.hayven`
+ * IS `~/.hayven`, and without it every location list would report the one copy
+ * twice and `models list` would call it redundant.
+ *
+ * It compares through `canonicalRoot` (symlinks resolved), not `resolve`, for
+ * the same reason `findUp` and `detectRepoRoot` do: `globalHayvenDir()` derives
+ * from `homedir()`/`$HAYVEN_HOME` with symlinks INTACT, while the project arm
+ * comes from `process.cwd()` and is always physical. On a host with a symlinked
+ * home (`/home/x` → `/mnt/…`, an autofs/NFS home, a relocated macOS home) a raw
+ * `resolve` comparison never matches, ONE physical directory is reported as two
+ * present copies, and `models list` tells the user their only multi-GB weight
+ * file is a redundant duplicate they can delete.
+ */
+export function modelSearchHomes(projectHayvenDir?: string | null): {
+  scope: ModelScope;
+  hayvenDir: string;
+}[] {
+  const global = globalHayvenDir();
+  const homes: { scope: ModelScope; hayvenDir: string }[] = [
+    { scope: "global", hayvenDir: global },
+  ];
+  if (
+    projectHayvenDir !== undefined &&
+    projectHayvenDir !== null &&
+    projectHayvenDir.length > 0 &&
+    canonicalRoot(projectHayvenDir) !== canonicalRoot(global)
+  ) {
+    homes.push({ scope: "project", hayvenDir: projectHayvenDir });
+  }
+  return homes;
+}
+
+/** Whether every declared artifact of `id` exists in that specific `.hayven`. */
+function presentIn(hayvenDir: string, id: string): boolean {
+  const dir = modelDirIn(hayvenDir, id);
+  const entry = MODEL_REGISTRY[id];
+  if (dir === null || entry === undefined) return false;
+  return entry.artifacts.every((a) => existsSync(join(dir, a.filename)));
+}
+
+/**
+ * Every place `id` could live, with on-disk presence — global first. Empty for
+ * an unknown id. This is the REPORTING view (`hayven models list`); it is
+ * deliberately read-only and never moves or deletes anything.
+ */
+export function modelLocations(
+  id: string,
+  projectHayvenDir?: string | null,
+): ModelLocation[] {
+  if (MODEL_REGISTRY[id] === undefined) return [];
+  return modelSearchHomes(projectHayvenDir).map((h) => ({
+    scope: h.scope,
+    hayvenDir: h.hayvenDir,
+    dir: modelDirIn(h.hayvenDir, id) as string,
+    present: presentIn(h.hayvenDir, id),
+  }));
+}
+
+/**
+ * Where the model's weights ACTUALLY are — the first search home that holds a
+ * complete copy — or null when no copy exists anywhere.
+ */
+export function locateModelDir(
+  id: string,
+  projectHayvenDir?: string | null,
+): string | null {
+  return modelLocations(id, projectHayvenDir).find((l) => l.present)?.dir ?? null;
+}
+
+/**
+ * Where a fresh `pull` SHOULD install the model: the global store. Null for an
+ * unknown id.
+ */
+export function canonicalModelDir(id: string): string | null {
+  return modelDirIn(globalHayvenDir(), id);
+}
+
+/**
+ * The per-model directory to use for `id` given the project at `hayvenDir`:
+ * an existing copy if there is one (global first, then this project's own
+ * legacy copy), else the canonical GLOBAL install target.
+ *
+ * THE SINGLE RESOLVER. Readers (`conflict/oracle.ts`, `graph/summarize.ts`,
+ * `db/fts.ts` — all of which hand this straight to `hayven-native infer
+ * --model`) and the writer (`models/install.ts`) both call this, so they cannot
+ * resolve the same asset to two different directories. The signature is
+ * unchanged from when this was a plain per-project join precisely so every one
+ * of those callers picked the fix up without an edit.
+ */
+export function modelDir(hayvenDir: string, id: string): string | null {
+  if (MODEL_REGISTRY[id] === undefined) return null;
+  return locateModelDir(id, hayvenDir) ?? canonicalModelDir(id);
+}
+
 /**
  * Absolute path to the model id's primary weights (`<dir>/model.gguf`), or null
- * for an unknown id. Kept for `hayven doctor`'s "expected at" message.
+ * for an unknown id. Resolves exactly like {@link modelDir}, so `hayven
+ * doctor`'s "expected at" names the same file `pull` would write and the oracle
+ * would load.
  */
 export function modelPath(hayvenDir: string, id: string): string | null {
   const dir = modelDir(hayvenDir, id);
@@ -254,8 +407,12 @@ export function modelPath(hayvenDir: string, id: string): string | null {
 
 /**
  * Whether the model is fully present AND loadable on disk — true iff EVERY
- * declared artifact (i.e. `model.gguf`) exists in the model's per-model
- * directory.
+ * declared artifact (i.e. `model.gguf`) exists in ONE of the search homes
+ * (global first, then this project's legacy copy).
+ *
+ * All-artifacts-in-ONE-home, never a union across homes: a half-global,
+ * half-project model would report present and then hand `infer` a directory
+ * missing a file.
  *
  * Presence keys solely on the declared (downloadable) artifacts: the native
  * `infer` builds the tokenizer from the GGUF's embedded metadata (BL-14
@@ -265,8 +422,5 @@ export function modelPath(hayvenDir: string, id: string): string | null {
  * module header's TOKENIZER note.
  */
 export function isModelPresent(hayvenDir: string, id: string): boolean {
-  const dir = modelDir(hayvenDir, id);
-  const entry = MODEL_REGISTRY[id];
-  if (dir === null || entry === undefined) return false;
-  return entry.artifacts.every((a) => existsSync(join(dir, a.filename)));
+  return locateModelDir(id, hayvenDir) !== null;
 }

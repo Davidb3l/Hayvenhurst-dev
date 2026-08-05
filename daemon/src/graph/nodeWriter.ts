@@ -180,11 +180,19 @@ export async function writeNodeMarkdowns(
   nodes: GraphNode[],
   neighborsByNode: Map<string, NodeNeighbors> = new Map(),
   concurrency = 16,
+  /**
+   * Optional CALLER-OWNED "directories already created" cache, shared across
+   * calls. `runIngest` no longer holds the whole repo's nodes in memory — it
+   * streams them back from the ingest spill in pages and calls this once per
+   * page — so a per-call cache would reset on every page and re-issue an
+   * `mkdir` for the same directory once per page instead of once per run
+   * (~O(pages x dirs) wasted syscalls on a large repo). Omitted → a fresh
+   * per-call cache, i.e. exactly the previous behavior.
+   */
+  ensuredDirs: Set<string> = new Set<string>(),
 ): Promise<number> {
   let written = 0;
   let i = 0;
-  /** Dirs we've already ensured this run, so we mkdir once per dir, not per node. */
-  const ensuredDirs = new Set<string>();
   const worker = async (): Promise<void> => {
     while (true) {
       const idx = i++;

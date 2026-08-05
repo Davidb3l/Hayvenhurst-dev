@@ -258,17 +258,17 @@ describe("idScheme collision: function named same as its module", () => {
       moduleName: "sympify",
       kind: "function",
     });
-    expect(moduleId).toBe("parse/sympify");
-    expect(fnId).toBe("parse/sympify/sympify");
+    expect(moduleId).toBe("src/parse/sympify");
+    expect(fnId).toBe("src/parse/sympify/sympify");
     expect(fnId).not.toBe(moduleId);
   });
 
-  it("does NOT regress the module node id (parse/hash/hash must not appear)", () => {
+  it("does NOT regress the module node id (src/parse/hash/hash must not appear)", () => {
     // Module node: no moduleName supplied.
-    expect(deriveEntityId("src/parse/hash.rs", "hash", { kind: "module" })).toBe("parse/hash");
+    expect(deriveEntityId("src/parse/hash.rs", "hash", { kind: "module" })).toBe("src/parse/hash");
     // Legacy callers that pass moduleName but NO kind keep the old shape too
-    // (the kind-undefined branch preserves `parse/hash`, not `parse/hash/hash`).
-    expect(deriveEntityId("src/parse/hash.rs", "hash", { moduleName: "hash" })).toBe("parse/hash");
+    // (the kind-undefined branch preserves `src/parse/hash`, not `src/parse/hash/hash`).
+    expect(deriveEntityId("src/parse/hash.rs", "hash", { moduleName: "hash" })).toBe("src/parse/hash");
   });
 
   it("an import-pinned bare call resolves to the FUNCTION node, not the module", () => {

@@ -206,8 +206,8 @@ describe("runIngest", () => {
     expect(result.nodes).toBe(2);
     expect(result.edges).toBe(1);
     expect(result.unresolvedEdges).toBe(0);
-    expect(db.getNode("auth/loginHandler")?.name).toBe("loginHandler");
-    expect(db.outgoing("auth/loginHandler")[0]?.dst).toBe("auth/validate_session");
+    expect(db.getNode("src/auth/loginHandler")?.name).toBe("loginHandler");
+    expect(db.outgoing("src/auth/loginHandler")[0]?.dst).toBe("src/auth/validate_session");
     db.close();
   });
 });
@@ -266,7 +266,7 @@ describe("BL-10: cross-file edge re-resolution after an incremental ingest", () 
     });
 
     // B's caller points at the unresolved sentinel.
-    const callerId = "b/caller/callB";
+    const callerId = "src/b/caller/callB";
     expect(db.outgoing(callerId).map((e) => e.dst)).toEqual(["?:f"]);
 
     // ─── Step 2: incremental ingest of ONLY file A, which now defines `f`.
@@ -284,7 +284,7 @@ describe("BL-10: cross-file edge re-resolution after an incremental ingest", () 
       ]),
     });
 
-    const fId = "a/target/f";
+    const fId = "src/a/target/f";
     expect(db.getNode(fId)?.name).toBe("f");
     // Still stale before the re-resolve pass.
     expect(db.outgoing(callerId).map((e) => e.dst)).toEqual(["?:f"]);
@@ -345,7 +345,7 @@ describe("BL-10: cross-file edge re-resolution after an incremental ingest", () 
 
     const fixed = reresolveAllEdges(db);
     expect(fixed).toBe(0); // neither `?:g` (missing) nor `?:dup` (ambiguous) resolves
-    const dsts = db.outgoing("b/caller/callB").map((e) => e.dst).sort();
+    const dsts = db.outgoing("src/b/caller/callB").map((e) => e.dst).sort();
     expect(dsts).toEqual(["?:dup", "?:g"]);
 
     db.close();

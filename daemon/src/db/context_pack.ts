@@ -29,6 +29,7 @@
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, resolve, sep } from "node:path";
 
+import { isPathExcludedByWalker } from "../native/ignore.ts";
 import { IMPORT_KIND, isCallKind, resolveNodeId } from "./graph_walk.ts";
 import { collectImportedSymbols } from "./imported_symbol.ts";
 import type { Db, NodeRow } from "./queries.ts";
@@ -497,16 +498,18 @@ const DENIED_EXTENSIONS = [
  *   3. A PARSEABLE LANGUAGE ({@link SOURCE_EXTENSIONS}) — the indexer opens no
  *      other file, so neither will we.
  *
- * WHY NOT A REAL `.gitignore` MATCH: the honest residual is a gitignored file
- * that is non-hidden, outside every always-pruned directory, AND carries a
- * source extension (e.g. a generated `src/gen/keys.ts` listed in `.gitignore`).
- * Closing THAT needs real gitignore semantics — negations, `**`, directory-only
- * rules, nested `.gitignore`s, `.git/info/exclude`, `core.excludesFile` — which
- * is a spec, not a regex, and hand-rolling it half-right buys false confidence.
- * The correct closure is a native-side call (see the module note in the lane
- * report); this predicate is the part that can be made exactly right today, and
- * it removes the entire class of NON-source files that the denylist could only
- * ever chase by name.
+ * WHAT THIS PREDICATE DELIBERATELY DOES NOT DO: evaluate `.gitignore`. Its
+ * residual — a gitignored file that is non-hidden, outside every always-pruned
+ * directory, AND carries a source extension (a generated `src/gen/keys.ts`, a
+ * committed-then-ignored `src/config.local.ts`) — is closed SEPARATELY, by
+ * {@link isPathExcludedByWalker}, which asks the Rust `ignore` crate over the
+ * `hayven-native check-ignored` op. Gitignore is a spec, not a regex
+ * (negations, `**`, directory-only rules, nested ignore files,
+ * `.git/info/exclude`, `core.excludesFile`, `require_git`), and hand-rolling it
+ * half-right buys false confidence. The two stay separate on purpose: this one
+ * is pure and free and removes the whole class of NON-source files by shape,
+ * which keeps the paid, subprocess-backed check off all but the paths that
+ * would otherwise have been allowed.
  */
 function isIndexerAdmissible(rel: string): boolean {
   const parts = rel.split(/[\\/]+/).filter((p) => p.length > 0);
@@ -587,11 +590,21 @@ function isDeniedRepoPath(rel: string): boolean {
  *      that builds the graph. That is what retires the stray-`dump.sql` class
  *      the denylist alone could not reach.
  *
- * WHAT THIS DOES NOT GUARANTEE. It is still not a `.gitignore` implementation.
- * The residual is precisely: a gitignored file that is non-hidden, outside every
- * always-pruned directory, and carries a source extension. The guarantee is:
- * nothing outside the repo, nothing the indexer itself would not open, nothing
- * of a well-known credential shape, nothing that can block, nothing unbounded.
+ *   5. GITIGNORE PARITY. See {@link isPathExcludedByWalker}: the Rust `ignore`
+ *      crate — the same configuration `walker::discover` walks with — is asked
+ *      whether the indexer would have yielded this path (by path, the way
+ *      `git check-ignore` answers, so a not-yet-created file is still
+ *      resolvable). This closes the last residual of (4): a gitignored file that
+ *      is non-hidden, outside every pruned directory, and carries a source
+ *      extension. It is the only check here that costs a subprocess, so it runs
+ *      LAST and only for paths every cheap rule already allowed, and it fails
+ *      CLOSED — an unavailable or broken native binary refuses the read.
+ *
+ * WHAT THIS DOES NOT GUARANTEE. The guarantee is: nothing outside the repo,
+ * nothing the indexer itself would not open, nothing of a well-known credential
+ * shape, nothing that can block, nothing unbounded. It is NOT an access-control
+ * boundary for a repo whose own tracked source contains secrets — a checked-in
+ * `src/config.ts` full of API keys is, to every rule here, ordinary source.
  */
 export function resolveWithinRepo(repoRoot: string, file: string): string | null {
   return resolveRepoPath(repoRoot, file)?.abs ?? null;
@@ -618,10 +631,75 @@ export interface ResolvedRepoPath {
  * what removes the reason to keep a second implementation.
  */
 export function resolveRepoPath(repoRoot: string, file: string): ResolvedRepoPath | null {
+  const contained = containWithinRoot(repoRoot, file);
+  if (contained === null) return null;
+  const { abs, rel, root } = contained;
+
+  // Denylist and the indexer mirrors run on the path RELATIVE to whichever root
+  // form matched, so `.env` named as `./.env`, `a/../.env` or an absolute path
+  // all normalize the same.
+  if (isDeniedRepoPath(rel)) return null;
+  if (!isIndexerAdmissible(rel)) return null;
+  const relPosix = rel.split(sep).join("/");
+  // GITIGNORE PARITY, and deliberately LAST — it is the only check that costs a
+  // subprocess, so every cheap refusal above keeps it from running at all.
+  //
+  // The hole it closes: a gitignored file that is non-hidden, outside every
+  // pruned directory, and carries a source extension. The Rust walker keeps it
+  // out of the graph entirely, so packing it made this gate strictly MORE
+  // permissive than the indexer on the one path that feeds a model prompt.
+  //
+  // NOT gated on the file existing. The oracle answers by PATH, the way
+  // `git check-ignore` does, so the brand-new-file case `context_for_change`
+  // exists to serve (a file the client is about to create) still resolves — it
+  // is absent, not ignored. An existence gate looked like the safe framing but
+  // was strictly weaker: `src/gen/not-written-yet.ts` under a gitignored
+  // `src/gen/` would have passed, and no test could distinguish the gate from
+  // its own absence.
+  if (isPathExcludedByWalker(root, relPosix)) return null;
+  return { abs, rel: relPosix };
+}
+
+/** A path proven to live inside a root, with the spellings both callers need. */
+interface ContainedPath {
+  /** Canonical (realpath'd where it exists) absolute path. */
+  abs: string;
+  /** Path relative to {@link root}, in the platform's separator. */
+  rel: string;
+  /** The root form `rel` is relative to — the lexical root or its realpath,
+   *  whichever the target actually matched. */
+  root: string;
+  /** Whether the path existed at check time (i.e. `realpath` succeeded). */
+  exists: boolean;
+}
+
+/**
+ * THE containment check. Resolve `candidate` (relative to `root`, or absolute)
+ * and prove it lives inside `root`, both LEXICALLY and after a realpath hop.
+ *
+ * WHY IT IS SHARED. This logic has been written three times in this codebase and
+ * the copies diverged every time: the proxy kept a lexical-only version that
+ * blessed an in-repo symlink pointing at an out-of-tree secret (read straight
+ * into a prompt bound for a third-party API), and the viewer's static route kept
+ * a `relative()`-with-`..`-prefix version with no realpath hop at all, which
+ * would serve a symlink planted in the build output. Duplicated containment
+ * logic is how they drifted, so there is one implementation and callers layer
+ * their own POLICY (credential denylist, indexer parity, MIME) on top of it.
+ *
+ * The realpath hop is what makes it a containment check rather than a string
+ * comparison: for a path that EXISTS the real location decides, both ways — it
+ * is the only test that catches a symlink escape, and it is what rescues the
+ * mirror-image case (a `root` given as the realpath with `candidate` given via
+ * the symlinked spelling, which a purely lexical test refuses for no reason).
+ * Returning the realpath is also what closes the check-then-read window a
+ * swapped symlink would otherwise open. A path that does not exist yet cannot
+ * be a symlink escape, so it falls back to the lexical answer.
+ */
+export function containWithinRoot(root: string, candidate: string): ContainedPath | null {
   // A NUL survives `resolve()` but makes every syscall throw. Refuse it here so
   // the gate never green-lights a path that cannot be read.
-  if (file.length === 0 || file.includes("\0")) return null;
-  const rootAbs = resolve(repoRoot);
+  if (candidate.length === 0 || candidate.includes("\0")) return null;
+  const rootAbs = resolve(root);
   const rootReal = tryRealpath(rootAbs) ?? rootAbs;
   const inside = (p: string): boolean =>
     p === rootAbs ||
@@ -629,22 +707,18 @@ export function resolveRepoPath(repoRoot: string, file: string): ResolvedRepoPat
     p === rootReal ||
     p.startsWith(rootReal + sep);
 
-  const abs = isAbsolute(file) ? resolve(file) : resolve(rootAbs, file);
+  const abs = isAbsolute(candidate) ? resolve(candidate) : resolve(rootAbs, candidate);
   const real = tryRealpath(abs);
-  // For an existing path the REAL location decides, both ways: it is the only
-  // check that catches a symlink escape, and it is what rescues the mirror-image
-  // case (a `repoRoot` given as the realpath with `file` given via the symlinked
-  // spelling, which a purely lexical test refuses for no reason).
   const target = real ?? abs;
   if (!inside(target)) return null;
 
-  // Denylist on the path RELATIVE to whichever root form matched, so `.env`
-  // named as `./.env`, `a/../.env` or an absolute path all normalize the same.
-  const root = target.startsWith(rootReal) ? rootReal : rootAbs;
-  const rel = target.slice(root.length).replace(/^[\\/]+/, "");
-  if (isDeniedRepoPath(rel)) return null;
-  if (!isIndexerAdmissible(rel)) return null;
-  return { abs: target, rel: rel.split(sep).join("/") };
+  const matched = target.startsWith(rootReal) ? rootReal : rootAbs;
+  return {
+    abs: target,
+    rel: target.slice(matched.length).replace(/^[\\/]+/, ""),
+    root: matched,
+    exists: real !== null,
+  };
 }
 
 /**

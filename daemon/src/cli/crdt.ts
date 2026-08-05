@@ -22,6 +22,7 @@
  * running at all.
  */
 import { OpLog, type CrdtType } from "../crdt/oplog.ts";
+import { readKnownPeers, SYNC_PROTOCOL_VERSION, type PeerRecord } from "../crdt/peers.ts";
 import { CRDT_LIMITS, inspectRetention, type RetentionReport } from "../crdt/retention.ts";
 import { isJson, requireProject } from "./_shared.ts";
 import type { ParsedArgs } from "../cli.ts";
@@ -30,8 +31,8 @@ const TYPES: readonly CrdtType[] = ["lww", "gset", "orset"];
 
 export async function runCrdt(args: ParsedArgs): Promise<number> {
   const sub = args.positionals[0] ?? "retention";
-  if (sub !== "retention") {
-    process.stderr.write("usage: hayven crdt [retention] [--json]\n");
+  if (sub !== "retention" && sub !== "peers") {
+    process.stderr.write("usage: hayven crdt [retention|peers] [--json]\n");
     return 2;
   }
 
@@ -42,6 +43,8 @@ export async function runCrdt(args: ParsedArgs): Promise<number> {
     process.stderr.write(`error: ${(err as Error).message}\n`);
     return 1;
   }
+
+  if (sub === "peers") return runPeers(ctx.paths.peersDir, isJson(args.flags));
 
   // Constructing an OpLog is cheap: the wire bridge is lazy (it spawns
   // `hayven-native` per call, and we never encode or decode here), and
@@ -78,6 +81,73 @@ export async function runCrdt(args: ParsedArgs): Promise<number> {
 
   process.stdout.write(renderReport(report));
   return 0;
+}
+
+/**
+ * `hayven crdt peers [--json]` — who this project has synced with (RFC-001 §4).
+ *
+ * The user-visible payoff of peer identity: before this, nothing on the machine
+ * could answer "who am I synced with?", because `hayven sync` was outbound-only
+ * and the responding daemon never learned who called.
+ *
+ * READ-ONLY and DAEMONLESS, like `crdt retention` above: it reads a handful of
+ * tiny JSON files under `.hayven/peers/known/` and talks to no daemon, so it is
+ * safe against a live daemon's project and works with none running.
+ *
+ * Exit code is always 0 for a successful read. An empty registry is a normal,
+ * expected state (a project that has never synced), NOT a failure — making it
+ * non-zero would break any script that polls this.
+ */
+function runPeers(peersDir: string, json: boolean): number {
+  const peers = readKnownPeers(peersDir);
+  if (json) {
+    process.stdout.write(
+      JSON.stringify(
+        {
+          ok: true,
+          protocol: SYNC_PROTOCOL_VERSION,
+          count: peers.length,
+          peers,
+        },
+        null,
+        2,
+      ) + "\n",
+    );
+    return 0;
+  }
+  process.stdout.write(renderPeers(peers));
+  return 0;
+}
+
+/** Human-readable rendering of the peer registry. Exported for a direct test on
+ *  the text, so the "never synced" wording cannot silently regress into looking
+ *  like an error. */
+export function renderPeers(peers: PeerRecord[]): string {
+  const lines: string[] = ["# Known sync peers", ""];
+  if (peers.length === 0) {
+    lines.push("None. This project has not exchanged CRDT segments with any peer.");
+    lines.push("");
+    lines.push("Run `hayven sync <peer_url>` to sync; peers are recorded from BOTH");
+    lines.push("directions — the one you reach, and any that reaches you.");
+    lines.push("");
+    return lines.join("\n");
+  }
+  for (const p of peers) {
+    lines.push(`- ${p.writer_id}`);
+    lines.push(`    url:      ${p.last_url ?? "(inbound only — never dialled)"}`);
+    lines.push(`    first:    ${p.first_seen}`);
+    lines.push(`    last:     ${p.last_synced}`);
+    // "unknown" is spelled out rather than shown as 0: an older peer omits the
+    // handshake entirely, and printing a number for it would invite a reader to
+    // compare against it.
+    lines.push(`    protocol: ${p.protocol ?? "unknown (peer sent no handshake)"}`);
+  }
+  lines.push("");
+  // Say what this list is NOT, so nobody reads it as an access-control list.
+  lines.push("This is a record of who has synced, not a permission list: sync is");
+  lines.push("unauthenticated, and being listed here grants nothing.");
+  lines.push("");
+  return lines.join("\n");
 }
 
 /** Human-readable rendering. Exported for a direct test on the text, so the

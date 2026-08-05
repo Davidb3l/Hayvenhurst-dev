@@ -61,6 +61,13 @@ describe("selectOracle — BL-14: real presence activates the LlmOracle on a ggu
     const dir = mkdtempSync(join(tmpdir(), "hayven-oracle-bl14-"));
     const hayvenDir = join(dir, ".hayven");
     const MODEL = "gemma4:e2b";
+    // Weights resolve GLOBAL-first, so without this the fixture below would be
+    // planted in (and deleted from) the process-wide test sandbox's global
+    // store rather than this tmp project — making the test's result depend on
+    // what other test files happened to leave there. Pointing `$HAYVEN_HOME` at
+    // `dir` makes the global store BE this tmp project.
+    const prevHome = process.env["HAYVEN_HOME"];
+    process.env["HAYVEN_HOME"] = dir;
     try {
       const md = modelDir(hayvenDir, MODEL)!;
       mkdirSync(md, { recursive: true });
@@ -84,6 +91,8 @@ describe("selectOracle — BL-14: real presence activates the LlmOracle on a ggu
       expect(gone).not.toBeInstanceOf(LlmOracle);
       expect(gone.id).toBe("heuristic-v1");
     } finally {
+      if (prevHome === undefined) delete process.env["HAYVEN_HOME"];
+      else process.env["HAYVEN_HOME"] = prevHome;
       rmSync(dir, { recursive: true, force: true });
     }
   });

@@ -58,34 +58,34 @@ half-written and claiming health.
 
 ---
 
-## 3. The CRDT log grows forever
+## 3. The CRDT log grows forever (measured: not worth fixing)
 
 **What.** The operation log and G-Set are append-only by design. Nothing prunes
 them. Every daemon start reads every segment.
 
-**Cost.** Unbounded disk and unbounded daemon memory over a long-lived install.
+**Cost.** Measured, rather than assumed, on a real install with five projects
+and two months of daily use: the largest CRDT directory is **12 KB**, the total
+across every log is **2,098 bytes**, and projected growth is **~12 KB/year**.
+Reaching the 512 MiB warning threshold takes roughly **42,600 years**. A user
+generating a hundred times more traffic needs about four centuries.
 
-**Why not fixed.** Pruning is not a local decision. Dropping a day diverges this
-peer's Merkle root from any peer that kept it; the diff then reports it missing
-and the peer pushes it straight back, costing more I/O than retention. A correct
-design needs peers to exchange an `oldest_retained_day` floor and prune only
-once every known peer has acknowledged it.
+**Status: will not fix.** An earlier draft of this entry described a peer
+acknowledgement protocol as the remedy, and a design for it was written before
+anyone measured the growth. That design carried permanent-data-loss risk —
+operations are the durable record of graph history, and a peer that prunes a day
+nobody else kept has destroyed it. There is no benefit at 12 KB/year to justify
+that risk.
 
-The blocker is clause three. `config.sync_peers` is declared and **read by
-nothing** — there is no peer identity, no acknowledgement store, and
-`hayven sync <peer_url>` is one-shot, so the responder never learns who called.
-"Every known peer" is the empty set, which makes the safety condition vacuously
-true and would prune immediately, reintroducing exactly the divergence the
-design exists to prevent. Half of it is worse than none.
-
-Real cost to fix: a durable peer registry, an acknowledgement exchange, a
-minimum-compatible-version bump so a pruning peer refuses to prune against a
-peer that cannot parse the floor, and a migration. Its own release cycle.
+If a workload ever appears that changes the number by orders of magnitude, three
+non-destructive options come first and none of them require peer coordination:
+fix the startup loading strategy (a memory concern, separable from disk),
+compress cold segments in place, or snapshot-plus-tail. Deletion is the last
+resort, not the first design. See
+[RFC-001](RFC-001-peer-sync-and-retention.md).
 
 **Mitigation shipped.** Retention limits are measured and warned at the append
 path (not only at daemon start, where the log is smallest), and
-`hayven crdt retention` reports size, segment counts, violations and limits, and
-states plainly that nothing prunes.
+`hayven crdt retention` reports size, segment counts, violations and limits.
 
 ---
 

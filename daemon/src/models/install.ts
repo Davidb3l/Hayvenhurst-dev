@@ -23,7 +23,9 @@ import { join } from "node:path";
 
 import {
   MODEL_REGISTRY,
+  canonicalModelDir,
   modelDir,
+  modelDirIn,
   type ModelArtifact,
   type ModelEntry,
 } from "./registry.ts";
@@ -220,6 +222,21 @@ function safeUnlink(path: string): void {
 }
 
 /**
+ * Whether EVERY declared artifact is already installed in `dir` and still
+ * matches its pinned sha256. An artifact with no pinned hash cannot be
+ * re-verified, so presence is the most we can honestly assert for it.
+ */
+async function modelIntactIn(dir: string, entry: ModelEntry): Promise<boolean> {
+  for (const a of entry.artifacts) {
+    const p = join(dir, a.filename);
+    if (!existsSync(p)) return false;
+    if (a.sha256.length === 0) continue;
+    if ((await sha256File(p)) !== a.sha256) return false;
+  }
+  return true;
+}
+
+/**
  * Pull every artifact for a model id into its per-model directory.
  * Idempotent; verifies each artifact; atomic per-artifact install.
  */
@@ -232,13 +249,45 @@ export async function pullModel(
   if (!entry) {
     throw new PullError(`unknown model id: "${id}" (not in the registry)`);
   }
-  const dir = modelDir(hayvenDir, id);
-  if (!dir) {
+  // THE SAME RESOLVER THE READERS USE. `modelDir` returns an EXISTING copy when
+  // there is one (global store first, then this project's own legacy per-project
+  // copy) and only otherwise the global install target. Two consequences, both
+  // load-bearing:
+  //   - a fresh pull lands in `~/.hayven/models/` ONCE and every project sees
+  //     it, instead of one multi-GB download per project; and
+  //   - a user who already pulled into a project keeps that copy — the pull
+  //     resolves to it, `installArtifact` finds the bytes present + verified,
+  //     and we never re-download something they already have.
+  // Resolving the target any other way here is how a writer and a reader end up
+  // pointed at two different directories for one immutable asset.
+  const preferred = modelDir(hayvenDir, id);
+  const canonical = canonicalModelDir(id);
+  if (!preferred || !canonical) {
     // Unreachable given the entry check, but keeps the type honest.
     throw new PullError(`no model directory for id: "${id}"`);
   }
   const fetchImpl = opts.fetchImpl ?? (globalThis.fetch as unknown as FetchLike);
   const log = opts.onProgress ?? noop;
+
+  // If the resolver picked a LEGACY per-project copy, that copy is only worth
+  // keeping while it is intact. A truncated or corrupt one would otherwise send
+  // the multi-GB re-download straight back into the per-project directory,
+  // re-creating the duplication this whole change exists to end. Repair into the
+  // global store instead, and leave the bad file alone for the user to remove
+  // (`models list` reports it) — deleting weights we did not write is exactly
+  // the incident this codebase already had once.
+  //
+  // The intact check costs one extra hash-read of an already-present file, so it
+  // is scoped to the legacy case only; the global case falls through untouched,
+  // and one re-read still beats one re-download by orders of magnitude.
+  let dir = preferred;
+  if (preferred !== canonical && !(await modelIntactIn(preferred, entry))) {
+    log(
+      `  legacy per-project copy at ${preferred} is incomplete or fails verification — ` +
+        `installing into the shared store at ${canonical} instead (the old copy is left in place)`,
+    );
+    dir = canonical;
+  }
 
   mkdirSync(dir, { recursive: true });
   log(`Pulling ${id} → ${dir}`);
@@ -252,9 +301,17 @@ export async function pullModel(
   return { id, dir, artifacts: results };
 }
 
-/** Total size on disk (bytes) of an installed model's artifacts, best-effort. */
-export function installedBytes(hayvenDir: string, id: string): number {
-  const dir = modelDir(hayvenDir, id);
+/**
+ * Total size on disk (bytes) of an installed model's artifacts in ONE specific
+ * `.hayven`, best-effort. Takes the exact directory (no global/project
+ * resolution) so `models list` can size a redundant per-project copy separately
+ * from the global one and report how much reclaiming it would free.
+ */
+export function installedBytesIn(hayvenDir: string, id: string): number {
+  return bytesInDir(modelDirIn(hayvenDir, id), id);
+}
+
+function bytesInDir(dir: string | null, id: string): number {
   const entry = MODEL_REGISTRY[id];
   if (!dir || !entry) return 0;
   let total = 0;

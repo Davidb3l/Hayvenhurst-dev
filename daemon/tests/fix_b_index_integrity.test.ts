@@ -539,7 +539,7 @@ describe("B3: an incremental re-ingest replaces only the parsed files' call site
     expect(db.callSitesOf("b/target")[0]?.file).toBe("src/b.ts");
 
     // The re-parsed file's own sites were REPLACED, not duplicated.
-    const aSites = db.callSitesOf("a/two");
+    const aSites = db.callSitesOf("src/a/two");
     expect(aSites.length).toBe(1);
     expect(aSites[0]?.line).toBe(4);
     db.close();
@@ -734,7 +734,7 @@ describe("B5: edge writes are idempotent even without a preceding clearGraph", (
     // Exactly ONE edge row carrying the summed weight (not three rows).
     expect(db.counts().edges).toBe(1);
     // And each occurrence still has its own call site at its own line.
-    const sites = db.callSitesOf("a/two");
+    const sites = db.callSitesOf("src/a/two");
     expect(sites.map((s) => s.line).sort((x, y) => (x ?? 0) - (y ?? 0))).toEqual([3, 7, 11]);
     db.close();
   });
@@ -834,7 +834,7 @@ describe("B6: node markdown is not rewritten unchanged, and orphans are reclaime
       fullRebuild: true,
       sweepOrphanMarkdown: true,
     });
-    const doomed = join(nodesDir, "a", "doomed.md");
+    const doomed = join(nodesDir, "src", "a", "doomed.md");
     expect(existsSync(doomed)).toBe(true);
 
     // `doomed` is deleted from the source; the next full ingest must reclaim it.
@@ -849,7 +849,7 @@ describe("B6: node markdown is not rewritten unchanged, and orphans are reclaime
     });
 
     expect(existsSync(doomed)).toBe(false);
-    expect(existsSync(join(nodesDir, "a", "keeper.md"))).toBe(true);
+    expect(existsSync(join(nodesDir, "src", "a", "keeper.md"))).toBe(true);
     db.close();
   });
 
@@ -894,8 +894,8 @@ describe("B6 (production path): the write-skip must survive last_seen re-stampin
     ];
 
     await runIngest({ db, nodesDir, run: fakeRun(records()), repoRoot, fullRebuild: true });
-    const p1 = join(nodesDir, "a", "one.md");
-    const p2 = join(nodesDir, "a", "two.md");
+    const p1 = join(nodesDir, "src", "a", "one.md");
+    const p2 = join(nodesDir, "src", "a", "two.md");
     const before = [statSync(p1).mtimeMs, statSync(p2).mtimeMs];
 
     // Ensure a distinguishable clock tick, then re-ingest identical source.
@@ -923,7 +923,7 @@ describe("B6 (production path): the write-skip must survive last_seen re-stampin
       repoRoot,
       fullRebuild: true,
     });
-    const p = join(nodesDir, "a", "one.md");
+    const p = join(nodesDir, "src", "a", "one.md");
     expect(readFileSync(p, "utf8")).toContain("range: [1, 5]");
 
     const moved = { ...(nodeRec("src/a.ts", "one") as object), range: [40, 90] } as NativeRecord;

@@ -185,6 +185,13 @@ describe("selectSummarizer — LLM-vs-heuristic decision", () => {
   it("a gguf-only model dir activates the LlmSummarizer (real presence check)", () => {
     const dir = mkdtempSync(join(tmpdir(), "hayven-summ-bl14-"));
     const hayvenDir = join(dir, ".hayven");
+    // Weights resolve GLOBAL-first, so `modelDir` below would otherwise plant
+    // this fixture in the process-wide test sandbox's global store and leave it
+    // there — a `gemma4:e2b` visible to every later test file. Pointing
+    // `$HAYVEN_HOME` at `dir` makes the global store BE this tmp project, so the
+    // write lands where the test means it to and the cleanup removes it.
+    const prevHome = process.env["HAYVEN_HOME"];
+    process.env["HAYVEN_HOME"] = dir;
     try {
       const md = modelDir(hayvenDir, MODEL)!;
       mkdirSync(md, { recursive: true });
@@ -192,6 +199,8 @@ describe("selectSummarizer — LLM-vs-heuristic decision", () => {
       const s = selectSummarizer({ model: MODEL }, { hayvenDir, locateBinary: () => "/bin/hayven-native" });
       expect(s).toBeInstanceOf(LlmSummarizer);
     } finally {
+      if (prevHome === undefined) delete process.env["HAYVEN_HOME"];
+      else process.env["HAYVEN_HOME"] = prevHome;
       rmSync(dir, { recursive: true, force: true });
     }
   });

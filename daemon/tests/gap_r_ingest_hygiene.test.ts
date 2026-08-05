@@ -212,15 +212,20 @@ describe("R5: two files deriving one module id is loud", () => {
     const { db, repoRoot } = makeIndex();
     const logs: Captured[] = [];
 
-    // `scopeForFile` elides the first `src/` segment, so both of these derive
-    // the module id `a/b`. Ids are the `nodes` PRIMARY KEY.
+    // EXTENSION-ONLY collision. This test used to pin the `src/`-elision case
+    // (`a/src/b.ts` vs `a/b.ts`), which schema v8 FIXED — see the sibling test
+    // below, which now pins that those two stay distinct. The detector did not
+    // become redundant, it narrowed: a module id is `<dir>/<extension-stripped
+    // stem>`, so two files differing only by extension still land on one
+    // PRIMARY KEY and one of them still vanishes from the graph. That is the
+    // collision this test now covers, and it is unfixed by the id scheme.
     const result = await runIngest({
       db,
       nodesDir: join(repoRoot, "nodes"),
       run: fakeRun([
         { type: "start", files_total: 2, version: "0.0.0" },
-        moduleRec("a/src/b.ts", "b"),
         moduleRec("a/b.ts", "b"),
+        moduleRec("a/b.py", "b"),
         { type: "done", files_done: 2, nodes: 2, edges: 0, elapsed_ms: 1 },
       ]),
       repoRoot,
@@ -240,10 +245,42 @@ describe("R5: two files deriving one module id is loud", () => {
     // Both sides must be named — one file path alone does not tell you what
     // overwrote what.
     expect([warn!.fields["file"], warn!.fields["collidesWith"]].sort()).toEqual([
+      "a/b.py",
       "a/b.ts",
-      "a/src/b.ts",
     ]);
     expect(logs.some((l) => l.level === "error" && l.msg.includes("COLLISION"))).toBe(true);
+    db.close();
+  });
+
+  it("no longer fires for `a/src/b.ts` vs `a/b.ts` — schema v8 made them distinct", async () => {
+    // The INVERSION of what this block originally pinned. Before schema v8 the
+    // id scope elided the first `src/` segment, so these two files shared the
+    // module id `a/b` and one of them was silently overwritten; the assertions
+    // here were 1 node / 1 collision. The scope is now the directory path
+    // verbatim, which is injective on files, so the overwrite is PREVENTED
+    // rather than merely reported. Kept as a regression pin from the ingest
+    // side: if the elision ever comes back, this fails here as well as in
+    // `idscheme_collision_e2e.test.ts`.
+    const { db, repoRoot } = makeIndex();
+    const logs: Captured[] = [];
+    const result = await runIngest({
+      db,
+      nodesDir: join(repoRoot, "nodes"),
+      run: fakeRun([
+        { type: "start", files_total: 2, version: "0.0.0" },
+        moduleRec("a/src/b.ts", "b"),
+        moduleRec("a/b.ts", "b"),
+        { type: "done", files_done: 2, nodes: 2, edges: 0, elapsed_ms: 1 },
+      ]),
+      repoRoot,
+      logger: capturingLogger(logs),
+      fullRebuild: true,
+    });
+
+    expect(db.counts().nodes).toBe(2);
+    expect(db.allNodeIds().sort()).toEqual(["a/b", "a/src/b"]);
+    expect(result.idCollisions).toBe(0);
+    expect(logs.some((l) => l.msg.includes("COLLISION"))).toBe(false);
     db.close();
   });
 

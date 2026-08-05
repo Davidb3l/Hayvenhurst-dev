@@ -157,6 +157,20 @@ describe("v3 → v4 in-place migration", () => {
     expect(cols).toContain("path");
 
     // The folder is now searchable on the upgraded index.
+    //
+    // NOTE the row is RE-INSERTED first, and that is not a workaround. The
+    // v7 -> v8 id-scheme migration deliberately DROPS nodes/edges/call_sites to
+    // force a full reindex (ids changed shape, so every stored id is stale), and
+    // `migrate()` always runs to the latest version. So a node seeded at v3
+    // cannot survive the chain, and asserting that it does would be asserting
+    // that v8 failed to do its job. What the v3 -> v4 step actually guarantees is
+    // that `nodes_fts` gains `path` and that the triggers index it — pinned by
+    // the column assertion above, and by searching a row inserted through the
+    // NEW triggers here.
+    raw.exec(
+      "INSERT INTO nodes (id, name, qualified_name, kind, language, file, range_start, range_end) " +
+        "VALUES ('db/schema/auth', 'auth', 'auth', 'function', 'typescript', 'backend/src/db/schema/auth.ts', 1, 2)",
+    );
     const hits = searchFts(raw, "schema");
     expect(hits.map((h) => h.id)).toContain("db/schema/auth");
     raw.close();

@@ -12,6 +12,7 @@
 import { existsSync } from "node:fs";
 
 import { tryLocateNativeBinary } from "../native/locate.ts";
+import { locateCheckIgnoredBinary, probeCheckIgnored } from "../native/ignore.ts";
 import { Db } from "../db/queries.ts";
 import { ftsAvailable } from "../db/migrations.ts";
 import { resolveReadIndex } from "../db/branch_index.ts";
@@ -104,6 +105,62 @@ function collect(): DoctorReport {
     detail: native ?? "NOT FOUND — build with: cd native && cargo build --release",
     gating: true,
   });
+
+  // Native check-ignored conformance — does the binary the PACKER will spawn
+  // actually implement the `check-ignored` op?
+  //
+  // The row above only proves a binary EXISTS. The context packer's gitignore
+  // gate (`native/ignore.ts`) is fail-closed: a binary built before the op was
+  // added (clap exits 2 on the unknown subcommand) makes the packer refuse
+  // EVERY file read, announced only by a one-time stderr warning that stdio
+  // MCP users never see. `doctor` is where someone looks when "hayven returns
+  // nothing", so the skew must surface here, with the offending path named.
+  //
+  // Two deliberate choices: the probed path comes from `ignore.ts`'s OWN
+  // locator (the gate and the hayven_native row can resolve differently in a
+  // dev checkout, and probing the wrong one reports health the packer does not
+  // have), and the row GATES — a packer that refuses every read is a broken
+  // tool, not a degraded configuration. When no binary exists at all the row
+  // reports skipped/ok:true so `hayven_native` alone carries that failure,
+  // mirroring index_integrity's could-not-probe posture.
+  const gateBinary = locateCheckIgnoredBinary();
+  if (gateBinary === null) {
+    checks.push({
+      name: "native_check_ignored",
+      ok: true,
+      detail: "skipped — hayven-native not found (see hayven_native)",
+      gating: false,
+    });
+  } else {
+    const probe = probeCheckIgnored(gateBinary);
+    if (probe.state === "ok") {
+      checks.push({
+        name: "native_check_ignored",
+        ok: true,
+        detail: `OK — ${gateBinary} answers check-ignored`,
+        gating: true,
+      });
+    } else if (probe.state === "stale_binary") {
+      checks.push({
+        name: "native_check_ignored",
+        ok: false,
+        detail:
+          `STALE_BINARY — ${gateBinary} predates the check-ignored subcommand ` +
+          `(exit 2, unknown subcommand); the context packer is refusing EVERY file read ` +
+          `(fail-closed). Rebuild it (cd native && cargo build --release) or reinstall.`,
+        gating: true,
+      });
+    } else {
+      checks.push({
+        name: "native_check_ignored",
+        ok: false,
+        detail:
+          `ERROR — ${gateBinary} failed the check-ignored probe: ${probe.message}; ` +
+          `the context packer fails closed and refuses file reads while this persists.`,
+        gating: true,
+      });
+    }
+  }
 
   // SQLite FTS5 + trigram
   try {
@@ -198,52 +255,54 @@ function collect(): DoctorReport {
   const initialized = existsSync(hayvenDir);
   modelLines.push(`- Project root: ${root} (${reason})`);
 
-  let modelCheck: DoctorCheck;
   if (!initialized) {
     modelLines.push("- Project: NOT INITIALIZED here — run `hayven init`.");
-    modelLines.push(
-      "    Model presence is per-project; nothing to report until the project exists.",
-    );
+  }
+
+  // Model presence is reported whether or not a project exists here, and via the
+  // SAME `isModelPresent`/`modelPath` the oracle and `models pull` use. Weights
+  // are GLOBAL now (with a fallback to a project's legacy copy), so a doctor run
+  // outside a project is still answering a real question. It used to short-
+  // circuit on `!initialized` with "model presence is per-project", which after
+  // the move would have reported a globally-present model as unreportable — and
+  // a doctor that disagrees with the resolver about where an asset lives is
+  // exactly the two-code-paths bug this change exists to remove.
+  // `loadConfig` layers defaults + global config and only adds the project layer
+  // when the project exists, so it is safe on an uninitialized root.
+  const configuredTier3 = loadConfig(root).config.models.tier3.model;
+  const entry = MODEL_REGISTRY[configuredTier3];
+  let modelCheck: DoctorCheck;
+  if (!entry) {
+    modelLines.push(`- Configured tier-3 model "${configuredTier3}": UNKNOWN (not in the model registry)`);
+    modelCheck = {
+      name: "tier3_model",
+      ok: false,
+      detail: `configured model "${configuredTier3}" is not in the model registry`,
+      gating: false,
+    };
+  } else if (isModelPresent(hayvenDir, configuredTier3)) {
+    modelLines.push(`- Configured tier-3 model "${configuredTier3}": PRESENT  OK`);
+    modelLines.push(`    Loaded from: ${modelPath(hayvenDir, configuredTier3)}`);
+    modelLines.push("    Layer C will use the LLM oracle.");
     modelCheck = {
       name: "tier3_model",
       ok: true,
-      detail: "project not initialized here; model presence is per-project",
+      detail: `"${configuredTier3}" present; Layer C uses the LLM oracle`,
       gating: false,
     };
   } else {
-    const configuredTier3 = loadConfig(root).config.models.tier3.model;
-    const entry = MODEL_REGISTRY[configuredTier3];
-    if (!entry) {
-      modelLines.push(`- Configured tier-3 model "${configuredTier3}": UNKNOWN (not in the model registry)`);
-      modelCheck = {
-        name: "tier3_model",
-        ok: false,
-        detail: `configured model "${configuredTier3}" is not in the model registry`,
-        gating: false,
-      };
-    } else if (isModelPresent(hayvenDir, configuredTier3)) {
-      modelLines.push(`- Configured tier-3 model "${configuredTier3}": PRESENT  OK`);
-      modelLines.push("    Layer C will use the LLM oracle.");
-      modelCheck = {
-        name: "tier3_model",
-        ok: true,
-        detail: `"${configuredTier3}" present; Layer C uses the LLM oracle`,
-        gating: false,
-      };
-    } else {
-      modelLines.push(`- Configured tier-3 model "${configuredTier3}": NOT DOWNLOADED`);
-      modelLines.push(`    Expected at: ${modelPath(hayvenDir, configuredTier3)}`);
-      modelLines.push(`    Pull with:   hayven models pull ${configuredTier3}`);
-      modelLines.push("    Until then, Layer C uses the deterministic heuristic-v1 oracle (no LLM).");
-      modelCheck = {
-        name: "tier3_model",
-        ok: false,
-        detail:
-          `"${configuredTier3}" not downloaded (hayven models pull ${configuredTier3}); ` +
-          "Layer C falls back to the deterministic heuristic-v1 oracle",
-        gating: false,
-      };
-    }
+    modelLines.push(`- Configured tier-3 model "${configuredTier3}": NOT DOWNLOADED`);
+    modelLines.push(`    Expected at: ${modelPath(hayvenDir, configuredTier3)}`);
+    modelLines.push(`    Pull with:   hayven models pull ${configuredTier3}`);
+    modelLines.push("    Until then, Layer C uses the deterministic heuristic-v1 oracle (no LLM).");
+    modelCheck = {
+      name: "tier3_model",
+      ok: false,
+      detail:
+        `"${configuredTier3}" not downloaded (hayven models pull ${configuredTier3}); ` +
+        "Layer C falls back to the deterministic heuristic-v1 oracle",
+      gating: false,
+    };
   }
   checks.push(modelCheck);
 
@@ -285,7 +344,7 @@ export function doctorEnvelope(report: DoctorReport): Record<string, unknown> {
 /** The human report — unchanged from before `--json` existed. */
 function renderHuman(report: DoctorReport): string {
   const lines: string[] = ["# hayven doctor", ""];
-  // collect() always pushes all four rows; throw loudly rather than render a
+  // collect() always pushes every row; throw loudly rather than render a
   // half-report if a future check is added to only one path.
   const byName = (n: string): DoctorCheck => {
     const c = report.checks.find((x) => x.name === n);
@@ -303,6 +362,11 @@ function renderHuman(report: DoctorReport): string {
     lines.push("- hayven-native: NOT FOUND  FAIL");
     lines.push("    Build with:  cd native && cargo build --release");
   }
+
+  const conformance = byName("native_check_ignored");
+  lines.push(
+    `- native check-ignored conformance: ${conformance.detail}  ${conformance.ok ? "OK" : "FAIL"}`,
+  );
 
   const fts = byName("sqlite_fts5_trigram");
   if (fts.detail.startsWith("probe failed: ")) {
