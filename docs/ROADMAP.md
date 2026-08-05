@@ -6,7 +6,7 @@
 > This is not a backlog. Known defects live in [KNOWN_ISSUES](KNOWN_ISSUES.md);
 > lessons from past bugs live in [DESIGN_LESSONS](DESIGN_LESSONS.md).
 >
-> Last reviewed: 2026-08-04.
+> Last reviewed: 2026-08-05.
 
 ---
 
@@ -23,7 +23,7 @@ no authentication at all — it refuses to bind a non-loopback address for
 exactly that reason, and its own error text says to put it behind something
 that authenticates.
 
-### Stage 1 — peer identity *(in progress)*
+### Stage 1 — peer identity *(shipped)*
 
 Reuse the existing `writer_id` as peer identity, advertise it in the Merkle
 handshake, record peers in a durable registry populated from BOTH directions,
@@ -35,7 +35,27 @@ built before either is settled. Every later capability — authorisation, audit,
 scheduled sync, offboarding — bottoms out in "which peer is this?", and that is
 currently unanswerable.
 
-Spec: [RFC-001](RFC-001-peer-sync-and-retention.md) §4.
+Spec: [RFC-001](RFC-001-peer-sync-and-retention.md) §4. Shipped with a 64-peer
+registry cap; see that RFC's implementation-deviations note.
+
+**What it did NOT buy: trust.** Identity is self-asserted. Any caller that can
+reach the sync routes can claim any `writer_id`, including one already in the
+registry. What protects a daemon today is the loopback bind and the two-step
+remote opt-in, which are perimeter controls that disappear the moment sync
+crosses a real network. [RFC-002](RFC-002-peer-pairing.md) proposes the smallest
+fix (a shared secret established once per peer pair) and is awaiting a decision.
+
+### Stage 1b — peer pairing *(proposed, awaiting decision)*
+
+The floor under sync: pairing makes the Stage 1 registry mean something without
+committing to a topology or an enterprise auth mechanism. Deliberately sits
+below Stages 2 and 3 rather than replacing either, and should land before
+Stage 4, because unattended recurring sync with self-asserted identity is worse
+than the manual one-shot we have now.
+
+Spec: [RFC-002](RFC-002-peer-pairing.md). **Entry condition:** David answers the
+four open questions in §6, starting with whether it is worth building before a
+design partner exists.
 
 ### Stage 2 — topology decision *(a conversation, not a build)*
 
@@ -61,10 +81,16 @@ to nothing." Guessing costs a rewrite of the layer guessed at.
 **Entry condition:** one real prospect who will state their actual requirement.
 Not a survey of what enterprises typically want.
 
+Stage 1b is not a substitute for this and must not be sold as one. When a
+partner names their mechanism it replaces pairing's proof step, while the
+identity, the registry and the pairing UX survive.
+
 ### Stage 4 — scheduled sync
 
 Gives `config.sync_peers` its meaning: the peers this daemon initiates sync
-with. Cheap once Stages 1 and 3 exist; incoherent before them.
+with. Cheap once Stages 1 and 3 exist; incoherent before them, and it should
+not ship before Stage 1b either: nobody is watching an unattended sync when it
+goes wrong.
 
 ---
 
