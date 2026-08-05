@@ -69,6 +69,37 @@ function capFromEnv(env: string, fallback: number): number {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
 }
 
+/**
+ * Filenames whose module name comes from the PARENT DIRECTORY rather than the
+ * file stem: the per-language exceptions in ARCHITECTURE.md §2's module-name
+ * table (`mod.rs`, `lib.rs`, `main.rs`, `__init__.py`). Mirrored here so the
+ * ordering FALLBACK below derives exactly the segment a real module record
+ * would have carried for the same file.
+ */
+const PARENT_DIR_MODULE_FILES = new Set(["mod.rs", "lib.rs", "main.rs", "__init__.py"]);
+
+/**
+ * Derive the module-name segment for `file` the way the native extractor does:
+ * the extension-stripped file stem, except the {@link PARENT_DIR_MODULE_FILES}
+ * cases, which take the parent directory's name (`src/y/mod.rs` → `y`, matching
+ * the qualified_name the file's module record would carry). Used ONLY by the
+ * module-record-ordering fallback in {@link drainIntoIndex}; the module record
+ * itself is always the authority when it has arrived.
+ */
+function fallbackModuleName(file: string): string {
+  const parts = normalizePosix(file)
+    .split("/")
+    .filter((p) => p.length > 0);
+  const filename = parts[parts.length - 1] ?? file;
+  if (PARENT_DIR_MODULE_FILES.has(filename) && parts.length >= 2) {
+    return parts[parts.length - 2]!;
+  }
+  // Extension strip mirrors idScheme.ts `stripExt`: `dot <= 0` keeps dotfiles
+  // (`.env`) and extensionless names whole rather than emptying them.
+  const dot = filename.lastIndexOf(".");
+  return dot <= 0 ? filename : filename.slice(0, dot);
+}
+
 /** Aliased import binding (`import { a as b }` → {local:"b",imported:"a"}). */
 type ImportAliasPair = { local: string; imported: string };
 
@@ -316,6 +347,14 @@ async function drainIntoIndex(opts: IngestOptions, spill: IngestSpill): Promise<
   const moduleByFile = new Map<string, string>();
 
   /**
+   * Latch for the module-record-ordering warning below (one per ingest, like
+   * {@link mutatedIndex}): a payload that violates ordering usually violates it
+   * for EVERY record of an affected file, and a per-record warning would flood
+   * the log the way the pre-dedup `native parse warning` lines once did.
+   */
+  let warnedModuleOrderFallback = false;
+
+  /**
    * module entity id → the FIRST file that claimed it, so a second file
    * deriving the same id is REPORTED instead of silently overwriting it.
    *
@@ -441,8 +480,39 @@ async function drainIntoIndex(opts: IngestOptions, spill: IngestSpill): Promise<
         }
         // For non-module entities, prepend the module name to disambiguate
         // across sibling files. The module node itself uses `qn` as-is.
-        const moduleName =
+        let moduleName =
           rec.kind === "module" ? undefined : moduleByFile.get(rec.file);
+        if (rec.kind !== "module" && moduleName === undefined) {
+          // ORDERING FALLBACK (ARCHITECTURE.md §2). The native binary
+          // guarantees a file's module record arrives before any other record
+          // from that file, so a miss here is a protocol violation. But
+          // deriving the id WITHOUT the module segment silently reintroduces
+          // the sibling-file collision the segment exists to prevent
+          // (`parse/hash.rs` and `parse/extract.rs` both defining
+          // `do_something` would collapse onto one `parse/do_something` row,
+          // and ids are the PRIMARY KEY, so one definition vanishes). Fall
+          // back to the segment a real module record WOULD have carried for
+          // this file (`fallbackModuleName`: the stem, with the parent-dir
+          // exceptions), so the derived id is byte-identical to the
+          // well-ordered one, and warn once per ingest.
+          moduleName = fallbackModuleName(rec.file);
+          if (!warnedModuleOrderFallback) {
+            warnedModuleOrderFallback = true;
+            logger?.warn(
+              "module-record ORDERING violation: non-module record arrived before its file's module record",
+              {
+                file: rec.file,
+                kind: rec.kind,
+                fallbackModule: moduleName,
+                hint:
+                  "the native binary guarantees module-first ordering per file; " +
+                  "falling back to the file stem as the module segment so ids " +
+                  "keep the documented <scope>/<module>/<qn> shape (warned once " +
+                  "per ingest; later records use the same fallback silently)",
+              },
+            );
+          }
+        }
         const id = deriveEntityId(
           rec.file,
           qn,
@@ -1404,8 +1474,16 @@ export class EdgeResolver {
  * An incremental `--files` ingest only resolves edges within the changed file
  * set, so a caller in an *unchanged* file that referenced a now-renamed/moved
  * entity keeps its stale `?:<name>` edge until the next full ingest. This is
- * the §10 Q4 "always re-resolve unresolved edges" path: a cheap in-memory pass
- * over the WHOLE node set, run after every incremental batch.
+ * the §10 Q4 "always re-resolve unresolved edges" path, run after every
+ * incremental batch, so it is BOUNDED BY THE UNRESOLVED SET, not the graph:
+ *   1. fetch the `?:` (non-import) edges first, cheap via the `edges_dst`
+ *      prefix index. Zero rows (the overwhelmingly common warm-graph case)
+ *      returns immediately without touching `nodes` at all;
+ *   2. otherwise materialize ONLY the nodes whose `name` or `qualified_name`
+ *      matches one of the unresolved names (chunked IN lists), plus the edges'
+ *      src nodes for package scoping, never the whole node table. On a
+ *      100k-node monorepo the old whole-table `SELECT` built three JS maps of
+ *      the entire graph per one-file save.
  *
  * We re-resolve only the `?:`-prefixed (unresolved) edges already in the SQL
  * cache — resolved edges are left untouched (an entity that *went away* leaves
@@ -1439,51 +1517,12 @@ export class EdgeResolver {
  * unresolved until a full/file reingest re-runs the SpecifierResolver.
  */
 export function reresolveAllEdges(db: Db, repoRoot?: string): number {
-  // 1. Build the per-package indexes from EVERY node currently in the graph.
-  //    The SQL cache (CRDT-derived but authoritative for graph reads) is the
-  //    cheap source — `nodes(name, qualified_name)` is what `resolveEdges`
-  //    indexed in-pass at ingest time.
-  const ws = WorkspaceMap.load(repoRoot ?? "");
-  const pkgCache = new Map<string, string>();
-  const pkgOf = (file: string): string => {
-    let pkg = pkgCache.get(file);
-    if (pkg === undefined) {
-      pkg = ws.packageForFile(file);
-      pkgCache.set(file, pkg);
-    }
-    return pkg;
-  };
-  const pkgKey = (pkg: string, name: string): string => `${pkg}\0${name}`;
-
-  const byQualified = new Map<string, string | typeof AMBIGUOUS>();
-  const byName = new Map<string, string | typeof AMBIGUOUS>();
-  /** src entity id → its file's package, to scope each edge's lookup. */
-  const pkgById = new Map<string, string>();
-  const allNodes = db.handle
-    .query<{ id: string; name: string; qualified_name: string; kind: string; file: string }, []>(
-      "SELECT id, name, qualified_name, kind, file FROM nodes",
-    )
-    .all();
-  for (const n of allNodes) {
-    const pkg = pkgOf(n.file);
-    pkgById.set(n.id, pkg);
-    // Mirror resolveEdges: a `module` node is never a call/reference dst-by-name
-    // (it's an import target), so excluding it keeps a function named after its
-    // own file (`sympify` in `sympify.py`) from being shadowed into AMBIGUOUS.
-    if (n.kind === "module") continue;
-    const qnKey = pkgKey(pkg, n.qualified_name);
-    const existingQn = byQualified.get(qnKey);
-    if (existingQn === undefined) byQualified.set(qnKey, n.id);
-    else if (existingQn !== n.id) byQualified.set(qnKey, AMBIGUOUS);
-
-    const nameKey = pkgKey(pkg, n.name);
-    const existing = byName.get(nameKey);
-    if (existing === undefined) byName.set(nameKey, n.id);
-    else if (existing !== n.id) byName.set(nameKey, AMBIGUOUS);
-  }
-
-  // 2. Collect the currently-unresolved (`?:`) edges and the id each now
-  //    resolves to. The `edges_dst` index makes the prefix scan cheap.
+  // 1. Fetch the currently-unresolved (`?:`) edges FIRST; the `edges_dst`
+  //    index makes the prefix scan cheap, and on a warm graph the answer is
+  //    almost always "none", in which case we return without reading a single
+  //    node row. Order matters: this function runs after EVERY incremental
+  //    batch (a one-file save), so its idle cost is what the watcher pays per
+  //    keystroke.
   interface UnresolvedRow {
     src: string;
     dst: string;
@@ -1499,7 +1538,96 @@ export function reresolveAllEdges(db: Db, repoRoot?: string): number {
       "SELECT src, dst, kind, weight, last_seen FROM edges WHERE dst LIKE ? AND kind != 'import'",
     )
     .all(`${UNRESOLVED_PREFIX}%`);
+  if (unresolved.length === 0) return 0;
 
+  // 2. Build the per-package indexes from ONLY the candidate nodes: the ones
+  //    whose `name` or `qualified_name` matches an unresolved name. The
+  //    AMBIGUOUS computation is unchanged by the restriction: for any name we
+  //    will actually look up, EVERY node carrying it (by name or qn) is in the
+  //    candidate fetch, so per-package multiplicity for that key is exactly
+  //    what the old whole-table scan computed. Chunked IN lists mirror the
+  //    bound-parameter chunking in db/queries.ts (`deleteCallSitesByFile`).
+  const ws = WorkspaceMap.load(repoRoot ?? "");
+  const pkgCache = new Map<string, string>();
+  const pkgOf = (file: string): string => {
+    let pkg = pkgCache.get(file);
+    if (pkg === undefined) {
+      pkg = ws.packageForFile(file);
+      pkgCache.set(file, pkg);
+    }
+    return pkg;
+  };
+  const pkgKey = (pkg: string, name: string): string => `${pkg}\0${name}`;
+  const CHUNK = 500;
+
+  const names = new Set<string>();
+  for (const e of unresolved) {
+    if (e.dst.startsWith(UNRESOLVED_PREFIX)) names.add(e.dst.slice(UNRESOLVED_PREFIX.length));
+  }
+
+  interface CandidateRow {
+    id: string;
+    name: string;
+    qualified_name: string;
+    kind: string;
+    file: string;
+  }
+  // De-duplicated by id: a node whose `name` AND `qualified_name` both match
+  // (the common top-level-function case) comes back once per chunk membership,
+  // and double-counting it would fabricate an AMBIGUOUS verdict.
+  const candidates = new Map<string, CandidateRow>();
+  const nameList = [...names];
+  for (let i = 0; i < nameList.length; i += CHUNK) {
+    const chunk = nameList.slice(i, i + CHUNK);
+    const placeholders = chunk.map(() => "?").join(",");
+    const rows = db.handle
+      .query<CandidateRow, string[]>(
+        `SELECT id, name, qualified_name, kind, file FROM nodes ` +
+          `WHERE name IN (${placeholders}) OR qualified_name IN (${placeholders})`,
+      )
+      .all(...chunk, ...chunk);
+    for (const r of rows) candidates.set(r.id, r);
+  }
+
+  // Package scoping needs the SRC side too: `pkgById` is looked up by each
+  // edge's src id (which need not be a candidate; it is usually a plain
+  // resolved caller), so fetch those nodes' files in a second small IN query
+  // keyed by id (the primary key). A src that no longer exists stays absent and
+  // falls back to the root package below, exactly as before.
+  /** src entity id → its file's package, to scope each edge's lookup. */
+  const pkgById = new Map<string, string>();
+  const srcIds = [...new Set(unresolved.map((e) => e.src))];
+  for (let i = 0; i < srcIds.length; i += CHUNK) {
+    const chunk = srcIds.slice(i, i + CHUNK);
+    const placeholders = chunk.map(() => "?").join(",");
+    const rows = db.handle
+      .query<{ id: string; file: string }, string[]>(
+        `SELECT id, file FROM nodes WHERE id IN (${placeholders})`,
+      )
+      .all(...chunk);
+    for (const r of rows) pkgById.set(r.id, pkgOf(r.file));
+  }
+
+  const byQualified = new Map<string, string | typeof AMBIGUOUS>();
+  const byName = new Map<string, string | typeof AMBIGUOUS>();
+  for (const n of candidates.values()) {
+    const pkg = pkgOf(n.file);
+    // Mirror resolveEdges: a `module` node is never a call/reference dst-by-name
+    // (it's an import target), so excluding it keeps a function named after its
+    // own file (`sympify` in `sympify.py`) from being shadowed into AMBIGUOUS.
+    if (n.kind === "module") continue;
+    const qnKey = pkgKey(pkg, n.qualified_name);
+    const existingQn = byQualified.get(qnKey);
+    if (existingQn === undefined) byQualified.set(qnKey, n.id);
+    else if (existingQn !== n.id) byQualified.set(qnKey, AMBIGUOUS);
+
+    const nameKey = pkgKey(pkg, n.name);
+    const existing = byName.get(nameKey);
+    if (existing === undefined) byName.set(nameKey, n.id);
+    else if (existing !== n.id) byName.set(nameKey, AMBIGUOUS);
+  }
+
+  // 3. Compute the id each unresolved edge now resolves to.
   const rewrites: Array<{ row: UnresolvedRow; newDst: string }> = [];
   for (const e of unresolved) {
     // Guard: only `?:`-prefixed dsts (LIKE '?:%' is exact for our ids, but the
@@ -1525,7 +1653,7 @@ export function reresolveAllEdges(db: Db, repoRoot?: string): number {
   }
   if (rewrites.length === 0) return 0;
 
-  // 3. Rewrite atomically: drop the `?:` row, upsert the resolved edge.
+  // 4. Rewrite atomically: drop the `?:` row, upsert the resolved edge.
   //    Changing `dst` changes the (src, dst, kind) primary key, so this is a
   //    delete + insert, not an UPDATE.
   const del = db.handle.query("DELETE FROM edges WHERE src = ? AND dst = ? AND kind = ?");

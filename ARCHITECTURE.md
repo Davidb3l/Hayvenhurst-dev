@@ -76,7 +76,7 @@ For every parsed file the native binary emits exactly one synthetic node of kind
 | `range`         | `[1, total_line_count]` (1-indexed, inclusive)                     |
 | `ast_hash`      | blake3 of the entire file's bytes (no prefix; daemon adds `blake3:`)|
 
-If the daemon receives a non-module record for a file whose module record hasn't arrived yet, that's a protocol violation — the ingest logs a warning and falls back to the file stem as the moduleName. The native binary is expected to guarantee ordering.
+If the daemon receives a non-module record for a file whose module record hasn't arrived yet, that's a protocol violation — the ingest logs a warning (once per ingest run) and falls back to the module name it would have derived for the file: the file stem, with the same per-language exceptions as the table above (`mod.rs`, `lib.rs`, `main.rs`, `__init__.py` take the parent directory). The fallback therefore yields the same entity ids a well-ordered stream would. The native binary is expected to guarantee ordering.
 
 ---
 

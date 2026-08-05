@@ -172,6 +172,21 @@ describe("runIngest", () => {
     db.migrate();
     const records: NativeRecord[] = [
       { type: "start", files_total: 1, version: "0.0.0-test" },
+      // The module record comes first, as the native binary guarantees — the
+      // extractor ALWAYS emits one per file, so a fixture without it exercised
+      // the (formerly silent) ordering-violation path rather than reality.
+      // Records arriving module-less now take the file-stem fallback and derive
+      // the SAME ids, which lane_g_module_fallback.test.ts covers explicitly.
+      {
+        type: "node",
+        file: "src/auth/login.ts",
+        name: "login",
+        qualified_name: "login",
+        kind: "module",
+        language: "typescript",
+        range: [0, 0],
+        ast_hash: "mod",
+      },
       {
         type: "node",
         file: "src/auth/login.ts",
@@ -200,14 +215,16 @@ describe("runIngest", () => {
         kind: "static_call",
       },
       { type: "progress", files_done: 1 },
-      { type: "done", files_done: 1, nodes: 2, edges: 1, elapsed_ms: 5 },
+      { type: "done", files_done: 1, nodes: 3, edges: 1, elapsed_ms: 5 },
     ];
     const result = await runIngest({ db, nodesDir: tmp, run: fakeRun(records) });
-    expect(result.nodes).toBe(2);
+    expect(result.nodes).toBe(3);
     expect(result.edges).toBe(1);
     expect(result.unresolvedEdges).toBe(0);
-    expect(db.getNode("src/auth/loginHandler")?.name).toBe("loginHandler");
-    expect(db.outgoing("src/auth/loginHandler")[0]?.dst).toBe("src/auth/validate_session");
+    expect(db.getNode("src/auth/login/loginHandler")?.name).toBe("loginHandler");
+    expect(db.outgoing("src/auth/login/loginHandler")[0]?.dst).toBe(
+      "src/auth/login/validate_session",
+    );
     db.close();
   });
 });
