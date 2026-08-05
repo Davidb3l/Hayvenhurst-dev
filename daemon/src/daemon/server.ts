@@ -343,12 +343,128 @@ export function buildApp(deps: ServerDependencies, opts: BuildAppOptions = {}) {
 
   const app = new Elysia({ name: "hayvenhurst" });
 
-  // Multi-project: select the request's project BEFORE any handler runs, so the
-  // facade getters below resolve the right project for the rest of the request.
-  if (opts.onRequest) {
-    const hook = opts.onRequest;
-    app.onRequest(({ request }) => hook(request));
-  }
+  // ---- SECURITY GATES ----------------------------------------------------
+  //
+  // Both gates live HERE, in buildApp, so that EVERY server built from this
+  // module is protected by construction. They used to live only in
+  // buildMultiProjectApp's onRequest hook, which production happens to go
+  // through — but any direct buildApp listener (a test harness promoted to a
+  // tool, a future single-project embed) silently lost them.
+
+  // GATE 1 — Host-header allowlist, applied to EVERY request, reads included.
+  //
+  // Threat: DNS rebinding. The Origin gate below cannot see a rebound request
+  // (it is same-origin, so the browser sends no Origin header on GETs), and
+  // the loopback bind does not help because the victim's browser IS local.
+  // The rebound request's one immutable tell is its Host header (`evil.com`),
+  // so we refuse anything whose Host is not loopback.
+  //
+  // Bind-host nuance: the daemon supports an explicit two-step opt-in to bind
+  // non-loopback (`--host` PLUS `--allow-remote-access`, see cli/daemon.ts).
+  // A strict localhost-only allowlist would break exactly the access that
+  // opt-in grants — remote callers legitimately send `Host: <lan-ip>:7777` or
+  // whatever DNS name the operator pointed at the box. The bind host is not
+  // in ServerDependencies, but Elysia exposes the live Bun server as
+  // `app.server`, whose `hostname` IS the actual bind address once listening
+  // — read lazily per request so it is correct whenever a request can exist.
+  // When that bind is non-loopback the gate STANDS DOWN entirely rather than
+  // allowlisting the bound name: a wildcard bind (0.0.0.0/::) matches no Host
+  // a browser would ever send, the operator may front the daemon with any DNS
+  // name we cannot enumerate, and rebinding protection buys nothing there
+  // anyway — the daemon is already reachable, unauthenticated, by anyone who
+  // can resolve it, with the operator's explicit sign-off. Before `listen`
+  // (`app.handle` in tests) `app.server` is null and the strict loopback
+  // allowlist applies.
+  //
+  // Bun's serve loop always has a Host (it builds `request.url` from it), but
+  // `app.handle(new Request("http://localhost/…"))` — the whole existing test
+  // suite — constructs Requests with NO Host header. So the gate falls back
+  // to the request URL's host (identical to the header under a real server,
+  // present under `app.handle`), and only rejects when BOTH are missing or
+  // the value fails the allowlist. The 403 body is intentionally terse and
+  // never echoes the attacker-controlled Host value.
+  const hostGate = (request: Request): Response | undefined => {
+    const bound = app.server?.hostname ?? null;
+    if (bound !== null && !isLoopbackHostName(bound)) {
+      return undefined; // explicit non-loopback opt-in — see comment above
+    }
+    let hostValue = request.headers.get("host");
+    if (hostValue === null) {
+      try {
+        hostValue = new URL(request.url).host;
+      } catch {
+        hostValue = null;
+      }
+    }
+    if (hostValue !== null && isAllowedRequestHost(hostValue, bound)) return undefined;
+    // The full value goes to the LOCAL log only (length-capped so a hostile
+    // client cannot bloat it) — never into the response.
+    deps.logger.warn("request: REFUSED non-local Host (DNS-rebinding gate)", {
+      host: (hostValue ?? "(none)").slice(0, 255),
+      method: request.method,
+    });
+    return new Response(
+      JSON.stringify({
+        error:
+          "refused: request Host is not a local address. This daemon is " +
+          "unauthenticated and only answers loopback-addressed requests.",
+      }),
+      { status: 403, headers: { "content-type": "application/json" } },
+    );
+  };
+
+  // GATE 2 — cross-origin MUTATION refusal.
+  //
+  // The daemon has no authentication, so any web page the user happens to
+  // have open can aim requests at 127.0.0.1:7777. The browser's same-origin
+  // policy stops it READING the responses, but nothing stopped it CAUSING
+  // WRITES — registering claims, adding/removing projects, triggering
+  // ingests. A cross-origin `fetch` always carries an `Origin` header, while
+  // the CLI, curl and the daemon's own same-origin viewer either omit it or
+  // send a loopback one, so this costs legitimate callers nothing.
+  //
+  // Applied to MUTATIONS (plus WebSocket upgrades, see below). Plain reads
+  // are deliberately left alone here: the
+  // viewer is served from this origin, and an opaque cross-origin GET leaks
+  // nothing to the caller — the rebinding case where it WOULD leak carries no
+  // Origin at all and is exactly what the Host gate above refuses.
+  // A WebSocket upgrade is a GET, so the method check alone would wave it
+  // through — but /ws/sync streams CRDT ops straight into the op-log (it is
+  // the WebSocket sibling of POST /api/sync/push), and browsers do NOT apply
+  // the same-origin policy to WebSocket connects: any web page may open
+  // `new WebSocket("ws://127.0.0.1:PORT/ws/…")` and both send and READ frames.
+  // So an upgrade is origin-gated like a mutation. Browsers always attach an
+  // Origin header to a WS handshake, while Bun's WebSocket client (the CLI and
+  // daemon-to-daemon sync peers) sends none — so, exactly as with mutations,
+  // this refuses only browser pages from foreign origins. Verified: Elysia
+  // runs onRequest for upgrade requests, and a returned Response refuses the
+  // handshake before the socket ever opens.
+  const isWsUpgrade = (request: Request): boolean =>
+    (request.headers.get("upgrade") ?? "").toLowerCase() === "websocket";
+  const originGate = (request: Request): Response | undefined => {
+    if (!MUTATING_METHODS.has(request.method) && !isWsUpgrade(request)) return undefined;
+    const origin = request.headers.get("origin");
+    if (origin === null || isLocalOrigin(origin)) return undefined;
+    deps.logger.warn("request: REFUSED cross-origin mutation", {
+      origin: origin.slice(0, 255),
+      method: request.method,
+    });
+    return new Response(
+      JSON.stringify({
+        error:
+          "cross-origin mutations are refused: this daemon is unauthenticated and " +
+          "must not be driven by a web page.",
+      }),
+      { status: 403, headers: { "content-type": "application/json" } },
+    );
+  };
+
+  // ONE onRequest registration so the order is explicit and a Response from
+  // an earlier stage short-circuits the later ones (Elysia treats a returned
+  // value as the response): Host gate → Origin gate → the caller's hook
+  // (multi-project: per-request project selection).
+  const hook = opts.onRequest;
+  app.onRequest(({ request }) => hostGate(request) ?? originGate(request) ?? hook?.(request));
 
   app
     .onError(({ error, code }) => {
@@ -496,6 +612,79 @@ export function isLocalOrigin(origin: string): boolean {
 }
 
 /**
+ * True when `name` (a bare hostname, no port) is one of the loopback names a
+ * legitimately-local request can carry in its `Host` header: `localhost`,
+ * any `127.x.x.x`, `::1` (bracketed or not), or the IPv4-mapped `::ffff:127.0.0.1`
+ * that a dual-stack listener reports. Deliberately does NOT include
+ * `*.localhost` or machine hostnames: the allowlist exists to stop DNS
+ * rebinding, and every name we admit must be one an attacker cannot point at
+ * this machine from public DNS.
+ */
+export function isLoopbackHostName(name: string): boolean {
+  const h = name.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  // Both spellings of the IPv4-mapped loopback are here on purpose:
+  // `hostHeaderName` funnels Host values through `new URL()`, whose canonical
+  // IPv6 serializer renders `[::ffff:127.0.0.1]` as `::ffff:7f00:1` — while a
+  // bound-hostname check (no URL normalization) sees the dotted form verbatim.
+  if (h === "localhost" || h === "::1" || h === "::ffff:127.0.0.1" || h === "::ffff:7f00:1") {
+    return true;
+  }
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
+}
+
+/**
+ * Extract the bare hostname out of a `Host` header value (`host` or
+ * `host:port`, including the bracketed IPv6 `[::1]:7777` form). Returns `null`
+ * for anything that is not a plain host — and that null is a REJECTION, not a
+ * shrug: a `Host` containing `@` / `/` / `?` / `#` / whitespace is an attempt
+ * to smuggle a hostile name past the URL parser (`http://evil.com@localhost`
+ * parses with hostname `localhost`), so those characters are refused before
+ * `new URL` ever sees the value.
+ */
+export function hostHeaderName(hostValue: string): string | null {
+  const raw = hostValue.trim();
+  // Length cap: a valid host fits in 255 octets; anything longer is noise and
+  // not worth handing to the parser.
+  if (raw.length === 0 || raw.length > 255) return null;
+  if (/[@/\\?#\s]/.test(raw)) return null;
+  try {
+    // WHATWG URL does the heavy lifting: lowercases, validates, splits the
+    // port off (including the bracketed-IPv6 form). `hostname` keeps the
+    // brackets on IPv6, so strip them to a bare comparable name.
+    return new URL(`http://${raw}`).hostname.replace(/^\[|\]$/g, "");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The Host-header allowlist (DNS-rebinding gate). True when `hostValue` (a raw
+ * `Host` header, any port) names loopback, or exactly names the host this
+ * server was explicitly bound to (`boundHostname`, when the operator opted
+ * into a non-loopback bind).
+ *
+ * Why this exists: the Origin gate below only covers MUTATIONS, because a
+ * cross-origin GET cannot be READ by the issuing page under the same-origin
+ * policy. DNS rebinding breaks that assumption — `evil.com` re-resolves to
+ * 127.0.0.1, the page's requests become SAME-origin (no Origin header at
+ * all), and the browser hands the attacker every response body: the whole
+ * graph, file contents via /api/context/* and /api/nodes/*, fleet memory,
+ * claims, traces. The one thing the rebound request cannot forge is its
+ * `Host` header (it says `evil.com`), so a Host allowlist closes the hole for
+ * reads AND writes at once.
+ */
+export function isAllowedRequestHost(hostValue: string, boundHostname?: string | null): boolean {
+  const name = hostHeaderName(hostValue);
+  if (name === null) return false;
+  if (isLoopbackHostName(name)) return true;
+  if (boundHostname) {
+    const bound = boundHostname.trim().toLowerCase().replace(/^\[|\]$/g, "");
+    if (bound.length > 0 && name === bound) return true;
+  }
+  return false;
+}
+
+/**
  * Build ONE Elysia app that serves N projects from a single daemon. The route
  * modules are UNCHANGED: they close over a facade `deps` whose db/paths/config/
  * crdt/ingest getters resolve the CURRENT request's project — chosen from
@@ -583,39 +772,10 @@ export function buildMultiProjectApp(multi: MultiProjectDeps) {
     // method once a selector is present.
     // /ws/sync is the WebSocket sibling of POST /api/sync/push (it streams
     // CRDT ops into the op-log), so its upgrade GET gets the same strictness.
-    // CROSS-ORIGIN GATE on mutations.
-    //
-    // The daemon has no authentication, so any web page the user happens to have
-    // open can aim requests at 127.0.0.1:7777. The browser's same-origin policy
-    // stops it READING the responses, but nothing stopped it CAUSING WRITES —
-    // registering claims, adding/removing projects, triggering ingests. A
-    // cross-origin `fetch` always carries an `Origin` header, while the CLI,
-    // curl and the daemon's own same-origin viewer either omit it or send a
-    // loopback one, so this costs legitimate callers nothing.
-    //
-    // Applied to MUTATIONS only. Reads are deliberately left alone: the viewer
-    // is served from this origin, an opaque cross-origin GET leaks nothing to
-    // the caller, and refusing them would break embedding without closing a
-    // hole. (Unbounded-work GETs are a separate problem, fixed by bounding the
-    // work, not by guessing at the caller.)
-    if (MUTATING_METHODS.has(request.method)) {
-      const origin = request.headers.get("origin");
-      if (origin !== null && !isLocalOrigin(origin)) {
-        multi.logger.warn("request: REFUSED cross-origin mutation", {
-          origin,
-          method: request.method,
-          path: pathname,
-        });
-        return new Response(
-          JSON.stringify({
-            error:
-              "cross-origin mutations are refused: this daemon is unauthenticated and " +
-              "must not be driven by a web page.",
-          }),
-          { status: 403, headers: { "content-type": "application/json" } },
-        );
-      }
-    }
+    // NB: the Host-header allowlist (DNS-rebinding gate) and the cross-origin
+    // mutation refusal both run BEFORE this hook — they live in buildApp
+    // itself so every server built from this module is protected by
+    // construction, not just the ones that route through this facade.
 
     const strictRoute = pathname.startsWith("/api/sync/") || pathname === "/ws/sync";
     if (alias && !selected && (strictRoute || MUTATING_METHODS.has(request.method))) {
