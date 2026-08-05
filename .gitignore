@@ -70,6 +70,11 @@ venv/
 # `hayven init` also installs the first-party skill into `.claude/skills/`
 # (a copy of `skill/hayvenhurst.md`); don't commit the dogfood copy.
 .claude/skills/
+# The suite event spine appends local NDJSON activity logs here (one file per
+# day, 11 MB after a few days of dogfooding). They are runtime state, not
+# source, and they record the file paths and symbol names touched on this
+# machine, so committing them to a public repo would publish local activity.
+.suite/
 
 # ---------- Local logs / scratch ----------
 *.log
