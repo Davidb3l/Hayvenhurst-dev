@@ -189,6 +189,24 @@ a green-to-red demonstration.
 
 ---
 
-*Add an entry when a decision is made to ship with a known defect. An entry must
-say what it costs the user and what fixing it would take — "TODO" is not an
-entry.*
+## 10. Affected-tests does not follow `export *` re-export hops
+
+**What.** The affected-tests selector walks the import graph to find tests
+reachable from a change. A re-export chain that passes through `export * from`
+is not followed: the wildcard carries no symbol names, so the walk cannot tell
+which downstream importers actually consume the changed symbol and stops rather
+than guess.
+
+**Cost.** A test importing a changed symbol only through an `export *` barrel
+is not selected — the gate can pass while a genuinely affected test never ran.
+Monorepos with barrel-file conventions are the exposed population. The
+full-suite CI run still catches the regression; only the selective gate
+under-selects.
+
+**Why not fixed.** Following the hop soundly means resolving the wildcard to a
+concrete symbol set per re-exporting module and intersecting with the change.
+That is real resolver work, not a walk tweak, and over-selecting (treating
+`export *` as "everything downstream is affected") would erode the selector's
+value on exactly the repos that use barrels most. Fix belongs with the next
+resolver-quality investment; until then the limitation is documented here and
+in the `--gate` help text's spirit: the gate narrows, CI proves.

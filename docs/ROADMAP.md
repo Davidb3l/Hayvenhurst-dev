@@ -6,7 +6,7 @@
 > This is not a backlog. Known defects live in [KNOWN_ISSUES](KNOWN_ISSUES.md);
 > lessons from past bugs live in [DESIGN_LESSONS](DESIGN_LESSONS.md).
 >
-> Last reviewed: 2026-08-02.
+> Last reviewed: 2026-08-04.
 
 ---
 
@@ -65,6 +65,43 @@ Not a survey of what enterprises typically want.
 
 Gives `config.sync_peers` its meaning: the peers this daemon initiates sync
 with. Cheap once Stages 1 and 3 exist; incoherent before them.
+
+---
+
+## Engineering debt (committed, sequenced)
+
+### Deduplicate the hand-synced rule copies
+
+Three rules exist in more than one place and are kept aligned by hand: the
+edge-resolution index rules (`EdgeResolver` and the incremental re-resolution
+pass), the context-pack assembly closure (duplicated ~140 lines across the
+two pack builders), and the "is this a test file" predicate (two disagreeing
+definitions between the packer and FTS scoring). Every past quiet bug in this
+codebase came from two correct pieces of code disagreeing about a rule; these
+are the three standing opportunities for the next one.
+
+**What it unlocks:** a rule change lands in one place with one test.
+**Entry condition:** none — this can start any time and should precede new
+feature work in the affected files.
+
+### Decompose `ingest.ts` and `context_pack.ts` along their comment seams
+
+Both files are past the point where narrative comments substitute for module
+boundaries (1,600 and 1,800 lines). The section headers already name the
+seams; the work is carving, not designing, with the full suite green after
+each carve.
+
+**What it unlocks:** cheaper review, and smaller blast radius per change.
+**Entry condition:** the deduplication above lands first, so the carve moves
+one copy of each rule, not two.
+
+### Decompose the native parser (`extract.rs`)
+
+The largest file in the repo (3,500 lines) and also the most stable. Splitting
+it carries the worst risk-to-reward of the three, so it waits.
+
+**Entry condition:** the next change to the parser that is more than additive —
+do the split as the first commit of that work, not as a standalone refactor.
 
 ---
 
