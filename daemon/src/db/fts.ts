@@ -52,34 +52,58 @@ const MAX_QUERY_TERMS = 32;
  *   - `isScaffold` = 1 for nodes whose source file is a test, bench, or mock
  *     file. The pattern list lives in `util/test_files.ts` and is shared with
  *     the packer's TypeScript predicate, so the two can no longer drift; it
- *     covers every indexed language (`*.test.*`, `*.spec.*`, `__tests__/`,
- *     `test_*.py`, `*_test.py`, `*_test.go`, `tests/`) plus `bench/` and mocks.
- *     `+τ·isScaffold` demotes that scaffolding so the product implementation
- *     surfaces above its tests.
+ *     covers every indexed language (`*.test.*`, `*.spec.*`, `__tests__/`, the
+ *     cross-language `*_test.*`, Ruby's `*_spec.rb`, `test_*.py`, and both
+ *     `tests/` and singular `test/`) plus `bench/` and mocks. Note that
+ *     `*_test.*` SUBSUMES the former per-language `*_test.py` / `*_test.go`
+ *     rows, which no longer exist as separate patterns. `+τ·isScaffold` demotes
+ *     that scaffolding so the product implementation surfaces above its tests.
  *
- * The α/τ figures below PRE-DATE the scaffold-set widening described above:
- * they were measured when `isScaffold` recognised JS/TS tests, `…/tests/…` and
- * `bench/` only. Six more classes (`*.spec.*`, `__tests__/`, `test_*.py`,
- * `*_test.py`, `*_test.go`, a root-anchored `tests/`) now take the full `+τ`
- * demotion, so treat the numbers as the tuning RATIONALE, not as a current
- * measurement. Re-run `bench/agent-nav-eval.ts` before quoting them again.
+ * CURRENT MEASUREMENT: reproducible, and the only numbers this block quotes.
  *
- * α/τ were tuned on `bench/agent-nav-eval.ts` (this repo's index): they lift
- * BROAD MRR 0.649 → 0.708 and BROAD top-5 5/6 → 6/6 while leaving the IMPL
- * exact-identifier cohort *unchanged* (MRR 0.946, top-5 14/14). The boost is
- * deliberately gentle: it only ever re-orders rows BM25 already deemed close,
- * never promotes an irrelevant high-degree node over a strong exact match.
+ * Harness: `bench/agent-nav-eval.ts` (read-only; opens the branch index and
+ * calls this file's `searchFts` directly). Reproduce from the repo root:
  *
- * v4 re-tune (path-searchable FTS, 2026-06-01): adding the `path` column widens
- * the BROAD candidate pool with path-only matches on LOW-degree leaf nodes
- * (mocks, query-key helpers) that, even at a near-zero path weight, slipped the
- * highest-degree implementation out of the top-5 (`neighbors`→`walkNeighbors`,
- * degree 14, fell from #5 to #6). A path-WEIGHT change alone could not fix this
- * (it's a BM25 document-length-normalization shift, not a path-score effect), so
- * α was nudged 0.25 → 0.30 — the lightest lever that lets the degree signal
- * re-seat the real implementation above the leaf path-hits. Measured on this
- * repo's v4 index: BROAD top-5 back to 6/6, IMPL *improved* (MRR 0.946 → 0.964,
- * top-5 still 14/14), UI/granularity/semantic unchanged.
+ *     bun daemon/src/cli.ts init      # build an index if you have none
+ *     bun bench/agent-nav-eval.ts
+ *
+ * At commit b8fe458, over an index of this repo (4365 nodes, 482 files), with
+ * α = 0.30 and τ = 1.0:
+ *
+ *     IMPL   top-1 12/13   top-5 13/13   MRR 0.962   misses 0
+ *     BROAD  top-1  3/6    top-5  5/6    MRR 0.685   misses 0
+ *
+ * Earlier revisions of this block quoted BROAD MRR 0.708 / top-5 6/6 and IMPL
+ * MRR 0.946 / top-5 14/14. Those came from a harness that was never public and
+ * could not be re-run, so they are replaced rather than carried forward. IMPL is
+ * unchanged in substance (the denominator is 13 because the 14th task targeted a
+ * bench file that only ever existed in a private tree). BROAD lost one top-5 slot
+ * to a REAL change in the repo, not to a ranking regression: splitting
+ * `db/context_pack.ts` into `pack_containment/pack_neighbors/pack_slicing`
+ * created several genuinely well-connected entities whose names contain
+ * "neighbors" (`pack_neighbors/addCallerNeighbors` degree 20,
+ * `addCalleeNeighbors` 19, `cli/neighbors/runNeighbors` 15), all of which now
+ * out-rank `routes/stats/walkNeighbors` (degree 14) on the query `neighbors`.
+ * Raising α cannot fix that, because the rows displacing the target have HIGHER
+ * degree than the target does.
+ *
+ * α = 0.30 / τ = 1.0 were re-confirmed as the best of a swept grid, α ∈ {0.2,
+ * 0.3, 0.4, 0.6} × τ ∈ {0.5, 1.0, 1.5}, measured on the same index. They give the
+ * joint-best IMPL MRR (0.962, matched only by higher α, never beaten) and the
+ * joint-best BROAD MRR (0.685). No cell in the grid recovers BROAD top-5 to 6/6,
+ * and UI (8/8), PATH (3/4), granularity (2/2) and semantic (5/6) are invariant
+ * across every cell. So the constants are kept as they stand: the grid offers no
+ * better trade, and re-tuning to chase the old headline would move ranking for
+ * every user without buying a single position back.
+ *
+ * Note that the scaffold-set widening described above (`*_test.*` in any
+ * language, `*_spec.rb`, singular `test/` directories, `__tests__/`) landed
+ * BEFORE this measurement, so the figures reflect the current, wider `isScaffold`
+ * input set, not the narrower JS/TS-only one the constants were first tuned on.
+ *
+ * The boost stays deliberately gentle: it only re-orders rows BM25 already
+ * deemed close, and never promotes an irrelevant high-degree node over a strong
+ * exact match, which is what the IMPL cohort exists to keep honest.
  */
 const DEGREE_BOOST_ALPHA = 0.30;
 const SCAFFOLD_PENALTY_TAU = 1.0;
@@ -92,12 +116,16 @@ const SCAFFOLD_PENALTY_TAU = 1.0;
  * segment matches dozens of files, and at the DEFAULT weight (1.0) those path
  * hits diluted the ranking enough to push existing BROAD targets down
  * (`search`→#6, `neighbors`→#7 on this repo's index). We down-weight `path` so
- * it ADDS recall (a name/qualified_name match still outranks a path-only match):
- *   - measured on `bench/agent-nav-eval.ts` (this repo): at w=0.35 the `search`
- *     target recovers to #2 and PATH stays 4/4. The residual `neighbors`
- *     one-position slip is NOT a path-weight problem (it persists at w=0); it's
- *     fixed by the v4 α nudge in `DEGREE_BOOST_ALPHA` above. Together they
- *     restore BROAD top-5 to 6/6 with IMPL/UI/granularity/semantic unchanged.
+ * it ADDS recall (a name/qualified_name match still outranks a path-only match).
+ *
+ * Measured at w=0.35 on `bench/agent-nav-eval.ts`, commit b8fe458 (same run as
+ * the α/τ figures above): the BROAD `search` target sits at #2, and the PATH
+ * cohort, whose targets are named only by their folder or file, resolves 3/4.
+ * The one PATH miss is `registry`: `daemon/src/daemon/registry` is a real module
+ * literally NAMED registry, so it wins on the name column over the path-only
+ * matches under `models/registry.ts`. That is the weighting working as intended
+ * rather than a defect, and it is the reason the number is 3/4 and not 4/4.
+ *
  * Name/qualified_name/summary keep weight 1.0; `id` is UNINDEXED so its weight
  * is inert but must still be supplied positionally.
  */
