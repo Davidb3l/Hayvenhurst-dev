@@ -47,6 +47,14 @@ export function healthRoutes(deps: ServerDependencies) {
   return new Elysia().get("/api/health", () => ({
     ok: true,
     version: deps.daemonVersion,
+    // THE SERVING PROCESS NAMES ITSELF (additive; older clients ignore it).
+    // This is the orphan-daemon escape hatch from HAYV-7: a daemon can be
+    // answering on the configured port with NO pidfile anywhere (the pidfile
+    // was deleted, or a second daemon won the port), and without a pid in the
+    // payload the only way to find the process was lsof. With it, `daemon
+    // stop`/`status` and `sirius doctor` can name - and a confident `stop` can
+    // signal - the exact process that produced this response.
+    pid: process.pid,
     native_version: deps.nativeVersion ?? null,
     // Absolute project root this daemon serves (the one selected by `?project=`,
     // else the primary). Lets a CLI client verify it is talking to the daemon

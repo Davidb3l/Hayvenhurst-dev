@@ -28,6 +28,13 @@ export interface HayvenHealth {
   readonly root?: string;
   readonly primary?: string;
   readonly projects?: HealthProject[];
+  /**
+   * The daemon process's own pid (additive - absent from pre-upgrade daemons).
+   * This is what lets `daemon stop`/`status` name and, with corroboration
+   * (the pid must be alive on THIS machine), signal an orphan daemon that
+   * answers on the port with no pidfile in any repo.
+   */
+  readonly pid?: number;
 }
 
 /**

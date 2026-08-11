@@ -19,11 +19,16 @@ import {
   type ServerDependencies,
 } from "../daemon/server.ts";
 import {
+  daemonStartLockFile,
   daemonStatus,
   installShutdownHandlers,
   isAlive,
   readPidFile,
+  readStartLockPid,
+  releaseStartLock,
   removePidFile,
+  tryAcquireStartLock,
+  type StartLockResult,
   verifyDaemonIdentity,
   writePidFile,
 } from "../daemon/lifecycle.ts";
@@ -55,7 +60,7 @@ import {
   DETACH_HEALTH_TIMEOUT_MS,
   type HayvenHealth,
 } from "../daemon/detach.ts";
-import { canonicalRoot, globalLogsDir, hayvenPathsFor, type HayvenPaths } from "../util/paths.ts";
+import { canonicalRoot, globalHayvenDir, globalLogsDir, hayvenPathsFor, type HayvenPaths } from "../util/paths.ts";
 import type { Logger } from "../util/log.ts";
 import { loadConfig } from "../config/load.ts";
 import {
@@ -765,7 +770,21 @@ const DAEMON_USAGE = `hayven daemon <subcommand>
                            requires --allow-remote-access: the daemon has NO
                            authentication and serves your whole code graph.
   stop                     Send SIGTERM to the running daemon (via its pidfile).
-  status                   Report whether the daemon is running.
+                           When no pidfile tracks one, it ALSO probes the
+                           configured daemon address: a hayven daemon answering
+                           there without a pidfile (an orphan) is stopped when
+                           its /api/health names a live pid, after printing the
+                           projects it serves. --port/--host probe elsewhere.
+                           Exit codes: 0 stopped or nothing to stop;
+                           1 failed to stop (including an orphan whose pid
+                           cannot be verified - the command prints how to stop
+                           it by hand).
+  status                   Report whether the daemon is running. Also probes
+                           the configured address, so an orphan daemon (one
+                           answering with no pidfile in this repo) is reported
+                           instead of "stopped". Exit codes: 0 running;
+                           1 not running (stopped/stale pidfile); 3 an orphan
+                           hayven daemon is answering on the address.
   restart                  Alias for stop + start.
   logs                     Tail the daemon logs.
   register [<path>]        Register a project so the daemon serves it. Defaults
@@ -784,9 +803,9 @@ export async function runDaemon(args: ParsedArgs): Promise<number> {
     case "start":
       return startDaemon(args);
     case "stop":
-      return stopDaemon();
+      return stopDaemon(args);
     case "status":
-      return statusDaemon();
+      return statusDaemon(args);
     case "register":
       return registerDaemonProject(args);
     case "projects":
@@ -943,12 +962,20 @@ class ProjectSchemaTooNew extends Error {
 }
 
 /**
- * Apply validated `--port`/`--host` overrides onto a copy of `config`.
- * Returns the effective config, or an exit code (2) after printing a usage
- * error. Shared by the detached parent (to know where to probe/poll) and the
- * foreground server (to know where to bind) so the two can never disagree.
+ * Resolve the effective daemon ADDRESS from `--port`/`--host` on top of
+ * `config`, WITHOUT the network-exposure gate. Returns the effective config or
+ * an exit code (2) after printing a flag usage error.
+ *
+ * The split exists because two DIFFERENT questions were being answered by one
+ * function. `start` needs "where do I BIND?", which must gate a non-loopback
+ * bind behind `--allow-remote-access`. `stop`/`status` need "where do I
+ * PROBE?", and they bind NOTHING — running the exposure gate there made a
+ * read-only command exit 2 ("refusing to bind ...") for a user whose
+ * `daemon_host` is non-loopback, or print the scary WARNING banner even with
+ * the opt-in, over a command that never opens a socket. Address resolution is
+ * shared; the gate is applied by {@link applyBindOverrides} alone.
  */
-function applyBindOverrides(
+function resolveBindAddress(
   args: ParsedArgs,
   config: HayvenConfig,
 ): { config: HayvenConfig } | { exitCode: number } {
@@ -975,6 +1002,25 @@ function applyBindOverrides(
     }
     effective.daemon_port = port;
   }
+  return { config: effective };
+}
+
+/**
+ * Apply validated `--port`/`--host` overrides AND the network-exposure gate.
+ * Returns the effective config, or an exit code (2) after printing a usage or
+ * exposure error. Used by the BINDING paths only (the detached parent, to know
+ * where to probe/poll and spawn; the foreground server, to know where to bind)
+ * so the two can never disagree. Read-only `stop`/`status` use
+ * {@link resolveBindAddress} instead — see its doc for why the gate must not
+ * fire there.
+ */
+function applyBindOverrides(
+  args: ParsedArgs,
+  config: HayvenConfig,
+): { config: HayvenConfig } | { exitCode: number } {
+  const resolved = resolveBindAddress(args, config);
+  if ("exitCode" in resolved) return resolved;
+  const effective = resolved.config;
 
   // NETWORK EXPOSURE GATE.
   //
@@ -1072,12 +1118,112 @@ async function startDetachedDaemon(args: ParsedArgs): Promise<number> {
   const config = bind.config;
   const base = `http://${config.daemon_host}:${config.daemon_port}`;
 
+  // SINGLE-INSTANCE START LOCK (HAYV-7, TASK B). The probe -> decide -> spawn
+  // -> healthy sequence below has a classic TOCTOU hole: two `daemon start`
+  // invocations racing (two SessionStart hooks one second apart, in the field
+  // evidence) BOTH probe an unbound port, BOTH conclude "nothing running", and
+  // BOTH spawn. The lock serializes the whole window. It lives in the CLI, not
+  // the shell hook, so every entry point (hook, terminal, supervisor) gets it,
+  // and it is keyed by ADDRESS under the global home because the raced
+  // resource - the port - is machine-global, not per-repo.
+  let lockPath: string | null = null;
+  try {
+    mkdirSync(globalHayvenDir(), { recursive: true });
+    lockPath = daemonStartLockFile(globalHayvenDir(), config.daemon_host, config.daemon_port);
+  } catch {
+    // No usable global home (relative $HAYVEN_HOME, unwritable disk). The lock
+    // is a race-narrowing mechanism, never a reason a daemon cannot start -
+    // proceed unlocked, exactly the pre-lock behavior.
+    lockPath = null;
+  }
+  // The result is a THREE-way string, and the distinction is load-bearing:
+  // comparing it with `!result` (as the first cut of this code did) is always
+  // false for a non-empty string, which silently disabled the entire loser
+  // path — every racer proceeded as the winner and the lock guarded nothing.
+  // The suite stayed green because `reusePort: false` independently makes a
+  // losing CHILD die on EADDRINUSE, masking the dead lock. Compare the enum.
+  let lockResult: StartLockResult = "unavailable";
+  if (lockPath !== null) lockResult = tryAcquireStartLock(lockPath);
+  if (lockPath !== null && lockResult === "held") {
+    // LOSER PATH: another `daemon start` is inside its probe+spawn window right
+    // now. Wait - bounded - for its daemon to come up, then join it via the
+    // ordinary already-running path and exit 0. If the lock evaporates instead
+    // (the winner failed before spawning), take it and proceed ourselves.
+    const deadline = Date.now() + START_LOCK_WAIT_MS;
+    for (;;) {
+      const seen = await probeDaemon(base);
+      if (seen.kind === "hayven") {
+        return ensureServedByRunningDaemon(base, seen.health, ctx.paths.repoRoot);
+      }
+      if (seen.kind === "foreign") {
+        // Same messaging contract as the foreign branch in
+        // `startDetachedUnderLock`: prefer the probe's specific reason (a
+        // version-skewed hayven daemon) over the generic not-a-hayven advice.
+        process.stderr.write(
+          seen.reason !== undefined
+            ? `error: ${seen.reason}\n`
+            : `error: ${config.daemon_host}:${config.daemon_port} is in use by something that is NOT a hayven daemon.\n` +
+                "Stop it, or start with a free port (`hayven daemon start --port <N>`).\n",
+        );
+        return 1;
+      }
+      lockResult = tryAcquireStartLock(lockPath);
+      if (lockResult === "acquired") break;
+      // The mechanism failing MID-WAIT (global dir deleted, fs went read-only)
+      // downgrades to an unlocked start, same as at the top: a broken lock must
+      // never be the reason a daemon cannot start.
+      if (lockResult === "unavailable") break;
+      if (Date.now() >= deadline) {
+        const holder = readStartLockPid(lockPath);
+        process.stderr.write(
+          `error: another \`hayven daemon start\`${holder !== null ? ` (pid ${holder})` : ""} has held the ` +
+            `start lock for over ${Math.round(START_LOCK_WAIT_MS / 1000)}s and no daemon has appeared at ${base}.\n` +
+            `If that process is gone, remove the lock and retry: ${lockPath}\n`,
+        );
+        return 1;
+      }
+      await new Promise((r) => setTimeout(r, START_LOCK_POLL_MS));
+    }
+  }
+  try {
+    return await startDetachedUnderLock(args, ctx, config, base);
+  } finally {
+    // The lock is held through the health wait, not just the spawn: released
+    // any earlier, a loser could acquire it, probe a child that has not bound
+    // yet, and spawn the very duplicate the lock exists to prevent. Release
+    // only what we ACQUIRED: on the `unavailable` degrade we hold nothing, and
+    // `releaseStartLock`'s own pid check is the backstop, not the contract.
+    if (lockPath !== null && lockResult === "acquired") releaseStartLock(lockPath);
+  }
+}
+
+/**
+ * How long a losing `daemon start` waits on the start lock before giving up.
+ * Must comfortably exceed {@link DETACH_HEALTH_TIMEOUT_MS}: the winner holds
+ * the lock through its own health wait, so a loser that gave up sooner would
+ * declare failure while the winner was still legitimately starting.
+ */
+export const START_LOCK_WAIT_MS = 20_000;
+/** Poll cadence while waiting on the start lock. */
+export const START_LOCK_POLL_MS = 200;
+
+/**
+ * The body of a detached `daemon start` - the probe -> decide -> spawn ->
+ * wait-healthy critical section. Callers MUST hold the start lock (when one
+ * could be created) for the entire call; see {@link startDetachedDaemon}.
+ */
+async function startDetachedUnderLock(
+  args: ParsedArgs,
+  ctx: ReturnType<typeof requireProject>,
+  config: HayvenConfig,
+  base: string,
+): Promise<number> {
   // Is something already answering on the target address?
   const probe = await probeDaemon(base);
   if (probe.kind === "foreign") {
     // `foreign` covers BOTH "not a hayven daemon at all" and "a hayven daemon we
     // are version-incompatible with". Only the former can be fixed by picking a
-    // free port, so when the probe supplies a specific reason, print THAT — the
+    // free port, so when the probe supplies a specific reason, print THAT - the
     // generic advice is actively wrong (and harmful) for the version case.
     process.stderr.write(
       probe.reason !== undefined
@@ -2307,8 +2453,21 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
   // bound by another project's daemon would crash with a raw stack trace (or,
   // worse on some platforms, appear to double-bind). Catch it, print a clean
   // message, release our pidfile, shut down all projects, and exit non-zero.
+  //
+  // `reusePort: false` IS THE HAYV-7 COEXISTENCE FIX and must never be removed:
+  // Elysia's Bun adapter defaults `reusePort: true` in the options it hands
+  // `Bun.serve` (node_modules/elysia/dist/adapter/bun/index.js, `reusePort: !0`),
+  // which sets SO_REUSEPORT on the listening socket. With that flag, a SECOND
+  // daemon's bind on the same address SUCCEEDS silently - no EADDRINUSE, so the
+  // catch below never fires, the loser never exits, and two daemons coexist
+  // indefinitely with the kernel deciding who answers (on macOS the newest
+  // binder takes the traffic, which is exactly the field evidence: pids 64551
+  // and 64618 both alive for a day, the second one answering :7777). Verified
+  // empirically on this machine: two Elysia listens on one port both reported
+  // bound, and only the second answered. Exactly one process may own a daemon
+  // address; a loser must die loudly on the EADDRINUSE path below.
   try {
-    app.listen({ hostname: config.daemon_host, port: config.daemon_port });
+    app.listen({ hostname: config.daemon_host, port: config.daemon_port, reusePort: false });
   } catch (err) {
     const e = err as NodeJS.ErrnoException;
     for (const file of [...ownedPidFiles]) releasePidFile(file);
@@ -2402,7 +2561,177 @@ export function truncateOwnOutLog(
  *  healthy daemon dies well within this. */
 export const STOP_WAIT_MS = 10_000;
 
-async function stopDaemon(): Promise<number> {
+/**
+ * THE ORPHAN GAP (HAYV-7, TASK A). `stop` and `status` used to conclude from
+ * the PIDFILE alone, but a daemon can be answering on the configured address
+ * with no pidfile in this repo at all: the field incident had `stop` kill the
+ * pidfile-tracked daemon, print "daemon is not running" on the second run, and
+ * leave pid 64618 serving :7777 for a day. So every "not running" conclusion
+ * now ALSO probes the address `daemon start` would use, and anything hayven
+ * that answers there is reported as an orphan instead of being denied.
+ *
+ * Returns the answering daemon's health when one answers, else `null`. A
+ * version-incompatible hayven daemon (probe kind `foreign` WITH a health
+ * payload) still counts: it is exactly the months-old orphan build from the
+ * incident, and hiding it would repeat the lie.
+ */
+async function probeForOrphan(config: HayvenConfig): Promise<{ base: string; health: HayvenHealth } | null> {
+  const base = `http://${config.daemon_host}:${config.daemon_port}`;
+  const probe = await probeDaemon(base);
+  if (probe.kind === "hayven") return { base, health: probe.health };
+  if (probe.kind === "foreign" && probe.health !== undefined) return { base, health: probe.health };
+  return null;
+}
+
+/** One line naming what the orphan serves, so nobody kills a shared daemon blind. */
+function renderOrphanServing(health: HayvenHealth): string {
+  const serving = renderServing(health);
+  return serving.length > 0 ? `it is ${serving}` : "";
+}
+
+/**
+ * The pid actually LISTENING on a loopback TCP port, per `lsof`, or `null` when
+ * lsof is unavailable/unparseable or nothing listens.
+ *
+ * WHY (the wrong-process kill this closes): the pid `stop` would signal comes
+ * from an HTTP payload, and over a loopback PORT-FORWARD (`docker -p
+ * 127.0.0.1:...`, `ssh -L`) that pid names a process in ANOTHER host or
+ * namespace. Locally, that same number may belong to an innocent, unrelated
+ * process — which `stop` would then SIGTERM and cheerfully report "daemon
+ * stopped". Cross-checking the payload's pid against the kernel's own idea of
+ * who holds the socket is what prevents signalling a process that merely shares
+ * a number with a remote daemon. Best-effort: when lsof cannot answer, the
+ * caller falls back to a post-signal liveness re-probe instead.
+ */
+function loopbackListenerPid(port: number): number | null {
+  try {
+    const r = Bun.spawnSync({
+      cmd: ["lsof", "-nP", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN", "-t"],
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    if (r.exitCode !== 0) return null;
+    const first = new TextDecoder()
+      .decode(r.stdout)
+      .split("\n")
+      .map((l) => Number(l.trim()))
+      .find((n) => Number.isInteger(n) && n > 0);
+    return first ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `stop` found an orphan: a hayven daemon answering on the configured address
+ * with NO pidfile in this repo. Stop it when we can do so safely, else say
+ * exactly what to run.
+ *
+ * WHY `stop` KILLS IT ITSELF (the decision the incident demands): `hayven
+ * daemon stop`'s contract is "the daemon on this repo's configured address
+ * stops", and stopping the shared daemon - one that serves other repos - is
+ * ALREADY what `stop` does whenever the pidfile exists, so signalling the
+ * orphan grants no new power; refusing would just re-create the incident's
+ * manual `kill -TERM` recovery. The gate is identity confidence, not
+ * ownership: we only signal when the payload NAMES a pid (Task C) and that
+ * pid is verifiably alive on THIS machine - the payload came over loopback
+ * from a process that passed the hayven health-shape check, and a live local
+ * pid corroborates it. What we owe the other repos that depend on it is
+ * honesty, not a veto: the "serving N project(s)" line is printed BEFORE the
+ * signal so the blast radius is on the record.
+ */
+async function stopOrphanDaemon(base: string, health: HayvenHealth): Promise<number> {
+  const serving = renderOrphanServing(health);
+  const pid = typeof health.pid === "number" && Number.isInteger(health.pid) && health.pid > 0 ? health.pid : null;
+  if (pid === null || !isAlive(pid)) {
+    // Either a pre-upgrade daemon whose health has no pid, or a pid we cannot
+    // observe alive here (which would mean the payload is not describing a
+    // local process we can verify). Refuse to guess - name the exact recovery.
+    process.stderr.write(
+      `error: a hayven daemon is still answering at ${base} but has NO pidfile in this repo, ` +
+        "and its /api/health does not name a pid this process can verify " +
+        "(an older build, most likely).\n" +
+        serving +
+        `Find and stop it yourself:\n` +
+        `  lsof -nP -iTCP:${new URL(base).port} -sTCP:LISTEN\n` +
+        "  kill -TERM <pid>\n",
+    );
+    return 1;
+  }
+  // CORROBORATE BEFORE SIGNALLING - this is what {@link loopbackListenerPid}
+  // exists for, and the first cut of this function documented the hazard and
+  // then never called it. The payload's pid arrived over HTTP; through a
+  // loopback port-forward (`docker -p 127.0.0.1:...`, `ssh -L`) it names a
+  // process in ANOTHER pid namespace, and the same number here may be an
+  // innocent local process - which `isAlive` alone happily green-lights.
+  // When the kernel can tell us who holds the socket, the payload pid must
+  // MATCH it or we refuse; when lsof cannot answer, we signal but only claim
+  // success once the ADDRESS is quiet, not merely once the pid died.
+  const port = Number(new URL(base).port);
+  const listener = loopbackListenerPid(port);
+  if (listener !== null && listener !== pid) {
+    process.stderr.write(
+      `error: refusing to stop - /api/health at ${base} names pid ${pid}, but the local ` +
+        `listener on port ${port} is pid ${listener}. That mismatch usually means the ` +
+        "address is a port-forward into a container/remote host, and signalling " +
+        `pid ${pid} here would hit an unrelated local process.\n` +
+        serving +
+        "Stop the daemon where it actually runs, or stop the local listener yourself:\n" +
+        `  kill -TERM ${listener}\n`,
+    );
+    return 1;
+  }
+  process.stdout.write(
+    `no pidfile in this repo, but a hayven daemon is still answering at ${base} (pid ${pid}).\n` + serving,
+  );
+  try {
+    process.kill(pid, "SIGTERM");
+    process.stdout.write(`SIGTERM sent to orphan daemon (pid ${pid})\n`);
+  } catch (err) {
+    process.stderr.write(`failed to signal pid ${pid}: ${(err as Error).message}\n`);
+    return 1;
+  }
+  const deadline = Date.now() + STOP_WAIT_MS;
+  while (Date.now() < deadline) {
+    if (!isAlive(pid)) {
+      // The pid died - but "stopped" is a claim about the ADDRESS. When lsof
+      // could not corroborate the pid above, the death we just observed may be
+      // an innocent process while the real daemon (elsewhere, or forwarded)
+      // keeps answering. Re-probe before reporting success either way; it is
+      // one cheap request and it turns a plausible lie into a checked fact.
+      const still = await probeDaemon(base);
+      if (still.kind === "unreachable") {
+        process.stdout.write(`daemon stopped (pid ${pid})\n`);
+        return 0;
+      }
+      process.stderr.write(
+        `error: pid ${pid} exited but ${base} is STILL answering - the address is likely a ` +
+          "port-forward and the daemon lives elsewhere. Stop it where it runs.\n",
+      );
+      return 1;
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  process.stderr.write(
+    `error: orphan daemon (pid ${pid}) is still shutting down after ${Math.round(STOP_WAIT_MS / 1000)}s - ` +
+      "check `hayven daemon status` before restarting.\n",
+  );
+  return 1;
+}
+
+/**
+ * After a pidfile-based "not running" conclusion, close the orphan gap: probe
+ * the configured address and, when a hayven daemon answers there, hand off to
+ * {@link stopOrphanDaemon} instead of letting `notRunningMessage` stand.
+ */
+async function concludeStopNotRunning(config: HayvenConfig, notRunningMessage: string): Promise<number> {
+  const orphan = await probeForOrphan(config);
+  if (orphan !== null) return stopOrphanDaemon(orphan.base, orphan.health);
+  process.stdout.write(notRunningMessage);
+  return 0;
+}
+
+async function stopDaemon(args: ParsedArgs): Promise<number> {
   let ctx;
   try {
     ctx = requireProject();
@@ -2410,15 +2739,20 @@ async function stopDaemon(): Promise<number> {
     process.stderr.write(`error: ${(err as Error).message}\n`);
     return 1;
   }
+  // The SAME host:port resolution `daemon start` uses (config + --host/--port
+  // + env), so the address `stop` probes is the address `start` would bind —
+  // but WITHOUT the exposure gate: `stop` binds nothing, so it must not refuse
+  // (or warn) for a non-loopback `daemon_host`. See resolveBindAddress.
+  const bind = resolveBindAddress(args, ctx.config);
+  if ("exitCode" in bind) return bind.exitCode;
+  const config = bind.config;
   const pid = readPidFile(ctx.paths.pidFile);
   if (pid === null) {
-    process.stdout.write("daemon is not running\n");
-    return 0;
+    return concludeStopNotRunning(config, "daemon is not running\n");
   }
   if (!isAlive(pid)) {
     removePidFile(ctx.paths.pidFile);
-    process.stdout.write("stale pidfile removed; daemon is not running\n");
-    return 0;
+    return concludeStopNotRunning(config, "stale pidfile removed; daemon is not running\n");
   }
   // NEVER signal a pid we can prove is not ours. Pids recycle: the live daemon
   // on this machine is 72718 while one served repo's pidfile still named 29264,
@@ -2427,11 +2761,11 @@ async function stopDaemon(): Promise<number> {
   // pre-upgrade daemon) keeps the old behavior rather than refusing to stop.
   if (verifyDaemonIdentity(ctx.paths.pidFile, pid) === "foreign") {
     removePidFile(ctx.paths.pidFile);
-    process.stdout.write(
+    return concludeStopNotRunning(
+      config,
       `stale pidfile removed — pid ${pid} is alive but is NOT this daemon (recycled pid); ` +
         "refusing to signal it. The daemon is not running.\n",
     );
-    return 0;
   }
   try {
     process.kill(pid, "SIGTERM");
@@ -2449,6 +2783,17 @@ async function stopDaemon(): Promise<number> {
   while (Date.now() < deadline) {
     if (!isAlive(pid)) {
       process.stdout.write(`daemon stopped (pid ${pid})\n`);
+      // The pid we tracked is gone - but is the ADDRESS quiet? In the field
+      // incident the pidfile-tracked daemon died here while a second, orphan
+      // daemon kept serving :7777, and this success message was the last word.
+      // One `stop` should leave the address stopped, so sweep the orphan too.
+      const orphan = await probeForOrphan(config);
+      if (orphan !== null) {
+        process.stdout.write(
+          "…but the address is NOT quiet: a second hayven daemon is still answering there.\n",
+        );
+        return stopOrphanDaemon(orphan.base, orphan.health);
+      }
       return 0;
     }
     await new Promise((r) => setTimeout(r, 100));
@@ -2460,7 +2805,38 @@ async function stopDaemon(): Promise<number> {
   return 1;
 }
 
-function statusDaemon(): number {
+/**
+ * Exit code `status` uses for the orphan verdict, distinct from both "running"
+ * (0) and "not running" (1) so scripted callers - `sirius doctor` was reading
+ * this exact broken state as green - can tell "healthy", "down", and "a daemon
+ * this repo does not track is holding the port" apart without parsing prose.
+ * 2 is left alone: it already means usage error throughout this CLI.
+ */
+export const STATUS_EXIT_ORPHAN = 3;
+
+/**
+ * `status` reached a not-running verdict from the pidfile - before printing
+ * it, probe the configured address. A hayven daemon answering there without a
+ * pidfile is an ORPHAN, and reporting "stopped" over it is the exact lie that
+ * hid pid 64618 for a day.
+ */
+async function concludeStatusNotRunning(config: HayvenConfig, message: string, code: number): Promise<number> {
+  const orphan = await probeForOrphan(config);
+  if (orphan === null) {
+    process.stdout.write(message);
+    return code;
+  }
+  const pid = typeof orphan.health.pid === "number" ? orphan.health.pid : null;
+  process.stdout.write(
+    `orphan: a hayven daemon${pid !== null ? ` (pid ${pid})` : ""} is answering at ${orphan.base} ` +
+      "WITHOUT a pidfile in this repo.\n" +
+      renderOrphanServing(orphan.health) +
+      "Run `hayven daemon stop` to stop it, or `hayven daemon start` to adopt/join it.\n",
+  );
+  return STATUS_EXIT_ORPHAN;
+}
+
+async function statusDaemon(args: ParsedArgs): Promise<number> {
   let ctx;
   try {
     ctx = requireProject();
@@ -2468,6 +2844,11 @@ function statusDaemon(): number {
     process.stderr.write(`error: ${(err as Error).message}\n`);
     return 1;
   }
+  // Address resolution WITHOUT the exposure gate - see stopDaemon: `status`
+  // opens no socket, so a non-loopback `daemon_host` must not make it exit 2.
+  const bind = resolveBindAddress(args, ctx.config);
+  if ("exitCode" in bind) return bind.exitCode;
+  const config = bind.config;
   const status = daemonStatus(ctx.paths.pidFile);
   switch (status.state) {
     case "running":
@@ -2482,16 +2863,14 @@ function statusDaemon(): number {
       // process they could see running, and made `sirius doctor` read the
       // shared daemon as down. The pidfile IS stale either way; only the
       // reason differs, and the reason is what the user acts on.
-      if (status.reason === "foreign") {
-        process.stdout.write(
-          `stale pidfile (pid ${status.pid} is alive but is NOT this daemon — recycled pid)\n`,
-        );
-      } else {
-        process.stdout.write(`stale pidfile (pid ${status.pid} is not alive)\n`);
-      }
-      return 1;
+      return concludeStatusNotRunning(
+        config,
+        status.reason === "foreign"
+          ? `stale pidfile (pid ${status.pid} is alive but is NOT this daemon - recycled pid)\n`
+          : `stale pidfile (pid ${status.pid} is not alive)\n`,
+        1,
+      );
     case "stopped":
-      process.stdout.write("stopped\n");
-      return 1;
+      return concludeStatusNotRunning(config, "stopped\n", 1);
   }
 }

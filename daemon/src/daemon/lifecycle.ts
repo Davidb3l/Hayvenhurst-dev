@@ -21,8 +21,9 @@
  * {@link verifyDaemonIdentity} for why comparing two absolute clock readings
  * turned an NTP step into a duplicate daemon.
  */
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
+import { join } from "node:path";
 
 export type DaemonStatus =
   | { state: "running"; pid: number }
@@ -300,6 +301,154 @@ export function daemonStatus(pidFile: string): DaemonStatus {
     return { state: "stale", pid, reason: "foreign" };
   }
   return { state: "running", pid };
+}
+
+/* ------------------------------------------------------------------ *
+ * Single-instance START LOCK (HAYV-7, TASK B)
+ *
+ * `daemon start`'s critical section is probe -> decide -> spawn -> healthy,
+ * and it had NO mutual exclusion: two SessionStart hooks racing one second
+ * apart both probed an unbound port, both concluded "nothing running", and
+ * both spawned - the two-daemons-for-a-day incident. The lock below
+ * serializes that window across EVERY entry point (hook, terminal,
+ * supervisor), because it lives in the CLI itself, keyed per daemon address
+ * under the GLOBAL home (the resource being raced is the address, which is
+ * machine-global - a per-repo lock would not stop two repos racing one port).
+ *
+ * Properties:
+ *  - O_EXCL creation (`flag: "wx"`), so exactly one process can create it.
+ *  - pid-stamped, so a holder is identifiable and a DEAD holder's lock is
+ *    breakable (a SIGKILLed winner must not wedge every future start).
+ *  - held only for the probe+spawn+health-wait window, released in a
+ *    `finally`; the loser polls with a bounded wait and, once the winner's
+ *    daemon answers, takes the ordinary already-running path and exits 0.
+ * ------------------------------------------------------------------ */
+
+/**
+ * Age past which a lock whose CONTENT we cannot read as a pid is treated as
+ * stale. The `wx` create and the pid write are two syscalls, so a reader can
+ * catch the file empty for a moment; only when it STAYS unreadable far longer
+ * than any healthy start takes is it debris (a process killed between the two
+ * writes) rather than a race.
+ */
+export const START_LOCK_UNREADABLE_STALE_MS = 30_000;
+
+/** The lock file guarding `daemon start`'s probe+spawn window for one address. */
+export function daemonStartLockFile(globalHayvenDir: string, host: string, port: number): string {
+  // The host lands in a filename; IPv6 colons and anything else exotic are
+  // flattened rather than trusted.
+  const safeHost = host.replace(/[^A-Za-z0-9.-]/g, "_");
+  return join(globalHayvenDir, `daemon.start.${safeHost}.${port}.lock`);
+}
+
+/** The pid stamped into a start lock, or `null` when missing/unreadable. */
+export function readStartLockPid(lockPath: string): number | null {
+  try {
+    const n = Number(readFileSync(lockPath, "utf8").trim());
+    return Number.isInteger(n) && n > 0 ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Is this lock debris we may break? True when its pid is DEAD, or when it has
+ * been unreadable for longer than {@link START_LOCK_UNREADABLE_STALE_MS}.
+ * A live holder - however slow - is never breakable; the caller's bounded
+ * wait is what protects against a wedged one.
+ */
+function startLockIsStale(lockPath: string): boolean {
+  const holder = readStartLockPid(lockPath);
+  if (holder !== null) return !isAlive(holder);
+  try {
+    return Date.now() - statSync(lockPath).mtimeMs > START_LOCK_UNREADABLE_STALE_MS;
+  } catch {
+    // Vanished between the EEXIST and this stat - free to retry the create.
+    return true;
+  }
+}
+
+/**
+ * Outcome of one acquisition attempt:
+ *  - `acquired`    — we created the lock; caller holds it and must release it.
+ *  - `held`        — a LIVE holder owns it; caller waits and retries.
+ *  - `unavailable` — the lock MECHANISM itself failed (an unwritable global
+ *                    dir: EACCES/EROFS/ENOENT on create). This is NOT
+ *                    contention, and the caller must NOT wait on it — a lock we
+ *                    cannot even create must never be the thing that prevents a
+ *                    daemon starting, so the caller falls through to an UNLOCKED
+ *                    start, exactly the pre-lock behavior. Conflating this with
+ *                    `held` made start burn the full loser budget and then fail
+ *                    pointing at a lock path that does not exist.
+ */
+export type StartLockResult = "acquired" | "held" | "unavailable";
+
+/**
+ * One acquisition attempt: O_EXCL create, breaking a verifiably stale lock
+ * first.
+ *
+ * BREAKING IS ATOMIC (the concurrency bug this guards against): a naive
+ * "read pid, see it is dead, unlinkSync(lockPath)" is a check-then-act race.
+ * Two processes racing the same stale lock could BOTH conclude it is stale;
+ * the first breaks and recreates it with its own LIVE pid, and the second then
+ * `unlinkSync`s that now-live lock and creates its own — both believe they
+ * hold it, and both run probe+spawn, the exact double-start the lock exists to
+ * prevent. So a stale lock is removed by RENAMING it aside and unlinking the
+ * RENAMED file: `renameSync` is atomic, so of two racers only one rename of the
+ * same source succeeds; the loser gets ENOENT and re-contends for the `wx`
+ * create cleanly. The winner of the create is then the sole holder.
+ */
+export function tryAcquireStartLock(lockPath: string): StartLockResult {
+  // Bounded retries: each iteration either takes the lock, observes a live
+  // holder, or breaks one stale lock. Three passes comfortably cover
+  // create -> lose-break-race -> re-contend.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      writeFileSync(lockPath, String(process.pid) + "\n", { flag: "wx" });
+      return "acquired";
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      // A create failure that is NOT "already exists" means the lock mechanism
+      // is unusable here (permissions, read-only fs). Degrade, do not wait.
+      if (code !== "EEXIST") return "unavailable";
+      if (!startLockIsStale(lockPath)) return "held";
+      // Break atomically: rename aside, then remove the file WE renamed. Only
+      // one racer's rename of this source can succeed.
+      const aside = `${lockPath}.stale.${process.pid}.${Date.now()}`;
+      try {
+        renameSync(lockPath, aside);
+      } catch {
+        // Lost the rename (another breaker won it, or a live start recreated
+        // the lock and this stat/rename now sees a different file) — re-loop
+        // and let the wx create re-adjudicate against whatever is there now.
+        continue;
+      }
+      try {
+        unlinkSync(aside);
+      } catch {
+        // Already gone; the source is cleared either way.
+      }
+      // Loop: retry the wx create against the now-cleared name.
+    }
+  }
+  // Kept losing the break race across every pass: a live start is evidently
+  // contending too, so treat it as held and let the caller wait rather than
+  // spin the CPU here.
+  return "held";
+}
+
+/**
+ * Release OUR lock. Refuses to delete a lock stamped with someone else's pid -
+ * after a crash-and-break, the file on disk may already belong to a newer
+ * start, and deleting it would reopen exactly the race this lock closes.
+ */
+export function releaseStartLock(lockPath: string, pid: number = process.pid): void {
+  if (readStartLockPid(lockPath) !== pid) return;
+  try {
+    unlinkSync(lockPath);
+  } catch {
+    // Already gone.
+  }
 }
 
 /**
