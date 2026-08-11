@@ -2474,7 +2474,21 @@ function statusDaemon(): number {
       process.stdout.write(`running (pid ${status.pid})\n`);
       return 0;
     case "stale":
-      process.stdout.write(`stale pidfile (pid ${status.pid} is not alive)\n`);
+      // Never claim a live pid is dead. The `foreign` case IS alive, and on a
+      // machine running one shared daemon it is usually THAT daemon: a repo
+      // holding a leftover pidfile from an earlier daemon whose pid has since
+      // been recycled reports on a process that is answering requests on :7777
+      // right now. Saying "is not alive" about it sent a user hunting a
+      // process they could see running, and made `sirius doctor` read the
+      // shared daemon as down. The pidfile IS stale either way; only the
+      // reason differs, and the reason is what the user acts on.
+      if (status.reason === "foreign") {
+        process.stdout.write(
+          `stale pidfile (pid ${status.pid} is alive but is NOT this daemon — recycled pid)\n`,
+        );
+      } else {
+        process.stdout.write(`stale pidfile (pid ${status.pid} is not alive)\n`);
+      }
       return 1;
     case "stopped":
       process.stdout.write("stopped\n");

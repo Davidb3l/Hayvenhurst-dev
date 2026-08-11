@@ -27,7 +27,17 @@ import { hostname } from "node:os";
 export type DaemonStatus =
   | { state: "running"; pid: number }
   | { state: "stopped" }
-  | { state: "stale"; pid: number };
+  /**
+   * The pidfile does not describe a daemon we should talk to. `reason`
+   * distinguishes the two ways that happens, because they are NOT the same
+   * fact and reporting one as the other is a lie a user acts on:
+   *   - `dead`    — no process holds that pid any more.
+   *   - `foreign` — the pid IS alive, but the sidecar proves it is a different
+   *                 process that recycled the number.
+   * Callers that only branch on `state` keep their existing self-healing
+   * behavior; callers that TELL THE USER something must read `reason`.
+   */
+  | { state: "stale"; pid: number; reason: "dead" | "foreign" };
 
 /**
  * What we record about OURSELVES next to a pidfile so a later `stop`/`status`
@@ -279,11 +289,16 @@ export function isAlive(pid: number): boolean {
 export function daemonStatus(pidFile: string): DaemonStatus {
   const pid = readPidFile(pidFile);
   if (pid === null) return { state: "stopped" };
-  if (!isAlive(pid)) return { state: "stale", pid };
+  if (!isAlive(pid)) return { state: "stale", pid, reason: "dead" };
   // A live pid is not proof: report `stale` when the sidecar says this process
   // is demonstrably NOT our daemon, so every caller's existing stale-handling
   // (remove the file and proceed) self-heals a recycled pid instead of wedging.
-  if (verifyDaemonIdentity(pidFile, pid) === "foreign") return { state: "stale", pid };
+  // `reason` keeps the two cases distinguishable for anything that reports to a
+  // human: this pid is alive, and saying otherwise sends the user hunting a
+  // process that is answering requests in front of them.
+  if (verifyDaemonIdentity(pidFile, pid) === "foreign") {
+    return { state: "stale", pid, reason: "foreign" };
+  }
   return { state: "running", pid };
 }
 
