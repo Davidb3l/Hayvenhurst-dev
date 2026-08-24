@@ -1,0 +1,33 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.davidb3l/hayvenhurst",
+  "title": "Hayvenhurst",
+  "description": "Code graph of the Sothis suite. Claude Code stdio MCP; Windows, macOS, Linux.",
+  "version": "0.0.7",
+  "websiteUrl": "https://hayvenhurst.dev",
+  "repository": {
+    "url": "https://github.com/Davidb3l/Hayvenhurst-dev",
+    "source": "github",
+    "id": "1287756878"
+  },
+  "_meta": {
+    "io.modelcontextprotocol.registry/publisher-provided": {
+      "com.github": {
+        "serverDisplayName": "Hayvenhurst"
+      },
+      "dev.hayvenhurst": {
+        "suite": "Sothis suite — Sirius Forester (foreman), Hayvenhurst (code graph), Ametrite (board), Catryna Wikinelli (docs), PingMyBell (the bell)",
+        "role": "live code graph — precise context slices and affected-test selection",
+        "cli": "hayven",
+        "mcpCommand": "hayven mcp",
+        "transport": "stdio",
+        "platforms": ["windows-x64", "macos-x64", "macos-arm64", "linux-x64-glibc", "linux-arm64"],
+        "clients": ["Claude Code", "any MCP client that speaks stdio JSON-RPC"],
+        "install": "Prebuilt binaries on GitHub Releases: hayvenhurst-<version>-<platform>.tar.gz, sha256-verified by plugin/scripts/install-hayven.sh (or install-hayven.ps1). Claude Code plugin: `claude plugin marketplace add Davidb3l/Sirius-Forester` then `claude plugin install hayvenhurst@sirius-forester` and `/hayvenhurst:install-binary`. Then: claude mcp add hayvenhurst -- hayven mcp",
+        "projectScopeConfig": "A repo-root .mcp.json with { \"mcpServers\": { \"hayvenhurst\": { \"command\": \"hayven\", \"args\": [\"mcp\"] } } } makes the server auto-discoverable to any agent that opens the repo.",
+        "requires": "a .hayven/ index in (or above) the working directory — create one with `hayven init`; the server is daemonless, read-only and stateless",
+        "license": "MIT"
+      }
+    }
+  }
+}

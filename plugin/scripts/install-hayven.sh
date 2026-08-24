@@ -14,8 +14,12 @@
 # verify its sha256 against the published `<tarball>.sha256`, and install the
 # binaries into a known location.
 #
-# Idempotent + safe to re-run. POSIX sh (macOS / Linux). Windows is not
-# covered here — see the note in plugin/README.md.
+# Idempotent + safe to re-run. POSIX sh: macOS, Linux, and Windows under Git
+# Bash / MSYS2 / Cygwin (windows-x64 only; the binaries carry a `.exe` suffix
+# there). The windows-x64 tarball has shipped with every release all along —
+# only the `uname -s` detection below refused it. For a native Windows shell use
+# install-hayven.ps1 beside this script: same asset, same checksum verification,
+# no POSIX layer required.
 #
 # Usage:
 #   install-hayven.sh                 # download + install latest release
@@ -58,7 +62,7 @@ while [ $# -gt 0 ]; do
       [ -n "${2:-}" ] || { echo "install-hayven: --prefix needs a directory" >&2; exit 2; }
       PREFIX="$2"; shift ;;
     --help|-h)
-      sed -n '2,31p' "$0"
+      sed -n '2,35p' "$0"
       exit 0
       ;;
     *) echo "install-hayven: unknown argument: $1" >&2; exit 2 ;;
@@ -91,13 +95,23 @@ detect_platform() {
   case "$uname_s" in
     Linux)  os="linux" ;;
     Darwin) os="macos" ;;
-    *) fail "unsupported OS '$uname_s' (this script covers macOS + Linux; on Windows install from the release tarball manually, see plugin/README.md)" ;;
+    # Git Bash reports MINGW64_NT-10.0-26200, MSYS2 reports MSYS_NT-*, Cygwin
+    # CYGWIN_NT-*. All three are Windows hosts running the same PE binaries, so
+    # they all map to the windows-x64 asset that every release already ships.
+    MINGW*|MSYS*|CYGWIN*) os="windows" ;;
+    *) fail "unsupported OS '$uname_s' (this script covers macOS, Linux, and Windows under Git Bash / MSYS2 / Cygwin)" ;;
   esac
   case "$uname_m" in
     x86_64|amd64) arch="x64" ;;
     arm64|aarch64) arch="arm64" ;;
     *) fail "unsupported CPU arch '$uname_m'" ;;
   esac
+  # windows-x64 is the ONLY Windows target in the release matrix — there is no
+  # windows-arm64 tarball to fall back to, so say that instead of 404ing later.
+  if [ "$os" = "windows" ] && [ "$arch" != "x64" ]; then
+    fail "unsupported Windows CPU arch '$uname_m' (the release matrix publishes windows-x64 only).
+        On Windows-on-ARM, run this from an x64 shell — the x64 build runs under emulation."
+  fi
   # The only x64 Linux release is the glibc build; musl is not a release target.
   if [ "$os" = "linux" ] && [ "$arch" = "x64" ]; then
     PLATFORM="linux-x64-glibc"
@@ -107,6 +121,19 @@ detect_platform() {
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# ---- host shape (needed BEFORE detect_platform) -----------------------------
+# --check inspects $BIN_DIR and prints the PATH hint without ever calling
+# detect_platform, and on Windows the installed binaries are `hayven.exe` /
+# `hayven-native.exe`. So resolve the two host facts every mode needs — the
+# executable suffix and "is this Windows" — up front, from `uname -s` alone.
+# EXE is appended to every binary name below; on macOS/Linux it is empty and
+# every path collapses back to exactly what it was.
+IS_WINDOWS=0
+EXE=""
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) IS_WINDOWS=1; EXE=".exe" ;;
+esac
 
 # ---- suite awareness --------------------------------------------------------
 # Hayvenhurst is the code graph of a four-tool suite: Ametrite holds the task
@@ -181,10 +208,16 @@ fetch_stdout() { # fetch_stdout <url>
 
 sha256_of() { # sha256_of <file> -> hex on stdout
   f="$1"
+  # Hash STDIN, not a named file. When the path contains a backslash — which it
+  # does on Windows whenever TMPDIR is inherited as a native path like
+  # C:\Users\...\Temp — both shasum and sha256sum escape the output line and
+  # prefix it with a literal "\", so `awk '{print $1}'` returned "\9c23..." and
+  # every comparison below failed as a bogus checksum mismatch. Fed on stdin the
+  # digest is over the same bytes and the printed name is just "-".
   if have shasum; then
-    shasum -a 256 "$f" | awk '{print $1}'
+    shasum -a 256 < "$f" | awk '{print $1}'
   elif have sha256sum; then
-    sha256sum "$f" | awk '{print $1}'
+    sha256sum < "$f" | awk '{print $1}'
   else
     fail "need shasum or sha256sum to verify the download"
   fi
@@ -218,6 +251,23 @@ print_path_hint() {
       log ""
       log "note: $BIN_DIR is not on your PATH. Add it, e.g.:"
       log "      export PATH=\"$BIN_DIR:\$PATH\"   # add to ~/.zshrc or ~/.bashrc"
+      # On Windows the export above only fixes THIS Git Bash session; anything
+      # launched by Windows itself (cmd, PowerShell, the Claude Code desktop
+      # app) reads the registry User Path instead. Print the one-liner that
+      # persists it — and never run it for them: silently rewriting a user's
+      # PATH is not an installer's call to make.
+      if [ "$IS_WINDOWS" = "1" ]; then
+        win_bin_dir="$BIN_DIR"
+        if have cygpath; then
+          win_bin_dir="$(cygpath -w "$BIN_DIR" 2>/dev/null || printf '%s' "$BIN_DIR")"
+        fi
+        log ""
+        log "      That export only affects this Git Bash session. To persist it for Windows,"
+        log "      run this in PowerShell (it appends to the per-user Path, no admin needed):"
+        log "        [Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path','User') + ';$win_bin_dir', 'User')"
+        log "      Then restart your shell (and any editor or terminal that inherited the old"
+        log "      PATH) before \`hayven\` resolves. This installer never edits your PATH for you."
+      fi
       ;;
   esac
 }
@@ -229,8 +279,8 @@ if [ "$MODE" = "check" ]; then
     if suite_repo; then suite_hint; fi
     exit 0
   fi
-  if [ -x "$BIN_DIR/hayven" ]; then
-    log "hayven: installed at $BIN_DIR/hayven (not on PATH)"
+  if [ -x "$BIN_DIR/hayven$EXE" ]; then
+    log "hayven: installed at $BIN_DIR/hayven$EXE (not on PATH)"
     print_path_hint
     if suite_repo; then suite_hint; fi
     exit 0
@@ -260,7 +310,18 @@ if [ "${HAYVEN_INSTALL_DRY_RUN:-}" = "1" ]; then
   exit 0
 fi
 
-TMP="$(mktemp -d "${TMPDIR:-/tmp}/hayven-install.XXXXXX")"
+# Windows inherits TMPDIR as a NATIVE path (C:\Users\...\Temp) often enough to
+# matter here, and GNU tar reads a leading "C:" as a remote host:path spec —
+# `tar -xzf C:\...\x.tar.gz` dies with "Cannot connect to C: resolve failed"
+# rather than extracting anything. Fall back to the POSIX /tmp that MSYS always
+# provides when TMPDIR looks native.
+TMP_BASE="${TMPDIR:-/tmp}"
+if [ "$IS_WINDOWS" = "1" ]; then
+  case "$TMP_BASE" in
+    *\\*|?:*) TMP_BASE="/tmp" ;;
+  esac
+fi
+TMP="$(mktemp -d "$TMP_BASE/hayven-install.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT INT TERM
 
 log "install-hayven: downloading $TARBALL_URL"
@@ -286,7 +347,9 @@ tar -xzf "$TMP/$TARBALL" -C "$TMP"
 # The tarball expands to a top-level dir: hayvenhurst-<version>-<platform>/
 STAGE="$TMP/hayvenhurst-${VERSION}-${PLATFORM}"
 [ -d "$STAGE" ] || fail "unexpected tarball layout (no $STAGE)"
-[ -f "$STAGE/hayven" ] || fail "tarball is missing the hayven binary"
+# On windows-x64 the release matrix builds `hayven.exe` / `hayven-native.exe`;
+# $EXE is empty everywhere else, so this is the same test it always was.
+[ -f "$STAGE/hayven$EXE" ] || fail "tarball is missing the hayven$EXE binary"
 
 mkdir -p "$BIN_DIR"
 # Install both binaries; install hayven-native beside hayven so the daemon's
@@ -297,11 +360,21 @@ install_one() { # install_one <name>
   tmp_dst="$BIN_DIR/.$name.tmp.$$"
   cp "$STAGE/$name" "$tmp_dst"
   chmod +x "$tmp_dst"
-  mv -f "$tmp_dst" "$BIN_DIR/$name"
+  # Windows locks a RUNNING .exe, so the replace can fail on an upgrade while
+  # the daemon is up. Say which door to close instead of leaving a bare
+  # "Device or resource busy" and a stray .tmp file behind.
+  mv -f "$tmp_dst" "$BIN_DIR/$name" || {
+    rm -f "$tmp_dst"
+    if [ "$IS_WINDOWS" = "1" ]; then
+      fail "could not replace $BIN_DIR/$name — Windows locks an executable while it runs.
+        Stop it (\`hayven daemon stop\`), close anything else using it, then re-run."
+    fi
+    fail "could not install $BIN_DIR/$name"
+  }
   log "install-hayven: installed $BIN_DIR/$name"
 }
-install_one hayven
-install_one hayven-native
+install_one "hayven$EXE"
+install_one "hayven-native$EXE"
 
 # Bundle viewer/dist + skill/ beside the binary too, so a plugin install gets
 # the same layout a tarball install does (resolveViewerDist / resolveSkillSource

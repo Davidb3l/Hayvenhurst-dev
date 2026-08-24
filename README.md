@@ -2,7 +2,7 @@
 
 # Hayvenhurst
 
-**A persistent, trace-augmented code graph for your repository — one local daemon, queried through the `hayven` CLI.**
+**Hayvenhurst is the Sothis suite's live code graph — a persistent, trace-augmented graph of your repository for Claude Code AI coding agents, served by one local daemon and queried through the `hayven` CLI.**
 
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 ![status](https://img.shields.io/badge/status-pre--release%20(0.x)-orange)
@@ -11,6 +11,15 @@
 [Site](https://hayvenhurst.dev) · [Quickstart](docs/QUICKSTART.md) · [Why Hayvenhurst](docs/WHY_HAYVENHURST.md) · [Integration](docs/INTEGRATION.md) · [Architecture](ARCHITECTURE.md)
 
 </div>
+
+<!-- When github.com/Davidb3l/sothis-suite is published, retarget this link to it. -->
+> **Part of the [Sothis suite](https://github.com/Davidb3l/Sirius-Forester)** — the
+> local-first fleet for Claude Code agents:
+> [Sirius Forester](https://siriusforester.com) (foreman) ·
+> **Hayvenhurst** (code graph) ·
+> [Ametrite](https://ametrite.com) (board) ·
+> [Catryna Wikinelli](https://catrynawiki.com) (docs) ·
+> [PingMyBell](https://github.com/Davidb3l/pingmybell) (the bell)
 
 ## Why
 
@@ -26,7 +35,22 @@ Prebuilt binaries for **macOS (arm64, x64), Linux (x64-glibc, arm64), and Window
 curl -fsSL https://raw.githubusercontent.com/Davidb3l/Hayvenhurst-dev/main/plugin/scripts/install-hayven.sh | sh
 ```
 
-Prefer to verify by hand? Grab the tarball and its `.sha256` from the [releases page](https://github.com/Davidb3l/Hayvenhurst-dev/releases), run `shasum -a 256 -c <tarball>.sha256`, and put the extracted `hayven` on your `PATH` (this is also the Windows path). Or build from source with [Bun](https://bun.sh) 1.3+ and a [Rust toolchain](https://rustup.rs/) — see [`docs/QUICKSTART.md`](docs/QUICKSTART.md).
+**On Windows**, take whichever route matches your shell — there is no need to hand-extract anything:
+
+- **Native PowerShell** (no Git Bash, no WSL) — [`install-hayven.ps1`](plugin/scripts/install-hayven.ps1) is a full port of the shell installer: same release asset, same layout, same sha256 verification, same exit codes. Download it, read it, run it:
+
+  ```powershell
+  irm https://raw.githubusercontent.com/Davidb3l/Hayvenhurst-dev/main/plugin/scripts/install-hayven.ps1 -OutFile install-hayven.ps1
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install-hayven.ps1 -AddToPath
+  ```
+
+  It takes `-Version vX.Y.Z`, `-Prefix DIR`, `-Check`, and `-AddToPath` (without `-AddToPath` it only *prints* the command to extend your `PATH` — it never edits it behind your back). Windows PowerShell 5.1 and PowerShell 7+ both work.
+
+- **Git Bash / MSYS2 / Cygwin / WSL** — use the `curl | sh` line above; [`install-hayven.sh`](plugin/scripts/install-hayven.sh) covers Windows under a POSIX layer.
+
+- **Inside Claude Code** — run **`/hayvenhurst:install-binary`**. The command picks the right installer for your shell (`.ps1` or `.sh`) and installs into the plugin's persistent data directory.
+
+Prefer to verify by hand? Grab the tarball and its `.sha256` from the [releases page](https://github.com/Davidb3l/Hayvenhurst-dev/releases), run `shasum -a 256 -c <tarball>.sha256` (`Get-FileHash <tarball> -Algorithm SHA256` on Windows), and put the extracted `hayven` on your `PATH`. Or build from source with [Bun](https://bun.sh) 1.3+ and a [Rust toolchain](https://rustup.rs/) — see [`docs/QUICKSTART.md`](docs/QUICKSTART.md).
 
 ## Quickstart
 

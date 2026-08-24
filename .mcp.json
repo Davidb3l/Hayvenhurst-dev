@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "ametrite": {
+      "command": "amt",
+      "args": ["mcp"]
+    },
+    "hayvenhurst": {
+      "command": "hayven",
+      "args": ["mcp"]
+    }
+  }
+}
