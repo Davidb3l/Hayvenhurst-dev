@@ -31,7 +31,7 @@ export interface HardwareProbes {
 function probeNvidiaSmi(): boolean {
   try {
     // Bun.spawnSync is sync; nvidia-smi -L lists GPUs and exits 0 when present.
-    const r = Bun.spawnSync(["nvidia-smi", "-L"], { stdout: "ignore", stderr: "ignore" });
+    const r = Bun.spawnSync(["nvidia-smi", "-L"], { stdout: "ignore", stderr: "ignore", windowsHide: true });
     return r.exitCode === 0;
   } catch {
     return false;

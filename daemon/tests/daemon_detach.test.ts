@@ -157,6 +157,26 @@ describe("waitForDaemon", () => {
     expect(health).toBeNull();
   });
 
+  it("bails out early when stillStarting reports the child dead", async () => {
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls++;
+      throw new Error("ECONNREFUSED");
+    }) as unknown as typeof fetch;
+    const health = await waitForDaemon("http://x", {
+      timeoutMs: 60_000, // the point: we must NOT burn this budget
+      intervalMs: 1,
+      fetchImpl,
+      sleep: async () => {},
+      // Child dies after the second probe.
+      stillStarting: () => calls < 2,
+    });
+    expect(health).toBeNull();
+    // One probe while alive, one final probe after death (the TOCTOU case:
+    // our child may have died to EADDRINUSE against a winner that answers).
+    expect(calls).toBe(2);
+  });
+
   it("keeps polling through transient foreign answers until the deadline", async () => {
     let calls = 0;
     const fetchImpl = (async () => {

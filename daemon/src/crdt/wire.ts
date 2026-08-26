@@ -380,7 +380,7 @@ function openSubprocessBridge(binaryPath?: string): WireBridge {
       const input = JSON.stringify(ops);
       // Default encoding is `null` → stdout/stderr are returned as Buffers,
       // which is what we want for the raw binary envelope.
-      const res = spawnSync(bin, ["serialize", "encode"], { input });
+      const res = spawnSync(bin, ["serialize", "encode"], { input, windowsHide: true });
       if (res.status !== 0) {
         const err = res.stderr ? Buffer.from(res.stderr).toString("utf8") : "<no stderr>";
         throw new Error(`hayven-native serialize encode failed (${res.status}): ${err}`);
@@ -391,6 +391,7 @@ function openSubprocessBridge(binaryPath?: string): WireBridge {
     decode(bytes: Uint8Array): WireOp[] {
       const res = spawnSync(bin, ["serialize", "decode"], {
         input: Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength),
+        windowsHide: true,
       });
       if (res.status !== 0) {
         const err = res.stderr ? Buffer.from(res.stderr).toString("utf8") : "<no stderr>";
@@ -410,6 +411,7 @@ function openSubprocessBridge(binaryPath?: string): WireBridge {
           segmentBytes.byteOffset,
           segmentBytes.byteLength,
         ),
+        windowsHide: true,
       });
       if (res.status !== 0) {
         const err = res.stderr ? Buffer.from(res.stderr).toString("utf8") : "<no stderr>";

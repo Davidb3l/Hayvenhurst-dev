@@ -20,7 +20,7 @@ async function openUrl(url: string): Promise<void> {
       ? ["cmd", "/c", "start", "", url]
       : ["xdg-open", url];
   try {
-    const child = Bun.spawn({ cmd, stdout: "ignore", stderr: "ignore" });
+    const child = Bun.spawn({ cmd, stdout: "ignore", stderr: "ignore", windowsHide: true });
     await child.exited;
   } catch {
     // Don't fail the command if no opener is available — the URL was already printed.
