@@ -442,7 +442,7 @@ export function gitDiffSince(repoRoot: string, fromRef: string): BranchDiff | nu
     const res = spawnSync(
       "git",
       ["-C", repoRoot, "diff", "--name-status", "-z", "--no-renames", fromRef],
-      { encoding: "utf8", timeout: 10_000, maxBuffer: 64 * 1024 * 1024 },
+      { encoding: "utf8", timeout: 10_000, maxBuffer: 64 * 1024 * 1024, windowsHide: true },
     );
     if (res.status !== 0 || typeof res.stdout !== "string") return null;
     out = res.stdout;
@@ -477,7 +477,7 @@ export function gitUntracked(repoRoot: string): string[] {
     const res = spawnSync(
       "git",
       ["-C", repoRoot, "ls-files", "--others", "--exclude-standard", "-z"],
-      { encoding: "utf8", timeout: 10_000, maxBuffer: 64 * 1024 * 1024 },
+      { encoding: "utf8", timeout: 10_000, maxBuffer: 64 * 1024 * 1024, windowsHide: true },
     );
     if (res.status !== 0 || typeof res.stdout !== "string") return [];
     return res.stdout.split("\0").filter((t) => t.length > 0);

@@ -327,7 +327,14 @@ const OUTPUT_DRAIN_MS = 2_000;
  * directly against a real hanging process.
  */
 export const spawnWithTimeout: SpawnFn = async (cmd, opts) => {
-  const proc = Bun.spawn(cmd, { cwd: opts.cwd, stdout: "pipe", stderr: "pipe" });
+  const proc = Bun.spawn(cmd, {
+    cwd: opts.cwd,
+    stdout: "pipe",
+    stderr: "pipe",
+    // `tsc`/`mypy`/`cargo` fired from the console-less daemon must not each
+    // open a visible console window on Windows. No-op on POSIX.
+    windowsHide: true,
+  });
   const limit = opts.timeoutMs ?? TYPECHECK_TIMEOUT_MS;
   let timedOut = false;
   let killTimer: ReturnType<typeof setTimeout> | undefined;

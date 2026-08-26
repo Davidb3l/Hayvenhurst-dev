@@ -207,6 +207,7 @@ export function readGitHead(repoRoot: string): string | null {
       stdout: "pipe",
       stderr: "pipe",
       timeout: 2000,
+      windowsHide: true,
     });
     if (!proc.success || proc.exitCode !== 0) return null;
     const head = proc.stdout.toString().trim();

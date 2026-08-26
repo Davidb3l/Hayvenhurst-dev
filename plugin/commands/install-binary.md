@@ -1,7 +1,7 @@
 ---
 description: Download and install the platform-correct `hayven` CLI binary for this OS/arch from the latest Hayvenhurst GitHub release, verifying its checksum. Use when `hayven` is not yet installed.
 argument-hint: "[vX.Y.Z]"
-allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/scripts/install-hayven.sh:*), Bash(powershell.exe -NoProfile -ExecutionPolicy Bypass -File ${CLAUDE_PLUGIN_ROOT}/scripts/install-hayven.ps1:*)
+allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/scripts/install-hayven.sh:*), Bash(powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_PLUGIN_ROOT}/scripts/install-hayven.ps1":*)
 ---
 
 # Install the `hayven` binary

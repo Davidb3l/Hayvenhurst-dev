@@ -241,7 +241,14 @@ if ($Check) {
 # binaries under emulation, and Git Bash (x86_64) already takes this same path
 # there, so ARM64 warns and proceeds rather than dead-ending. A 32-bit-only host
 # has neither an asset nor an emulation story, so it stops.
-$procArch = $env:PROCESSOR_ARCHITECTURE
+# PROCESSOR_ARCHITEW6432 first: under WOW64 (a 32-bit PowerShell host on a
+# 64-bit OS) PROCESSOR_ARCHITECTURE reports the HOST's arch ('x86'), while
+# ARCHITEW6432 carries the real OS arch ('AMD64'/'ARM64'). Reading only the
+# former made this script abort "unsupported CPU arch 'x86'" on perfectly
+# supported hardware whenever a 32-bit parent (legacy launcher, CI shim,
+# SysWOW64 shell) invoked it. ARCHITEW6432 is unset outside WOW64.
+$procArch = $env:PROCESSOR_ARCHITEW6432
+if (-not $procArch) { $procArch = $env:PROCESSOR_ARCHITECTURE }
 if (-not $procArch) { $procArch = 'unknown' }
 switch ($procArch) {
     'AMD64' { break }
@@ -330,7 +337,17 @@ try {
     Write-Log 'install-hayven: verifying sha256'
     $checksumLine = $null
     try {
-        $checksumLine = (Invoke-WebRequest -Uri $ChecksumUrl -UseBasicParsing).Content
+        # GitHub serves release assets as application/octet-stream, for which
+        # Invoke-WebRequest's .Content is a byte[] on both PS 5.1 and PS 7 —
+        # NOT a string. `-split` over a byte array stringifies element-wise, so
+        # the "expected" digest became the decimal of the first byte ("99") and
+        # the comparison below failed on EVERY valid download. Decode explicitly.
+        $checksumRaw = (Invoke-WebRequest -Uri $ChecksumUrl -UseBasicParsing).Content
+        if ($checksumRaw -is [byte[]]) {
+            $checksumLine = [Text.Encoding]::UTF8.GetString($checksumRaw)
+        } else {
+            $checksumLine = [string]$checksumRaw
+        }
     } catch {
         $checksumLine = $null
     }
@@ -338,6 +355,11 @@ try {
 
     $expected = ($checksumLine -split '\s+' | Where-Object { $_ })[0]
     if (-not $expected) { Stop-WithError 'published checksum was empty' }
+    # A digest that is not 64 hex chars means we mis-decoded the asset (or the
+    # release published garbage); say that instead of a guaranteed "mismatch".
+    if ($expected -notmatch '^[0-9a-fA-F]{64}$') {
+        Stop-WithError "published checksum is not a sha256 digest: '$expected' (from $ChecksumUrl)"
+    }
     $actual = (Get-FileHash -LiteralPath $tarballPath -Algorithm SHA256).Hash
 
     if ($expected -ine $actual) {

@@ -314,6 +314,7 @@ function gitSourceContentUnchangedImpl(repoRoot: string, ingestedHead: string): 
     const rev = spawnSync("git", ["-C", repoRoot, "rev-parse", "HEAD"], {
       encoding: "utf8",
       timeout: 2000,
+      windowsHide: true,
     });
     if (rev.status !== 0 || typeof rev.stdout !== "string") return false;
     if (rev.stdout.trim() !== head) return false; // HEAD moved → real change
@@ -325,6 +326,7 @@ function gitSourceContentUnchangedImpl(repoRoot: string, ingestedHead: string): 
     const diff = spawnSync("git", ["-C", repoRoot, "diff", "--name-only", "-z", "HEAD", "--"], {
       encoding: "utf8",
       timeout: 2000,
+      windowsHide: true,
     });
     if (diff.status !== 0 || typeof diff.stdout !== "string") return false;
     const changed = diff.stdout.split("\0").filter((p) => p.length > 0);
@@ -366,6 +368,7 @@ function listSourceFiles(repoRoot: string): string[] | null {
         encoding: "buffer",
         timeout: 2000,
         maxBuffer: 32 * 1024 * 1024,
+        windowsHide: true,
       });
       if (res.status === 0 && res.stdout) {
         const rel = res.stdout

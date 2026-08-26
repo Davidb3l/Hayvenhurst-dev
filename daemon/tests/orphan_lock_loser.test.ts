@@ -82,17 +82,21 @@ describe("daemon start honors a held start lock (the loser path exists)", () => 
         env: {
           ...(process.env as Record<string, string>),
           HAYVEN_HOME: home,
+          // The production wait is 75s (it must outlast a slow cold start);
+          // pin it down for the test so `await child.exited` below returns
+          // inside the test timeout.
+          HAYVEN_START_LOCK_WAIT_MS: "18000",
         },
         stdout: "pipe",
         stderr: "pipe",
       });
       children.push(child);
 
-      // A WORKING loser path polls for the full START_LOCK_WAIT_MS (20s)
-      // because no winner daemon will ever appear on this port. The INERT
-      // call site ignores the lock, spawns a daemon, and exits 0 well inside
-      // 15s. So: still-running at 15s distinguishes the two implementations
-      // before we even read the exit.
+      // A WORKING loser path polls for the full start-lock wait (pinned to 18s
+      // above) because no winner daemon will ever appear on this port. The
+      // INERT call site ignores the lock, spawns a daemon, and exits 0 well
+      // inside 15s. So: still-running at 15s distinguishes the two
+      // implementations before we even read the exit.
       const WINDOW_MS = 15_000;
       const finishedEarly = await Promise.race([
         child.exited.then(() => true),

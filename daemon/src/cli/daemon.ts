@@ -50,14 +50,23 @@ import { Db } from "../db/queries.ts";
 import { SchemaTooNewError } from "../db/migrations.ts";
 import { activeBranchKey, resolveWriteIndex, resolveWriteIndexForKey } from "../db/branch_index.ts";
 import type { HayvenConfig } from "../config/defaults.ts";
-import { closeSync, existsSync, fstatSync, ftruncateSync, mkdirSync, openSync, statSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  fstatSync,
+  ftruncateSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  statSync,
+} from "node:fs";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import {
   buildDetachedCommand,
   probeDaemon,
   waitForDaemon,
-  DETACH_HEALTH_TIMEOUT_MS,
+  DETACH_COLD_START_TIMEOUT_MS,
   type HayvenHealth,
 } from "../daemon/detach.ts";
 import { canonicalRoot, globalHayvenDir, globalLogsDir, hayvenPathsFor, type HayvenPaths } from "../util/paths.ts";
@@ -1149,7 +1158,7 @@ async function startDetachedDaemon(args: ParsedArgs): Promise<number> {
     // now. Wait - bounded - for its daemon to come up, then join it via the
     // ordinary already-running path and exit 0. If the lock evaporates instead
     // (the winner failed before spawning), take it and proceed ourselves.
-    const deadline = Date.now() + START_LOCK_WAIT_MS;
+    const deadline = Date.now() + startLockWaitMs();
     for (;;) {
       const seen = await probeDaemon(base);
       if (seen.kind === "hayven") {
@@ -1177,7 +1186,7 @@ async function startDetachedDaemon(args: ParsedArgs): Promise<number> {
         const holder = readStartLockPid(lockPath);
         process.stderr.write(
           `error: another \`hayven daemon start\`${holder !== null ? ` (pid ${holder})` : ""} has held the ` +
-            `start lock for over ${Math.round(START_LOCK_WAIT_MS / 1000)}s and no daemon has appeared at ${base}.\n` +
+            `start lock for over ${Math.round(startLockWaitMs() / 1000)}s and no daemon has appeared at ${base}.\n` +
             `If that process is gone, remove the lock and retry: ${lockPath}\n`,
         );
         return 1;
@@ -1199,11 +1208,37 @@ async function startDetachedDaemon(args: ParsedArgs): Promise<number> {
 
 /**
  * How long a losing `daemon start` waits on the start lock before giving up.
- * Must comfortably exceed {@link DETACH_HEALTH_TIMEOUT_MS}: the winner holds
- * the lock through its own health wait, so a loser that gave up sooner would
- * declare failure while the winner was still legitimately starting.
+ * Must comfortably exceed {@link DETACH_COLD_START_TIMEOUT_MS}: the winner
+ * holds the lock through its own health wait, so a loser that gave up sooner
+ * would declare failure while the winner was still legitimately starting.
  */
-export const START_LOCK_WAIT_MS = 20_000;
+export const START_LOCK_WAIT_MS = 75_000;
+/**
+ * Operator/test override for {@link START_LOCK_WAIT_MS}.
+ *
+ * A set-but-EMPTY variable falls back to the default: `Number("") === 0`, so
+ * without the trim check a cleared-not-unset var (a wrapper's `export
+ * HAYVEN_START_LOCK_WAIT_MS=`, an unexpanded template) made every losing
+ * `daemon start` time out after 0 ms and print advice to delete the live
+ * winner's lock — reintroducing the duplicate-daemon race. A value below
+ * {@link DETACH_COLD_START_TIMEOUT_MS} is accepted (tests need it) but warned
+ * about, because it breaks the loser-outlasts-the-winner invariant documented
+ * above.
+ */
+function startLockWaitMs(): number {
+  const raw = process.env["HAYVEN_START_LOCK_WAIT_MS"];
+  if (raw === undefined || raw.trim().length === 0) return START_LOCK_WAIT_MS;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return START_LOCK_WAIT_MS;
+  const waitMs = Math.floor(n);
+  if (waitMs < DETACH_COLD_START_TIMEOUT_MS) {
+    process.stderr.write(
+      `warning: HAYVEN_START_LOCK_WAIT_MS=${waitMs} is below the ${DETACH_COLD_START_TIMEOUT_MS} ms ` +
+        "cold-start budget — a racing `daemon start` may falsely give up while the winner is still starting.\n",
+    );
+  }
+  return waitMs;
+}
 /** Poll cadence while waiting on the start lock. */
 export const START_LOCK_POLL_MS = 200;
 
@@ -1281,6 +1316,7 @@ async function startDetachedUnderLock(
   });
 
   const logPath = join(globalLogsDir(), "daemon.out.log");
+  let logOffset = 0;
   let child;
   try {
     mkdirSync(globalLogsDir(), { recursive: true });
@@ -1300,11 +1336,24 @@ async function startDetachedUnderLock(
     // inode into `autostart.log.1` and the next session starts a fresh file,
     // which is correct — nothing is lost, it is just split at the boundary.
     rotateLogFile(join(globalLogsDir(), "autostart.log"));
+    // Where this start's output BEGINS. Rotation above is a no-op below the
+    // size cap, so the file usually still carries previous daemons' output;
+    // the failure path must tail only what THIS child wrote.
+    try {
+      logOffset = statSync(logPath).size;
+    } catch {
+      logOffset = 0; // fresh file
+    }
     const fd = openSync(logPath, "a");
     try {
       child = spawn(cmd[0]!, cmd.slice(1), {
         cwd: ctx.paths.repoRoot,
         detached: true, // own process group/session — survives the parent's terminal
+        // On Windows a detached console child gets its OWN console — a visible
+        // terminal window that pops over whatever the user is typing, once per
+        // daemon start (field report: a wall of `.local\bin\hayven` windows).
+        // CREATE_NO_WINDOW keeps it a true background process; no-op on POSIX.
+        windowsHide: true,
         stdio: ["ignore", fd, fd],
       });
     } finally {
@@ -1316,13 +1365,48 @@ async function startDetachedUnderLock(
   }
   child.unref(); // let THIS process exit without waiting on the child
 
-  const health = await waitForDaemon(base, { timeoutMs: DETACH_HEALTH_TIMEOUT_MS });
+  // An unref'd child still emits `exit` while we are alive, and knowing it died
+  // turns a 60 s "did not become healthy" mystery into an immediate, accurate
+  // "the daemon exited" with the log tail in hand.
+  //
+  // The `error` listener is NOT optional. An async spawn failure (ENOENT for a
+  // relocated entry script, EACCES, a deleted cwd) is reported via `error`, not
+  // the try/catch around `spawn` — and with no listener that event CRASHES this
+  // process (verified on Bun 1.4.0). `exit` never fires after `error`, so the
+  // handler must also flip `childExited` or the wait below burns its full
+  // budget on a child that never existed.
+  let childExited = false;
+  let childSpawnError: string | null = null;
+  child.once("exit", () => {
+    childExited = true;
+  });
+  child.once("error", (err) => {
+    childSpawnError = err.message;
+    childExited = true;
+  });
+
+  const health = await waitForDaemon(base, {
+    timeoutMs: DETACH_COLD_START_TIMEOUT_MS,
+    stillStarting: () => !childExited,
+  });
   if (health === null) {
-    process.stderr.write(
-      `error: daemon did not become healthy at ${base} within ${Math.round(DETACH_HEALTH_TIMEOUT_MS / 1000)}s.\n` +
-        `Check the log: ${logPath}\n` +
-        "(or run it in this terminal: `hayven daemon start --foreground`)\n",
-    );
+    if (childExited) {
+      process.stderr.write(
+        childSpawnError !== null
+          ? `error: the daemon process could not be spawned: ${childSpawnError}\n` +
+              "(or run it in this terminal: `hayven daemon start --foreground`)\n"
+          : `error: the daemon process exited during startup without answering at ${base}.\n` +
+              renderLogTail(logPath, logOffset) +
+              `Full log: ${logPath}\n` +
+              "(or run it in this terminal: `hayven daemon start --foreground`)\n",
+      );
+    } else {
+      process.stderr.write(
+        `error: daemon did not become healthy at ${base} within ${Math.round(DETACH_COLD_START_TIMEOUT_MS / 1000)}s.\n` +
+          `Check the log: ${logPath}\n` +
+          "(or run it in this terminal: `hayven daemon start --foreground`)\n",
+      );
+    }
     return 1;
   }
 
@@ -1347,6 +1431,50 @@ async function startDetachedUnderLock(
       "It runs detached from this shell; stop it with `hayven daemon stop`.\n",
   );
   return 0;
+}
+
+/** Bytes read from the end of the child's log slice for the failure message. */
+const LOG_TAIL_READ_BYTES = 64 * 1024;
+
+/**
+ * Last lines of the child's log SINCE `fromOffset`, indented for the error
+ * message.
+ *
+ * The offset is the log's size captured just before the spawn — NOT zero:
+ * `rotateLogFile` only rotates past LOG_MAX_BYTES (32 MB), so in the normal
+ * case the file still holds many previous daemons' output. Tailing the whole
+ * file showed a PREVIOUS run's (often clean-shutdown) lines under "the daemon
+ * process exited during startup", misdirecting the diagnosis — and read up to
+ * 32 MB to print 15 lines. Reading a bounded window from the offset fixes
+ * both. Best-effort — any error yields an empty string, never a second error.
+ */
+function renderLogTail(logPath: string, fromOffset: number, lines = 15): string {
+  let fd: number | null = null;
+  try {
+    fd = openSync(logPath, "r");
+    const size = fstatSync(fd).size;
+    if (size <= fromOffset) return ""; // the child wrote nothing
+    const start = Math.max(fromOffset, size - LOG_TAIL_READ_BYTES);
+    const buf = Buffer.alloc(size - start);
+    readSync(fd, buf, 0, buf.length, start);
+    const tail = buf
+      .toString("utf8")
+      .split("\n")
+      .filter((l) => l.trim().length > 0)
+      .slice(-lines);
+    if (tail.length === 0) return "";
+    return "Last log lines:\n" + tail.map((l) => `  ${l}`).join("\n") + "\n";
+  } catch {
+    return "";
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {
+        // Nothing useful to do with a close failure on a read-only fd.
+      }
+    }
+  }
 }
 
 /**
@@ -2609,6 +2737,7 @@ function loopbackListenerPid(port: number): number | null {
       cmd: ["lsof", "-nP", `-iTCP@127.0.0.1:${port}`, "-sTCP:LISTEN", "-t"],
       stdout: "pipe",
       stderr: "ignore",
+      windowsHide: true,
     });
     if (r.exitCode !== 0) return null;
     const first = new TextDecoder()

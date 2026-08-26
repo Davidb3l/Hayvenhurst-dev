@@ -120,6 +120,7 @@ export function buildSignatureIndex(opts: {
     encoding: "utf8",
     maxBuffer: 256 * 1024 * 1024,
     timeout: opts.timeoutMs ?? 120_000,
+    windowsHide: true,
   });
   const stdout = res.stdout ?? "";
   const records = parseSignatureRecords(stdout);
@@ -185,7 +186,7 @@ export function extractSignatureFromBody(opts: {
     const res = spawnSync(
       opts.binary,
       ["parse", "--root", dir, "--signatures"],
-      { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: opts.timeoutMs ?? 30_000 },
+      { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: opts.timeoutMs ?? 30_000, windowsHide: true },
     );
     const records = parseSignatureRecords(res.stdout ?? "");
     if (records.length === 0) return null;

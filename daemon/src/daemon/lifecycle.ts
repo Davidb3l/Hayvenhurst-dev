@@ -123,6 +123,7 @@ function psFields(pid: number, fields: string): string | null {
       cmd: ["ps", "-p", String(pid), "-o", fields],
       stdout: "pipe",
       stderr: "ignore",
+      windowsHide: true,
     });
     if (r.exitCode !== 0) return null;
     const out = new TextDecoder().decode(r.stdout).trim();

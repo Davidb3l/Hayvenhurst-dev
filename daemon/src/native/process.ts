@@ -38,6 +38,7 @@ type SpawnFn = (opts: {
   stdin?: "ignore" | "pipe" | "inherit";
   stdout?: "ignore" | "pipe" | "inherit";
   stderr?: "ignore" | "pipe" | "inherit";
+  windowsHide?: boolean;
 }) => SpawnLike;
 
 export interface ParseOptions {
@@ -133,6 +134,9 @@ export function startParse(opts: ParseOptions): ParseRun {
     stdin: incremental ? "pipe" : "ignore",
     stdout: "pipe",
     stderr: "pipe",
+    // Console-less parent (the detached daemon on Windows) + console child =
+    // a visible console window per parse. Hide it; no-op on POSIX.
+    windowsHide: true,
   });
 
   if (incremental) {
