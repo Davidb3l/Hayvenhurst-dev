@@ -101,8 +101,19 @@ describe("doctor index_integrity", () => {
     db.close();
 
     const report = collectForTest();
-    expect(report.checks.find((c) => c.name === "index_integrity")?.ok).toBe(false);
-    expect(report.ok).toBe(true); // SUITE_CONTRACTS §3
+    const row = report.checks.find((c) => c.name === "index_integrity");
+    expect(row?.ok).toBe(false);
+    expect(row?.gating).toBe(false); // the advisory marker consumers read (HD-7)
+    // The corrupt index must not drag the envelope down. An UNRELATED gating
+    // failure on this machine (e.g. a stale installed hayven-native) makes
+    // ok:false for its own legitimate reason, so only assert the absolute
+    // value when this row is the sole failure.
+    const unrelatedGatingFailure = report.checks.some(
+      (c) => c.name !== "index_integrity" && c.gating && !c.ok,
+    );
+    if (!unrelatedGatingFailure) {
+      expect(report.ok).toBe(true); // SUITE_CONTRACTS §3
+    }
   });
 
   it("is quiet, not broken, when there is no index yet", () => {

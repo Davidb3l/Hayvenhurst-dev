@@ -151,11 +151,14 @@ describe("doctor --json with a stale native binary", () => {
     const { envelope } = await runDoctorJson({ HAYVEN_NATIVE_BIN: makeStaleBinary() });
     const row = checkByName(envelope, "native_check_ignored");
     expect(row).toBeDefined();
-    // §3-exact rows: {name, ok, detail}, snake_case name, no internal fields.
-    expect(Object.keys(row!).sort()).toEqual(["detail", "name", "ok"]);
+    // Wire rows are {name, ok, detail, gating} (HD-7: `gating` marks whether
+    // a failure means a broken install), snake_case name, nothing else.
+    expect(Object.keys(row!).sort()).toEqual(["detail", "gating", "name", "ok"]);
     expect(row!["name"]).toMatch(/^[a-z0-9]+(_[a-z0-9]+)*$/);
     expect(typeof row!["ok"]).toBe("boolean");
     expect(typeof row!["detail"]).toBe("string");
+    // A stale binary means the packer refuses every read — a broken tool.
+    expect(row!["gating"]).toBe(true);
   });
 
   it("classifies a runs-but-fails binary as ERROR, not STALE_BINARY", async () => {

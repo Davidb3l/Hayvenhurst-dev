@@ -330,7 +330,13 @@ export function doctorEnvelope(report: DoctorReport): Record<string, unknown> {
     schemaVersion: 1,
     ok: report.ok,
     capabilities: [...CAPABILITIES],
-    checks: report.checks.map((c) => ({ name: c.name, ok: c.ok, detail: c.detail })),
+    // `gating` is on the wire (matching the sirius doctor contract) so a
+    // suite-level consumer can tell an advisory row (tier3_model,
+    // index_integrity) from a broken-install row without hardcoding check
+    // names. Invariant, pinned by tests: `ok` === computeOk(checks), i.e. a
+    // row with gating:false never drags the envelope unhealthy. Additive and
+    // backward-compatible, so schemaVersion stays 1.
+    checks: report.checks.map((c) => ({ name: c.name, ok: c.ok, detail: c.detail, gating: c.gating })),
     report: {
       hardware: report.hardware,
       recommended_tier3_model: report.recommendedTier3,
@@ -403,6 +409,10 @@ function envelopeForCollectFailure(err: Error): Record<string, unknown> {
         name: "doctor_ran",
         ok: false,
         detail: `doctor could not complete its checks: ${err.message}`,
+        // Gating by definition: this row only exists when doctor could not
+        // run, and the envelope it rides in is already ok:false — the fields
+        // must agree.
+        gating: true,
       },
     ],
     report: { error: err.message },
