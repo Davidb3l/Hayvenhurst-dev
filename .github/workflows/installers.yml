@@ -140,6 +140,14 @@ jobs:
           if ($r.Text -notmatch 'not on PATH') { throw '-Check did not take the installed-not-on-PATH branch' }
           if ([Environment]::GetEnvironmentVariable('Path', 'User') -ne $before) { throw '-Check changed the user Path' }
 
+          # Re-running a pinned v0.0.6 is a no-op. (That release's native
+          # binary reports 0.0.5, so idempotence must not match on it.)
+          $p6 = Join-Path $env:RUNNER_TEMP 'v006'
+          $r = Invoke-Installer @('-Prefix', $p6, '-Version', 'v0.0.6', '-RequireSignature')
+          if ($r.Code -ne 0) { throw "v0.0.6 install exited $($r.Code)" }
+          $r = Invoke-Installer @('-Prefix', $p6, '-Version', 'v0.0.6')
+          if ($r.Code -ne 0 -or $r.Text -notmatch 'nothing to do') { throw 'pinned v0.0.6 re-run was not a no-op' }
+
           # A release that predates signing has no bundle: must fail closed.
           $old = Join-Path $env:RUNNER_TEMP 'old'
           $r = Invoke-Installer @('-Prefix', $old, '-Version', 'v0.0.5')

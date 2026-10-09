@@ -129,11 +129,11 @@ esac
 
 # A relative --prefix would install fine and then print PATH advice naming a
 # relative directory, which means nothing to a shell started anywhere else.
-# Anchor it to the cwd once, here. "C:..." / "C:\..." already name a drive on
-# Windows, so leave those alone.
+# Anchor it to the cwd once, here. On Windows "C:..." / "C:\..." name a drive
+# and "\\server\share" is a UNC path, so leave those alone.
 case "$PREFIX" in
   /*) ;;
-  ?:*) [ "$IS_WINDOWS" = "1" ] || PREFIX="$(pwd)/$PREFIX" ;;
+  ?:*|\\*) [ "$IS_WINDOWS" = "1" ] || PREFIX="$(pwd)/$PREFIX" ;;
   *) PREFIX="$(pwd)/$PREFIX" ;;
 esac
 BIN_DIR="$PREFIX/bin"
@@ -391,7 +391,8 @@ verify_signature() {
         Refusing to install: this artifact was not produced by $REPO's release workflow."
 
   # cosign older than 3.0 cannot read sigstore-python v3's `.sigstore.json`
-  # bundle at all, so its failure says nothing about the artifact. Treat an old
+  # bundle as invoked here (2.4+ needs --new-bundle-format; older cannot at
+  # all), so its failure says nothing about the artifact. Treat an old
   # cosign as NO usable cosign (fall through to `sigstore`, then to the
   # no-verifier path) instead of reporting a tampered release. That is no
   # weaker than not having cosign: an attacker cannot choose which cosign is
@@ -401,7 +402,7 @@ verify_signature() {
   if have cosign; then
     cosign_major="$(cosign version 2>/dev/null | sed -n 's/^GitVersion:[[:space:]]*v\{0,1\}\([0-9][0-9]*\)\..*/\1/p' | head -1)"
     if [ -n "$cosign_major" ] && [ "$cosign_major" -lt 3 ]; then
-      log "install-hayven: note: cosign $cosign_major.x cannot read this bundle format (needs cosign 3+); not using it."
+      log "install-hayven: note: found cosign $cosign_major.x; this installer verifies with cosign 3+ (older cosign reads this bundle format only with extra flags). Not using it."
     else
       cosign_ok=1
     fi

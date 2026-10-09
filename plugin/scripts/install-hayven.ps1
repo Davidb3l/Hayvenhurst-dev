@@ -784,7 +784,7 @@ SIGNATURE VERIFICATION FAILED for $AssetName
         $major = $null
         if ($cv.Output -match 'GitVersion:\s*v?(\d+)\.') { $major = [int]$Matches[1] }
         if ($null -ne $major -and $major -lt 3) {
-            Write-Log ('install-hayven: note: cosign ' + $major + '.x cannot read this bundle format (needs cosign 3+); not using it.')
+            Write-Log ('install-hayven: note: found cosign ' + $major + '.x; this installer verifies with cosign 3+ (older cosign reads this bundle format only with extra flags). Not using it.')
         } else {
             $cosignOk = $true
         }
@@ -916,14 +916,24 @@ Write-Log ('install-hayven: asset=' + $Tarball)
 # Idempotence: re-running with the same version is a no-op, not a re-download.
 # Only the prefix copy counts: a different hayven.exe elsewhere on PATH says
 # nothing about whether THIS prefix is installed. BOTH binaries must report the
-# version: an install interrupted between the two copies (Ctrl-C, or a running
-# hayven-native.exe locking its file) leaves a new hayven.exe beside an old
-# native binary, and checking hayven.exe alone would call that "nothing to do"
-# forever - exactly when the error message told the user to re-run.
+# install must have COMPLETED: an install interrupted between the two copies
+# (Ctrl-C, or a running hayven-native.exe locking its file) leaves a new
+# hayven.exe beside an old native binary, and checking hayven.exe alone would
+# call that "nothing to do" forever - exactly when the error message told the
+# user to re-run. The marker below is deleted before the copies start and
+# written only after both succeed. (Not hayven-native.exe --version: the native
+# crate's version is not bumped on every release - v0.0.6 shipped a native
+# binary reporting 0.0.5 - so matching it would re-download forever.)
+$MarkerPath = Join-Path $BinDir '.hayven-installed-version'
+function Get-InstallMarker {
+    if (-not (Test-Path -LiteralPath $MarkerPath)) { return $null }
+    try { return ([string](Get-Content -LiteralPath $MarkerPath -Raw -ErrorAction Stop)).Trim() } catch { Assert-NotStopping $_; return $null }
+}
 if (-not $Force) {
     $installed = Get-InstalledVersion $BinPath
-    $nativeInstalled = Get-InstalledVersion (Join-Path $BinDir $NativeName)
-    if ($null -ne $installed -and $installed -eq $VersionNumber -and $nativeInstalled -eq $VersionNumber) {
+    if ($null -ne $installed -and $installed -eq $VersionNumber -and
+        (Get-InstallMarker) -eq $VersionNumber -and
+        (Test-Path -LiteralPath (Join-Path $BinDir $NativeName))) {
         Write-Log ('install-hayven: hayven ' + $installed + ' is already installed at ' + $BinPath + '; nothing to do (pass -Force to reinstall).')
         Write-PathHint
         exit 0
@@ -1046,10 +1056,13 @@ try {
     if (-not (Test-Path -LiteralPath $BinDir)) {
         New-Item -ItemType Directory -Path $BinDir -Force | Out-Null
     }
+    Remove-Item -LiteralPath $MarkerPath -Force -ErrorAction SilentlyContinue
     Install-StagedFile -Stage $stage -Name $BinName
     Install-StagedFile -Stage $stage -Name $NativeName
     Install-StagedDir -From (Join-Path $stage 'viewer\dist') -To (Join-Path $BinDir 'viewer\dist')
     Install-StagedDir -From (Join-Path $stage 'skill') -To (Join-Path $BinDir 'skill')
+    # Only now is the install complete; see the idempotence check above.
+    Set-Content -LiteralPath $MarkerPath -Value $VersionNumber -Encoding ascii
 } finally {
     Remove-Item -LiteralPath $Tmp -Recurse -Force -ErrorAction SilentlyContinue
 }
