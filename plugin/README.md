@@ -59,7 +59,9 @@ After the plugin is installed, run the slash command:
 /hayvenhurst:install-binary
 ```
 
-This runs [`scripts/install-hayven.sh`](scripts/install-hayven.sh), which:
+This runs [`scripts/install-hayven.sh`](scripts/install-hayven.sh) (or, from
+Windows PowerShell with no POSIX shell, its native twin
+[`scripts/install-hayven.ps1`](scripts/install-hayven.ps1)), which:
 
 1. detects your OS + CPU arch (`uname`),
 2. maps it to the matching release asset (mirrors the platform matrix in
@@ -71,23 +73,30 @@ This runs [`scripts/install-hayven.sh`](scripts/install-hayven.sh), which:
    | Linux arm64              | `hayvenhurst-<version>-linux-arm64.tar.gz`     |
    | macOS Intel (x86-64)     | `hayvenhurst-<version>-macos-x64.tar.gz`       |
    | macOS Apple Silicon      | `hayvenhurst-<version>-macos-arm64.tar.gz`     |
+   | Windows x86-64           | `hayvenhurst-<version>-windows-x64.tar.gz`     |
 
 3. downloads it from `https://github.com/Davidb3l/Hayvenhurst-dev/releases/download/<tag>/…`,
-4. **verifies its sha256** against the published `<asset>.tar.gz.sha256`,
+4. **verifies its sha256** against the published `<asset>.tar.gz.sha256`, and
+   **its Sigstore signature** (`<asset>.tar.gz.sigstore.json`), pinned to this
+   repo's release workflow at that tag. A bad or missing signature aborts; with
+   no verifier installed (`cosign` or `sigstore`) it warns and continues on the
+   checksum, unless you pass `--require-signature`,
 5. installs `hayven` (+ `hayven-native`, plus the bundled `viewer/dist` and `skill/`)
    into the plugin's persistent data dir (`${CLAUDE_PLUGIN_DATA}/bin`, which survives
    plugin updates), and prints a `PATH` hint and next steps.
 
 It is **idempotent and safe to re-run** (e.g. to upgrade). To pin a release:
-`/hayvenhurst:install-binary v0.0.3`.
+`/hayvenhurst:install-binary v0.0.7` (v0.0.6 or newer; older releases carry no
+signature bundle and are refused).
 
 You can also run the script directly outside Claude Code:
 
 ```sh
 sh scripts/install-hayven.sh                 # latest release → ~/.local/bin
-sh scripts/install-hayven.sh --version v0.0.3 # pin a tag
+sh scripts/install-hayven.sh --version v0.0.7 # pin a tag
 sh scripts/install-hayven.sh --prefix ~/.local # choose the install prefix
 sh scripts/install-hayven.sh --check          # status only, never downloads
+sh scripts/install-hayven.sh --require-signature # refuse to install unverified
 ```
 
 A `SessionStart` **hook** runs `install-hayven.sh --check` on every session. It
@@ -96,12 +105,27 @@ the install stays an explicit, user-consented action.
 
 #### Windows
 
-The installer script is POSIX `sh` and covers **macOS + Linux**. A
-`windows-x64` tarball is published with every release, but Windows install is
-manual for now: download `hayvenhurst-<version>-windows-x64.tar.gz` (and its
-`.sha256`) from the [release page](https://github.com/Davidb3l/Hayvenhurst-dev/releases),
-verify the checksum, extract, and put `hayven.exe` / `hayven-native.exe` on your
-`PATH`.
+Two routes, the same download and the same checks:
+
+- **Git Bash / MSYS2 / Cygwin:** `install-hayven.sh` works as above and installs
+  `hayven.exe` + `hayven-native.exe`. It prints the PowerShell one-liner that puts
+  the install dir on your Windows `PATH` (it never edits `PATH` itself).
+- **PowerShell only** (Windows PowerShell 5.1 or PowerShell 7):
+
+  ```powershell
+  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install-hayven.ps1             # latest
+  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install-hayven.ps1 -AddToPath  # and fix PATH
+  ```
+
+  Flags mirror the `.sh`: `-Version`, `-Prefix`, `-Check`, `-RequireSignature`,
+  plus `-AddToPath` (appends to your *user* `Path`, keeping its `REG_EXPAND_SZ`
+  type so `%VAR%` entries keep working) and `-Force`. Binaries land in
+  `<prefix>\bin`; the prefix is `CLAUDE_PLUGIN_DATA` when run by the plugin,
+  else `%USERPROFILE%\.local`. For signature checks install
+  `winget install Sigstore.Cosign` (or `pip install sigstore`).
+
+WSL is not a Windows route: inside WSL the `.sh` installs a *Linux* `hayven` that
+Windows-native tools cannot see.
 
 ## Prerequisite: index a repo
 

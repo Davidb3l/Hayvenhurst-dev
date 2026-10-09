@@ -1,0 +1,189 @@
+# Smoke-test the release installers on a real Windows box.
+#
+# install-hayven.ps1 cannot be exercised on the macOS/Linux machines it is
+# developed on (no Windows PowerShell 5.1 there), and install-hayven.sh's
+# Git Bash path only runs for real under MINGW. This job installs published
+# releases through each of them on windows-latest: PowerShell 5.1,
+# PowerShell 7, and Git Bash, with cosign present and signatures REQUIRED, plus
+# a forced verifier failure to prove the fail-closed path. It downloads from
+# GitHub Releases, so it only runs when the installers (or this file) change.
+name: Installers
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "plugin/scripts/install-hayven.*"
+      - ".github/workflows/installers.yml"
+  pull_request:
+    paths:
+      - "plugin/scripts/install-hayven.*"
+      - ".github/workflows/installers.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows installers (PS 5.1, PS 7, Git Bash)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # cosign 3.x (the installer's default here) is what can read
+      # sigstore-python v3 bundles; without a verifier every step below would
+      # only exercise the "no verifier, warn and continue" path.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v4.1.2
+
+      - name: install-hayven.ps1 under Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $script = (Resolve-Path .\plugin\scripts\install-hayven.ps1).Path
+          $pfx = Join-Path $env:RUNNER_TEMP 'ps51'
+
+          # Run the installer in a CHILD process and capture its stderr. The
+          # installer logs through [Console]::Error, which in-process 2>&1 cannot
+          # capture, so asserting on its messages needs a real stream.
+          function Invoke-Installer([string[]]$InstallerArgs) {
+            $err = Join-Path $env:RUNNER_TEMP ('err-' + [guid]::NewGuid().ToString('N') + '.txt')
+            $out = $err + '.out'
+            $p = Start-Process -FilePath 'powershell.exe' -NoNewWindow -Wait -PassThru `
+              -ArgumentList (@('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script) + $InstallerArgs) `
+              -RedirectStandardError $err -RedirectStandardOutput $out
+            $text = (Get-Content -LiteralPath $err -Raw)
+            if ($null -eq $text) { $text = '' }
+            Write-Host $text
+            return [pscustomobject]@{ Code = $p.ExitCode; Text = $text }
+          }
+
+          # Record the user Path's registry kind so -AddToPath can be checked
+          # for the REG_EXPAND_SZ -> REG_SZ flattening bug.
+          $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment')
+          $kindBefore = if ($k -and ($k.GetValueNames() -contains 'Path')) { $k.GetValueKind('Path') } else { 'absent' }
+          if ($k) { $k.Close() }
+          Write-Host "user Path kind before: $kindBefore"
+
+          # In-process with `&`, exactly how Sirius's install-sothis.ps1 calls it.
+          & $script -Prefix $pfx -AddToPath -RequireSignature
+          if ($LASTEXITCODE -ne 0) { throw "install exited $LASTEXITCODE" }
+          $exe = Join-Path $pfx 'bin\hayven.exe'
+          foreach ($f in @('bin\hayven.exe', 'bin\hayven-native.exe', 'bin\skill\hayvenhurst.md')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $pfx $f))) { throw "missing $f" }
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $pfx 'bin\viewer\dist'))) { throw 'missing viewer\dist' }
+          Write-Host ("installed: " + (& $exe --version))
+
+          $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment')
+          $kindAfter = $k.GetValueKind('Path')
+          $raw = [string]$k.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+          $k.Close()
+          Write-Host "user Path kind after: $kindAfter"
+          if ($kindBefore -ne 'absent' -and "$kindAfter" -ne "$kindBefore") { throw "user Path kind changed: $kindBefore -> $kindAfter" }
+          if ($kindBefore -eq 'absent' -and "$kindAfter" -ne 'ExpandString') { throw "new user Path written as $kindAfter, want ExpandString" }
+          if (-not $raw.Contains((Join-Path $pfx 'bin'))) { throw 'bin dir not added to user Path' }
+
+          # Re-run in a child process: must verify the signature path ran last
+          # time, and be a no-op now.
+          $r = Invoke-Installer @('-Prefix', $pfx)
+          if ($r.Code -ne 0) { throw "re-run exited $($r.Code)" }
+          if ($r.Text -notmatch 'nothing to do') { throw 're-run was not a no-op' }
+
+          # -Force reinstalls, and with cosign present the signature is verified.
+          $r = Invoke-Installer @('-Prefix', $pfx, '-Force', '-RequireSignature')
+          if ($r.Code -ne 0) { throw "-Force exited $($r.Code)" }
+          if ($r.Text -notmatch 'signature OK \(cosign\)') { throw 'signature was not verified with cosign' }
+
+      - name: install-hayven.ps1 under PowerShell 7 (pinned, -Check, fail-closed)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $script = (Resolve-Path ./plugin/scripts/install-hayven.ps1).Path
+          $pfx = Join-Path $env:RUNNER_TEMP 'ps7'
+          function Invoke-Installer([string[]]$InstallerArgs, [hashtable]$Env = @{}) {
+            $err = Join-Path $env:RUNNER_TEMP ('err-' + [guid]::NewGuid().ToString('N') + '.txt')
+            $out = $err + '.out'
+            $saved = @{}
+            foreach ($k in $Env.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); [Environment]::SetEnvironmentVariable($k, $Env[$k]) }
+            try {
+              $p = Start-Process -FilePath 'pwsh' -NoNewWindow -Wait -PassThru `
+                -ArgumentList (@('-NoProfile', '-File', $script) + $InstallerArgs) `
+                -RedirectStandardError $err -RedirectStandardOutput $out
+            } finally {
+              foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) }
+            }
+            $text = (Get-Content -LiteralPath $err -Raw)
+            if ($null -eq $text) { $text = '' }
+            Write-Host $text
+            return [pscustomobject]@{ Code = $p.ExitCode; Text = $text }
+          }
+
+          # -Check on an empty prefix exits 3. (A fresh step: the previous
+          # step's -AddToPath reached the registry, not this process's PATH.)
+          $r = Invoke-Installer @('-Prefix', (Join-Path $env:RUNNER_TEMP 'empty'), '-Check')
+          if ($r.Code -ne 3) { throw "-Check (missing) exited $($r.Code), want 3" }
+
+          # Pinned with a bare version.
+          $r = Invoke-Installer @('-Prefix', $pfx, '-Version', '0.0.7', '-RequireSignature')
+          if ($r.Code -ne 0) { throw "install exited $($r.Code)" }
+          $v = & (Join-Path $pfx 'bin/hayven.exe') --version
+          if ("$v" -notmatch '0\.0\.7') { throw "wrong version: $v" }
+
+          # -Check on the installed-but-not-on-PATH prefix: exit 0, says so,
+          # and -AddToPath is ignored (no registry change).
+          $before = [Environment]::GetEnvironmentVariable('Path', 'User')
+          $r = Invoke-Installer @('-Prefix', $pfx, '-Check', '-AddToPath')
+          if ($r.Code -ne 0) { throw "-Check (installed) exited $($r.Code)" }
+          if ($r.Text -notmatch 'not on PATH') { throw '-Check did not take the installed-not-on-PATH branch' }
+          if ([Environment]::GetEnvironmentVariable('Path', 'User') -ne $before) { throw '-Check changed the user Path' }
+
+          # Re-running a pinned v0.0.6 is a no-op. (That release's native
+          # binary reports 0.0.5, so idempotence must not match on it.)
+          $p6 = Join-Path $env:RUNNER_TEMP 'v006'
+          $r = Invoke-Installer @('-Prefix', $p6, '-Version', 'v0.0.6', '-RequireSignature')
+          if ($r.Code -ne 0) { throw "v0.0.6 install exited $($r.Code)" }
+          $r = Invoke-Installer @('-Prefix', $p6, '-Version', 'v0.0.6')
+          if ($r.Code -ne 0 -or $r.Text -notmatch 'nothing to do') { throw 'pinned v0.0.6 re-run was not a no-op' }
+
+          # A release that predates signing has no bundle: must fail closed.
+          $old = Join-Path $env:RUNNER_TEMP 'old'
+          $r = Invoke-Installer @('-Prefix', $old, '-Version', 'v0.0.5')
+          if ($r.Code -ne 1) { throw "v0.0.5 (no bundle) exited $($r.Code), want 1" }
+          if (Test-Path -LiteralPath (Join-Path $old 'bin\hayven.exe')) { throw 'unsigned release was installed' }
+
+          # A verifier that REJECTS the artifact must abort the install. A fake
+          # cosign.cmd first on PATH also exercises the .cmd launch path.
+          $fake = Join-Path $env:RUNNER_TEMP 'fakecosign'
+          New-Item -ItemType Directory -Path $fake -Force | Out-Null
+          Set-Content -LiteralPath (Join-Path $fake 'cosign.cmd') -Value "@echo off`r`necho fake cosign: verification failed 1>&2`r`nexit /b 1" -Encoding ascii
+          $bad = Join-Path $env:RUNNER_TEMP 'bad'
+          $r = Invoke-Installer @('-Prefix', $bad, '-Version', 'v0.0.7') @{ PATH = ($fake + ';' + $env:PATH) }
+          if ($r.Code -ne 1) { throw "rejected signature exited $($r.Code), want 1" }
+          if ($r.Text -notmatch 'SIGNATURE VERIFICATION FAILED') { throw 'no signature failure message' }
+          if (Test-Path -LiteralPath (Join-Path $bad 'bin\hayven.exe')) { throw 'installed despite a failed signature' }
+
+      - name: install-hayven.sh under Git Bash
+        shell: bash
+        run: |
+          set -eu
+          # A NATIVE-form prefix, as CLAUDE_PLUGIN_DATA is on the plugin route.
+          pfx="$(cygpath -w "$RUNNER_TEMP/gitbash")"
+          sh plugin/scripts/install-hayven.sh --prefix "$pfx" --require-signature 2>&1 | tee "$RUNNER_TEMP/gb.log"
+          grep -q 'signature OK (cosign)' "$RUNNER_TEMP/gb.log"
+          bin="$(cygpath -u "$pfx")/bin"
+          test -f "$bin/hayven.exe"
+          test -f "$bin/hayven-native.exe"
+          "$bin/hayven.exe" --version
+          # The PATH hint must use the POSIX form for bash, not "D:\...".
+          if grep -q 'export PATH="[A-Za-z]:' "$RUNNER_TEMP/gb.log"; then
+            echo "PATH hint printed a native path to bash"; exit 1
+          fi
+          sh plugin/scripts/install-hayven.sh --prefix "$pfx" --check
+          # On PATH (POSIX form): no "not on your PATH" note.
+          PATH="$bin:$PATH" sh plugin/scripts/install-hayven.sh --prefix "$pfx" --version v0.0.7 2>&1 | tee "$RUNNER_TEMP/gb2.log"
+          if grep -q 'is not on your PATH' "$RUNNER_TEMP/gb2.log"; then
+            echo "PATH hint printed although the dir is on PATH"; exit 1
+          fi
