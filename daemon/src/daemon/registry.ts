@@ -894,33 +894,27 @@ function graceStartMs(stamp: string | undefined, nowMs: number): number | null {
   return parsed;
 }
 
-/**
- * Directories whose CHILDREN are conventionally mount points: `/Volumes/<x>`
- * (macOS), `/mnt/<x>`, `/media/<x>`, and `/media/<user>/<x>` or
- * `/run/media/<user>/<x>` (Linux desktops).
- */
-const VOLUME_PARENTS = new Set(["/Volumes", "/mnt", "/media"]);
-const PER_USER_VOLUME_GRANDPARENTS = new Set(["/media", "/run/media"]);
+/** Conventional mount locations: macOS `/Volumes`, Linux `/mnt`, `/media`, `/run/media`. */
+const MOUNT_DIRS = ["/Volumes", "/mnt", "/media", "/run/media"];
 
 /**
- * True when `root` looks like the ROOT of a mounted volume rather than a
- * folder inside one.
+ * True when `root` is at or below a conventional mount location.
  *
- * Why it matters for auto-relocation: the "is the old filesystem mounted?"
- * proof is "the old root's PARENT still exists". For a repo INSIDE a volume
- * (`/Volumes/Drive/code/repo`) unmounting removes the parent too, so the proof
- * works. For a repo that IS a volume's root (`/Volumes/Repo`), unmounting
- * removes the repo but leaves `/Volumes` standing, which would read as "moved"
- * and hand its alias to any copy. Those roots are therefore never
- * auto-relocated; `hayven projects relocate` still works for them. A volume
- * mounted somewhere unconventional is not recognized here; the cost is the old
- * behavior (a copy registered as `<alias>-2` would instead take the alias only
- * if the original is missing AND its parent exists).
+ * Why it matters for auto-relocation: its proof that the old filesystem is
+ * still mounted is "the old root's PARENT exists". That proof fails in both
+ * common removable layouts:
+ *   - a repo that IS a volume (`/Volumes/Repo`): unmounting leaves `/Volumes`;
+ *   - a repo inside a Linux fstab mount (`/mnt/data/proj`): unmounting leaves
+ *     the EMPTY mount-point directory `/mnt/data` behind, so the parent exists.
+ * Either way a temporarily unplugged repo would read as "moved" and its alias
+ * would go to any copy carrying the same identity. So nothing under these
+ * directories is ever auto-relocated, at any depth; the user gets the
+ * `hayven projects relocate` note instead. A volume mounted somewhere
+ * unconventional is not recognized; there the parent check is the only guard.
  */
-export function looksLikeVolumeRoot(root: string): boolean {
+export function isOnMountLocation(root: string): boolean {
   const r = resolve(root);
-  const parent = dirname(r);
-  return VOLUME_PARENTS.has(parent) || PER_USER_VOLUME_GRANDPARENTS.has(dirname(parent));
+  return MOUNT_DIRS.some((d) => r === d || r.startsWith(`${d}/`));
 }
 
 /** What {@link registerProjectDetailed} did, so a caller can SAY it. */
@@ -1016,7 +1010,7 @@ export function registerProject(root: string, alias?: string): ProjectEntry {
  *     present parent proves the filesystem holding the old root is mounted. A
  *     repo AT a volume's root (`/Volumes/Repo`) loses itself but not its parent
  *     when unmounted, so those are never auto-relocated either (see
- *     {@link looksLikeVolumeRoot}); `hayven projects relocate` handles them.
+ *     {@link isOnMountLocation}); `hayven projects relocate` handles them.
  *     The guarantee is therefore "a copy cannot take the alias while the
  *     original is present or its volume visibly unmounted", not "never".
  *   - "exactly one": two missing rows with one identity means the history is
@@ -1097,7 +1091,7 @@ export function registerProjectDetailed(
     let ambiguousReason: AmbiguityReason | undefined;
     if (sameIdentity.length === 1) {
       const moved = sameIdentity[0]!;
-      const unmounted = !stat(dirname(moved.root)) || looksLikeVolumeRoot(moved.root);
+      const unmounted = !stat(dirname(moved.root)) || isOnMountLocation(moved.root);
       if (!unmounted && !blocked.has(moved.alias)) {
         const others = entries.filter((e) => e !== moved);
         // The moved row's alias is unique already (it held it), so it needs no
@@ -1144,19 +1138,31 @@ export function registerProjectDetailed(
  * the NEXT daemon start, and moving it before then (while it is being served)
  * would still produce `<alias>-2`.
  */
-export function recordProjectIdentities(roots: readonly string[]): number {
+export function recordProjectIdentities(
+  roots: readonly string[],
+  /**
+   * Ids known from BEFORE some other writer touched the file, keyed by
+   * canonical root. Applied only to rows that have lost theirs and whose root
+   * could not be read now. This is how a MISSING row keeps its id across a
+   * write by an older daemon (v0.0.7 rewrites the registry without ids): its
+   * root has nothing to re-read, and a missing row is exactly the one
+   * auto-relocation needs the id for.
+   */
+  previous: ReadonlyMap<string, string> = new Map(),
+): number {
   const found = new Map<string, string>();
   for (const root of roots) {
     const id = readProjectIdentity(root);
     if (id !== undefined) found.set(canonicalRoot(root), id);
   }
-  if (found.size === 0) return 0;
+  if (found.size === 0 && previous.size === 0) return 0;
   return withRegistryLock(() => {
     const entries = readRegistryRaw();
     let changed = 0;
     const next = entries.map((e) => {
       if (!isAbsolute(e.root)) return e;
-      const id = found.get(canonicalRoot(e.root));
+      const key = canonicalRoot(e.root);
+      const id = found.get(key) ?? (e.id === undefined ? previous.get(key) : undefined);
       if (id === undefined || id === e.id) return e;
       changed++;
       return makeEntry(e.alias, e.root, id, e.missing_since);
@@ -1623,4 +1629,17 @@ function notFoundMessage(target: UnregisterTarget, entries: readonly ProjectEntr
 /** Remove a project by alias XOR path. Returns true if something was removed. */
 export function unregisterProject(aliasOrRoot: string): boolean {
   return unregisterProjectDetailed(aliasOrRoot).removed;
+}
+
+/**
+ * Every recorded identity, keyed by canonical root: taken before a command
+ * talks to a live daemon, so {@link recordProjectIdentities} can put back ids
+ * that an older daemon's registry write dropped.
+ */
+export function snapshotProjectIdentities(): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const e of readRegistryRaw()) {
+    if (e.id !== undefined && isAbsolute(e.root)) out.set(canonicalRoot(e.root), e.id);
+  }
+  return out;
 }

@@ -2362,6 +2362,20 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
       // add, i.e. every `claim`/`sync` from a moved primary repo would fail.
       // Blocked, the move registers as `<alias>-N` and is served now; the
       // `alias-busy` note tells the user how to fold it back.
+      // CAP, before anything is persisted, as it was before this check moved:
+      // the cap is the backstop against an unauthenticated local POST flood,
+      // and a refused add must not leave a registry row behind. The one
+      // exception is a daemon that holds a STALE runtime (a non-primary whose
+      // root is gone): retiring it below frees the slot, so let the add
+      // through to the post-retire check.
+      if (
+        runtimes.size >= MAX_LIVE_PROJECTS &&
+        ![...runtimes.values()].some(
+          (rt) => rt.alias !== primaryAlias && !isDirectory(rt.deps.paths.repoRoot),
+        )
+      ) {
+        throw new Error(`project cap reached (${MAX_LIVE_PROJECTS} served) — remove one before adding another`);
+      }
       const registered = registerProjectDetailed(root, aliasHint, { blockedAliases: [primaryAlias] });
       const entry = registered.entry;
       // Nobody reads this route's caller output for a relocation (a `claim`

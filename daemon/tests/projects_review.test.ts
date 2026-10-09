@@ -45,7 +45,7 @@ import { relocationNotes } from "../src/cli/daemon.ts";
 import { registryCheck } from "../src/cli/doctor.ts";
 import { homeIsSandboxed } from "../src/cli/projects_live.ts";
 import {
-  looksLikeVolumeRoot,
+  isOnMountLocation,
   readRegistryRaw,
   registerProject,
   registerProjectDetailed,
@@ -114,14 +114,22 @@ describe("1: auto-relocation needs proof the old filesystem is mounted", () => {
     expect(readRegistryRaw().find((e) => e.alias === "lydgr")?.root).toBe(original);
   });
 
-  it("treats a repo AT a volume's root as unprovable (its parent survives unmounting)", () => {
-    expect(looksLikeVolumeRoot("/Volumes/MyRepo")).toBe(true);
-    expect(looksLikeVolumeRoot("/Volumes/MyRepo/")).toBe(true);
-    expect(looksLikeVolumeRoot("/mnt/nas")).toBe(true);
-    expect(looksLikeVolumeRoot("/media/dave/usb")).toBe(true);
-    expect(looksLikeVolumeRoot("/run/media/dave/usb")).toBe(true);
-    expect(looksLikeVolumeRoot("/Volumes/Drive/code/repo")).toBe(false);
-    expect(looksLikeVolumeRoot("/Users/dave/code/repo")).toBe(false);
+  it("treats anything on a conventional mount location as unprovable, at any depth", () => {
+    // A volume root: unmounting leaves /Volumes (or /mnt) standing.
+    expect(isOnMountLocation("/Volumes/MyRepo")).toBe(true);
+    expect(isOnMountLocation("/Volumes/MyRepo/")).toBe(true);
+    expect(isOnMountLocation("/mnt/nas")).toBe(true);
+    expect(isOnMountLocation("/media/dave/usb")).toBe(true);
+    expect(isOnMountLocation("/run/media/dave/usb")).toBe(true);
+    // INSIDE a Linux fstab mount: the empty mount-point dir /mnt/data survives
+    // unmounting, so the parent check alone would call this repo "moved".
+    expect(isOnMountLocation("/mnt/data/proj")).toBe(true);
+    expect(isOnMountLocation("/media/dave/disk/code/proj")).toBe(true);
+    expect(isOnMountLocation("/Volumes/Drive/code/repo")).toBe(true);
+    // Not mount locations, and no prefix false positives.
+    expect(isOnMountLocation("/Users/dave/code/repo")).toBe(false);
+    expect(isOnMountLocation("/mntx/repo")).toBe(false);
+    expect(isOnMountLocation("/home/dave/media/repo")).toBe(false);
   });
 
   it("backs up projects.json before an automatic re-point", () => {
@@ -361,11 +369,16 @@ describe("CLI against a stub daemon", () => {
     expect(stub.calls).toEqual(["POST two"]);
   });
 
-  it("4: ids an old daemon dropped during the command are restored", async () => {
+  it("4: ids an old daemon dropped during the command are restored, including a MISSING row's", async () => {
     const app = makeRepo("app", ID_A);
     const p = makeRepo("p");
+    // A missing row has no config to re-read its id from, and it is exactly the
+    // row auto-relocation will need the id for when the repo turns up again.
+    const ghost = join(ws, "moved-away", "ghost");
+    mkdirSync(join(ws, "moved-away"), { recursive: true });
     writeRegistry([
       { alias: "app", root: app, id: ID_A },
+      { alias: "ghost", root: ghost, id: ID_B },
       { alias: "p", root: p },
     ]);
     // A v0.0.7 daemon rewrites the registry on hot-add without any `id`.
@@ -380,6 +393,7 @@ describe("CLI against a stub daemon", () => {
     expect(r.code).toBe(0);
     expect(stub.calls).toEqual(["DELETE app", "POST app2"]);
     expect(readRegistryRaw().find((e) => e.alias === "app2")?.id).toBe(ID_A);
+    expect(readRegistryRaw().find((e) => e.alias === "ghost")?.id).toBe(ID_B);
   });
 
   it("6: prune serves again what it stopped but did not remove (the drive came back)", async () => {

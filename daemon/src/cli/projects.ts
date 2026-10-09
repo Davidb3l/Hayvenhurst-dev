@@ -21,6 +21,7 @@ import {
   pruneMissingProjects,
   readRegistryRaw,
   recordProjectIdentities,
+  snapshotProjectIdentities,
   relocateProject,
   renameProject,
   sameProjectRoot,
@@ -231,6 +232,9 @@ async function probeLive(mutating = false): Promise<LiveDaemon> {
   if (base instanceof Error) {
     return { kind: "unmanaged", base: "(unknown)", message: `could not read the daemon address: ${base.message}` };
   }
+  // Taken BEFORE any live call: an older daemon's write may drop ids, and a
+  // missing root has nothing to re-read them from (see restoreIdentities).
+  if (mutating) identitySnapshot = snapshotProjectIdentities();
   return connectLiveDaemon(base, { mutating });
 }
 
@@ -245,13 +249,16 @@ async function probeLive(mutating = false): Promise<LiveDaemon> {
  * all of them. Reading each present root's identity again is cheap and only
  * writes when something was lost.
  */
+/** Ids recorded before this command touched a live daemon; see probeLive. */
+let identitySnapshot: Map<string, string> = new Map();
+
 function restoreIdentities(live: LiveDaemon): void {
   if (live.kind !== "up") return;
   try {
     const roots = readRegistryRaw()
       .filter((e) => isAbsolute(e.root))
       .map((e) => e.root);
-    const restored = recordProjectIdentities(roots);
+    const restored = recordProjectIdentities(roots, identitySnapshot);
     if (restored > 0) out(`restored the recorded identity of ${restored} project(s) the daemon's write dropped`);
   } catch (err) {
     process.stderr.write(`note: could not re-check project identities: ${(err as Error).message}\n`);
