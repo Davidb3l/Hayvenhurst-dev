@@ -4,7 +4,7 @@
 import { resolveSemanticInfer, searchFts, searchFtsSemantic } from "../db/fts.ts";
 import { refreshIfRequested, warnIfStale } from "../db/freshness.ts";
 import type { ParsedArgs } from "../cli.ts";
-import { isJson, openProjectDb, requireProject } from "./_shared.ts";
+import { isJson, openProjectDb, readPaths, requireProject } from "./_shared.ts";
 
 export async function runQuery(args: ParsedArgs): Promise<number> {
   if (args.positionals.length === 0) {
@@ -37,7 +37,7 @@ export async function runQuery(args: ParsedArgs): Promise<number> {
   try {
     // Surface (on stderr only) if the index looks stale and no watcher owns it.
     // Never touches stdout, so `--json` stays byte-identical and pipeable.
-    warnIfStale(db, ctx.paths);
+    warnIfStale(db, readPaths(ctx));
     const q = args.positionals.join(" ");
     const limit = Math.min(100, Math.max(1, Number(args.flags["limit"]) || 20));
     // Optional `--path <prefix>` (or `--path=<prefix>`) scopes results to nodes

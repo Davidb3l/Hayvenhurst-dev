@@ -3,7 +3,7 @@
  */
 import type { ParsedArgs } from "../cli.ts";
 import { refreshIfRequested, warnIfStale } from "../db/freshness.ts";
-import { isJson, openProjectDb, requireProject } from "./_shared.ts";
+import { isJson, openProjectDb, readPaths, requireProject } from "./_shared.ts";
 
 interface NeighborGraph {
   root: string;
@@ -39,7 +39,7 @@ export async function runNeighbors(args: ParsedArgs): Promise<number> {
     // Surface (on stderr only) if the index looks stale and no watcher owns it.
     // Emitted before the node-exists check so a stale index also explains a
     // "no node" miss. Never touches stdout, so `--json` stays byte-identical.
-    warnIfStale(db, ctx.paths);
+    warnIfStale(db, readPaths(ctx));
     if (!db.getNode(id)) {
       process.stderr.write(`No node with id \`${id}\` — try \`hayven query ${id}\` to fuzzy-find it.\n`);
       return 1;

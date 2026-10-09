@@ -62,7 +62,10 @@ export async function runRemember(args: ParsedArgs): Promise<number> {
   const ttlRaw = flagStr(args, "ttl");
   const ttl = ttlRaw !== undefined && Number.isFinite(Number(ttlRaw)) ? Number(ttlRaw) : null;
 
-  const db = openProjectDb(ctx, { readonly: false });
+  // Fleet memory is shared by every agent on the project, so it lives in the
+  // MAIN index even when run from a registered worktree (HAYV-13): a note
+  // written into an overlay would vanish on its next reseed.
+  const db = openProjectDb(ctx, { readonly: false, mainIndex: true });
   try {
     const stored = recordMemory(db, {
       agent: flagStr(args, "agent"),
@@ -101,7 +104,7 @@ export async function runRecall(args: ParsedArgs): Promise<number> {
   const limit = limitRaw !== undefined && Number.isFinite(Number(limitRaw)) ? Number(limitRaw) : undefined;
   const term = args.positionals.join(" ").trim();
 
-  const db = openProjectDb(ctx, { readonly: forgetId === undefined ? true : false });
+  const db = openProjectDb(ctx, { readonly: forgetId === undefined ? true : false, mainIndex: true });
   try {
     if (forgetId !== undefined) {
       const removed = forgetMemory(db, forgetId);

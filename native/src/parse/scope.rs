@@ -211,6 +211,19 @@ impl ScopeFilter {
     /// here, `None` = this directory's rules say nothing.
     fn matched_in(&self, dir: &Path, path: &Path, is_dir: bool) -> Option<bool> {
         let is_repo_root = Some(dir) == self.repo_root.as_deref();
+        // Git-sourced rules stop at the REPO ROOT. The `ignore` crate's walker
+        // tracks `saw_git` while climbing and skips every `.gitignore` above the
+        // first directory holding `.git`; only `.ignore` keeps applying. This
+        // filter used to climb to `/` applying `.gitignore` everywhere, so a
+        // linked worktree nested in its main checkout under an ignored path
+        // (`.sirius/worktrees/w1`, with `.sirius/` in the main `.gitignore`)
+        // had EVERY explicit file rejected while the full walk of the same root
+        // accepted them — the incremental path silently indexed nothing.
+        let git_here = self.git
+            && self
+                .repo_root
+                .as_deref()
+                .is_some_and(|repo| dir.starts_with(repo));
         // Recover from poisoning instead of propagating it. A poisoned mutex
         // here would make `lock().ok()?` return None forever, i.e. "no ignore
         // rules at all" — a long-lived watcher would silently start re-admitting
@@ -227,15 +240,15 @@ impl ScopeFilter {
             cache.clear();
         }
         let stale = match cache.get(dir) {
-            Some(entry) => entry.stamps != stamps_for(dir, is_repo_root, self.git),
+            Some(entry) => entry.stamps != stamps_for(dir, is_repo_root, git_here),
             None => true,
         };
         if stale {
             cache.insert(
                 dir.to_path_buf(),
                 DirIgnore {
-                    gi: build_dir_ignore(dir, is_repo_root, self.git),
-                    stamps: stamps_for(dir, is_repo_root, self.git),
+                    gi: build_dir_ignore(dir, is_repo_root, git_here),
+                    stamps: stamps_for(dir, is_repo_root, git_here),
                 },
             );
         }
@@ -402,6 +415,34 @@ mod tests {
         assert!(
             sf.accepts(&root.join("src/keep/a.gen.ts"), false),
             "nested negation re-includes"
+        );
+    }
+
+    /// A linked worktree nested under a path its MAIN checkout ignores must
+    /// still have its own files in scope: git rules from above the worktree's
+    /// own `.git` (a gitlink FILE) do not apply, exactly as in the full walk.
+    /// `.ignore` files above it still do.
+    #[test]
+    fn gitignore_above_the_repo_root_does_not_apply() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = dir.path().canonicalize().expect("canonicalize");
+        make_repo(&main);
+        std::fs::write(main.join(".gitignore"), b".sirius/\n").expect("write main gitignore");
+        let wt = main.join(".sirius/worktrees/w1");
+        std::fs::create_dir_all(wt.join("src")).expect("mkdir");
+        std::fs::write(wt.join(".git"), b"gitdir: /nowhere/.git/worktrees/w1\n").expect("gitlink");
+
+        let sf = ScopeFilter::new(&wt, &opts());
+        assert!(
+            sf.accepts(&wt.join("src/newmod.ts"), false),
+            "main's .gitignore must not reach into the worktree"
+        );
+
+        std::fs::write(main.join(".ignore"), b"*.skip.ts\n").expect("write .ignore");
+        let sf = ScopeFilter::new(&wt, &opts());
+        assert!(
+            !sf.accepts(&wt.join("src/x.skip.ts"), false),
+            ".ignore above the repo root still applies, as in the walker"
         );
     }
 

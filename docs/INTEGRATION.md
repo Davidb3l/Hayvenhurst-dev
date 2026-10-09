@@ -49,6 +49,7 @@ The CLI is the primary agent surface. It is hand-rolled (no argument-parsing lib
 | `hayven models <list\|pull <id>>` | shipped | Local model lifecycle (download + sha256-verify + install). |
 | `hayven traces <id>` | shipped | Reads per-entity runtime trace history (observed + resolved callers/callees, invocation counts). |
 | `hayven release <claim_id>` | shipped | Releases a claim via CLI (`DELETE /api/claims/:id` with a daemon-identity guard). |
+| `hayven worktree <add\|remove\|list\|prune> [path] [--json]` | shipped | Per-worktree overlay indexes, so graph reads inside a registered git worktree see that worktree's code. See "Fleet workers in git worktrees" below. |
 
 ### Claim exit codes
 
@@ -211,6 +212,41 @@ pytest tests/test_session.py::test_refresh tests/test_token.py   # from the pyte
 ```
 
 The selection fuses two signals: the **static** impact graph (reverse call+import walk) and the **runtime trace** map. A test tagged `trace` was *observed* exercising the code — ground truth that catches paths the static graph misses (e.g. a test that reaches a symbol through a re-export has no static edge to the real definition, so static-only selection would skip it). Cold start: with no traces yet the result is static-only and says so in `note` — run the suite once under the collector (`HAYVEN_TRACE=1`) to populate the trace signal, then re-select. `--trace-only` returns just the observed (highest-confidence) set.
+
+### Recipe: fleet workers in git worktrees (Sirius)
+
+A fleet worker usually edits inside its own `git worktree` (Sirius uses detached worktrees under `.sirius/worktrees/`, reset to a new base tip every iteration). Unregistered, a read from there resolves to the MAIN checkout's index, so the worker's brand-new files map to nothing and `affected-tests` selects no tests for them. Register the worktree once:
+
+```sh
+# From the main checkout (or from inside the worktree itself):
+hayven worktree add .sirius/worktrees/w1          # validates, seeds and builds the overlay
+cd .sirius/worktrees/w1
+hayven affected-tests --changed src/newmod.ts --json   # sees the worker's new file and its test
+
+# Or, from anywhere, without changing directory:
+hayven query brandNewThing --root /path/to/worktree
+
+hayven worktree list --json    # each overlay with freshness: fresh | stale | missing | broken | worktree-gone
+hayven worktree remove .sirius/worktrees/w1
+hayven worktree prune          # drop overlays whose worktree is gone (the daemon also does this on start)
+```
+
+How it behaves:
+
+- **Full copy, not a delta.** Each registered worktree gets `.hayven/worktrees/<id>/index.sqlite`, seeded from the main project's current read index and then amended with the worktree's diff (plus untracked and modified files). Over 2,000 changed files it re-ingests the worktree in full. Overlays live outside `.hayven/branches/`, so they never use one of the 8 per-branch cache slots.
+- **Refreshed lazily, before each read.** `query`, `refs`, `importers`, `impact`, `neighbors`, `context`, `affected-tests`, `plan-lanes`, `fleet-context`, `mcp` and `proxy` compare the worktree's HEAD, `git status` and dirty-file mtimes with the overlay's stamp, and re-parse only what changed. No explicit reindex is needed. `mcp` and `proxy` refresh once, at startup. A refresh that dies mid-way leaves the overlay marked broken (never fresh), and the next read rebuilds it.
+- **One project.** Claims, `node body`, `sync`, fleet memory (`remember`/`recall`), `traces` and `summarize` keep using the main project and its daemon: entity ids are repo-relative paths, so they are identical in every worktree. `hayven ingest` inside a registered worktree refreshes its overlay (`--full` rebuilds it); `hayven reindex` there is refused.
+- **Explicit and bounded.** Up to 16 overlays per project. At the cap, `add` first prunes registrations whose worktree is provably gone, and only then refuses, with a pointer to `hayven worktree prune`. Unregistered worktrees resolve exactly as before. The worktree must share the main checkout's git common dir, it cannot be the main checkout itself, and the project must be the repository's MAIN checkout (not itself a linked worktree, and not a bare or `--separate-git-dir` repository).
+- **Prune needs proof.** `prune` (and the daemon's prune on start) drops a registration only when the worktree path is gone, or git ran and said it is no longer a worktree of this repo. If git is missing, slow or failing, entries are kept.
+
+Limits to know about:
+
+- **`--root`** is honored by commands that locate their project through the shared resolver: the graph reads, `ingest`, `worktree`, `claim`/`release`/`sync`/`node`, `daemon`. It is ignored by `init` (use `--cwd`), `config`, `doctor` and `projects`.
+- **`mcp` and `proxy` refresh once, at startup.** Later edits in the worktree, or a reseed of the overlay by another CLI process, are not seen until the server restarts.
+- **affected-tests coverage in a worktree is main's coverage as of the seed.** Runtime traces are recorded into the main index by the daemon; the overlay carries the copy it was seeded with, so tests recorded after that (or coverage of code that exists only in the worktree) show up as static reachability, not as `observed`.
+- **Older native binaries cost a full re-parse.** Before the scope fix shipped with this feature, the native incremental parser dropped every file of a worktree nested under an ignored path (`.sirius/` in the main `.gitignore`). Overlays detect "parser accepted zero files" and fall back to a full re-parse of the worktree, which is correct but slow; upgrade `hayven-native` to get incremental refreshes back. With a current binary the same fallback still fires (rarely) when every changed file is legitimately out of scope, such as a fixture-only edit.
+- **Seeding trusts main's record of its own uncommitted edits, and only that.** While a project has a worktree registry (`.hayven/worktrees.json`), every ingest also records which SOURCE files were dirty when it ran (`last_ingest_dirty`; one `git status` with a 2s budget). Projects with no registered worktree pay nothing extra. A seed re-parses that record plus main's current dirty files from the worktree. When there is no trusted record (main has not had a full rebuild since its first worktree was registered: only a full rebuild may START the record, because an incremental ingest cannot know what an earlier, unrecorded ingest left in the index), when it overflowed (more than 2,000 paths), or when git failed or timed out at some ingest since main's last full rebuild, the overlay is built with a full parse of the worktree instead: slower, never wrong. The "no record yet" case prints a one-line note once per project; one `hayven ingest --full` in main starts the record. A git failure or overflow likewise lasts until main's next full rebuild, so under a long-running daemon seeds stay full parses until then (a time cost only). A seed copied while main was itself mid-ingest is detected on the copy and likewise abandoned for a full parse.
+- **`worktree list` freshness `unknown`** means git did not answer (missing, slow or failing). It is not a prune signal; only `worktree-gone` is.
 
 ## Programmatic context packs (the builder API)
 

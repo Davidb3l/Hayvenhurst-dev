@@ -10,18 +10,101 @@ import { resolveReadIndex } from "../db/branch_index.ts";
 import { Db } from "../db/queries.ts";
 import { canonicalRoot, detectRepoRoot, hayvenHomeDir, hayvenPathsFor, type HayvenPaths } from "../util/paths.ts";
 import { rootLogger } from "../util/log.ts";
+import { findRegisteredOverlay, overlaySqlitePath, type WorktreeEntry } from "../worktree/registry.ts";
+
+/**
+ * A read resolved INSIDE a registered git worktree (HAYV-13). Present on a
+ * {@link ProjectContext} only then; absent, everything behaves as it always has.
+ */
+export interface ProjectOverlay {
+  /** The worktree's canonical top-level — where SOURCE files are read from. */
+  readonly worktreeRoot: string;
+  readonly entry: WorktreeEntry;
+  /** The overlay index `openProjectDb` opens instead of the main read index. */
+  readonly sqlitePath: string;
+}
 
 export interface ProjectContext {
+  /**
+   * The project's paths. Inside a registered worktree these are STILL the MAIN
+   * checkout's: project identity, config, claims, CRDT and daemon routing all
+   * stay with the main project, because entity ids are repo-relative paths and
+   * therefore identical in every worktree. Only the GRAPH and the SOURCE ROOT
+   * differ — see {@link overlay}, {@link sourceRoot} and {@link readPaths}.
+   */
   paths: HayvenPaths;
   config: ReturnType<typeof loadConfig>["config"];
   configSources: string[];
+  /** Set when the cwd (or `--root`) is inside a registered worktree. */
+  overlay?: ProjectOverlay;
+}
+
+/**
+ * The global `--root <path>` override (set once by `cli.ts#main`). It stands in
+ * for `process.cwd()` wherever a command resolves its project WITHOUT an
+ * explicit cwd, so an orchestrator can point a read at a worker's worktree
+ * without `cd`-ing its own process there. An explicit `requireProject(cwd)`
+ * argument still wins.
+ */
+let projectCwdOverride: string | undefined;
+
+export function setProjectCwdOverride(path: string | undefined): void {
+  projectCwdOverride = path;
+}
+
+/** The directory project resolution starts from: `--root` when given, else the cwd. */
+export function projectCwd(): string {
+  return projectCwdOverride ?? process.cwd();
+}
+
+/**
+ * Where a read command must read SOURCE files from: the worktree inside a
+ * registered worktree, the main checkout otherwise. Use this (never
+ * `ctx.paths.repoRoot`) for anything that opens a file named by a node.
+ */
+export function sourceRoot(ctx: ProjectContext): string {
+  return ctx.overlay?.worktreeRoot ?? ctx.paths.repoRoot;
+}
+
+/**
+ * The paths a staleness probe (`warnIfStale`) should judge the read index
+ * against: the main project's `.hayven` layout, with `repoRoot` swapped for
+ * the tree the index was actually built from. Identical to `ctx.paths`
+ * outside a registered worktree.
+ */
+export function readPaths(ctx: ProjectContext): HayvenPaths {
+  return ctx.overlay === undefined ? ctx.paths : { ...ctx.paths, repoRoot: ctx.overlay.worktreeRoot };
 }
 
 /**
  * Locate the project and load its config. Throws (with a friendly message)
  * if the project hasn't been initialized via `hayven init`.
+ *
+ * Inside a REGISTERED worktree (`hayven worktree add`), the project is the main
+ * checkout that registered it and the context carries an {@link ProjectOverlay}.
+ * That check is filesystem-only and comes first because `detectRepoRoot` walks
+ * up to the first `.hayven`, which from a worktree nested in the repo is the
+ * MAIN checkout's, and from a worktree outside the repo is nothing at all. An
+ * UNREGISTERED worktree falls straight through to the original resolution.
  */
-export function requireProject(cwd: string = process.cwd()): ProjectContext {
+export function requireProject(cwd: string = projectCwd()): ProjectContext {
+  const registered = findRegisteredOverlay(cwd, hayvenPathsFor);
+  if (registered !== null && isRegistrableRoot(registered.mainRoot)) {
+    const paths = hayvenPathsFor(registered.mainRoot);
+    if (existsSync(paths.hayvenDir)) {
+      const loaded = loadConfig(registered.mainRoot);
+      return {
+        paths,
+        config: loaded.config,
+        configSources: loaded.sources,
+        overlay: {
+          worktreeRoot: registered.worktreeRoot,
+          entry: registered.entry,
+          sqlitePath: overlaySqlitePath(paths, registered.entry.id),
+        },
+      };
+    }
+  }
   const { root, reason } = detectRepoRoot(cwd);
   // The REGISTRY guard only stops a bad root from being PERSISTED. It does not
   // stop the damage: in `$HOME`, `detectRepoRoot` falls through to
@@ -66,10 +149,26 @@ export function openDb(paths: HayvenPaths, opts: { readonly?: boolean } = {}): D
  */
 export function openProjectDb(
   ctx: ProjectContext,
-  opts: { readonly?: boolean } = {},
+  opts: { readonly?: boolean; mainIndex?: boolean } = {},
 ): Db {
+  const { mainIndex, ...dbOpts } = opts;
+  // Inside a registered worktree, read the worktree's OVERLAY. `cli.ts#main`
+  // refreshed it before dispatch. `mainIndex` opts out for the callers whose
+  // data is PROJECT-level rather than tree-level (fleet memory, runtime traces,
+  // summaries): those live in the main index, and an overlay copy of them would
+  // be a stale snapshot taken at seed time.
+  if (ctx.overlay !== undefined && mainIndex !== true) {
+    if (existsSync(ctx.overlay.sqlitePath)) return new Db(ctx.overlay.sqlitePath, dbOpts);
+    // Registered but never built (or deleted by hand). Answer from main rather
+    // than opening an empty file, and SAY so: these results do not include the
+    // worktree's own changes.
+    process.stderr.write(
+      `note: no overlay index for worktree ${ctx.overlay.worktreeRoot} yet, so reading the main index. ` +
+        "Run `hayven ingest` from the worktree to build it.\n",
+    );
+  }
   const resolved = resolveReadIndex(ctx.paths, ctx.config);
-  return new Db(resolved.path, opts);
+  return new Db(resolved.path, dbOpts);
 }
 
 /** Exit-with-error helper. Logs through the daemon logger and prints to stderr. */

@@ -81,6 +81,7 @@ import {
   type RegisterOutcome,
 } from "../daemon/registry.ts";
 import { parseMaxFiles, refuseIfOverCeiling } from "./init.ts";
+import { pruneWorktreeOverlays } from "../worktree/registry.ts";
 import { hotAddToRunningDaemon, requireProject } from "./_shared.ts";
 import { connectLiveDaemon } from "./projects_live.ts";
 import { VERSION } from "../version.ts";
@@ -1499,6 +1500,23 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
   if (existing.state === "stale") {
     logger.warn("stale pidfile detected; removing", { pid: existing.pid });
     removePidFile(primaryPaths.pidFile);
+  }
+
+  // Drop worktree overlays (HAYV-13) whose worktree is gone or no longer of
+  // this repo. Sirius creates and deletes worktrees constantly, and nothing
+  // else ever runs `hayven worktree prune`, so without this the overlays (each
+  // a full index copy) would only accumulate until the 16-overlay cap refused
+  // new ones. BEST-EFFORT: overlay hygiene must never stop a daemon starting.
+  try {
+    const pruned = pruneWorktreeOverlays(primaryPaths);
+    if (pruned.removed.length > 0 || pruned.orphanDirs.length > 0) {
+      logger.info("pruned worktree overlays", {
+        removed: pruned.removed.map((r) => r.entry.path),
+        orphanDirs: pruned.orphanDirs.length,
+      });
+    }
+  } catch (err) {
+    logger.warn("worktree overlay prune failed (non-fatal)", { error: (err as Error).message });
   }
 
   /**

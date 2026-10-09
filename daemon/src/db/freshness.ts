@@ -677,6 +677,13 @@ export async function refreshIfRequested(
   // probe-Db failure) leaves the index untouched, so the mild note suffices.
   let reindexStarted = false;
 
+  // Inside a registered worktree the read index is an OVERLAY that
+  // `cli.ts#main` already refreshed before dispatch (HAYV-13). Falling through
+  // would probe the MAIN index and, if that looked stale, run a full rebuild of
+  // the MAIN project from a worktree — work nobody asked for, against a tree the
+  // read will not even use.
+  if (ctx.overlay !== undefined) return "fresh";
+
   try {
     // (1) Daemon owns the project → defer, never race its writes.
     if (probes.daemonRunning(ctx.paths)) {
