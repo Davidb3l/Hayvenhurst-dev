@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/Davidb3l/Hayvenhurst-dev/blob/main/SECURITY.md
+    about: Please do not file security problems as public issues. Email dev@hayvenhurst.dev instead.
+  - name: Documentation and quickstart
+    url: https://github.com/Davidb3l/Hayvenhurst-dev/blob/main/docs/QUICKSTART.md
+    about: The hands-on walkthrough, from install to multi-agent claims.
+  - name: The Sothis suite
+    url: https://github.com/Davidb3l/Sothis
+    about: Sirius Forester, Ametrite, Catryna Wikinelli and PingMyBell, the tools Hayvenhurst works with.

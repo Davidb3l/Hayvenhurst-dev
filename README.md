@@ -4,11 +4,16 @@
 
 **A persistent, trace-augmented code graph for your repository — one local daemon, queried through the `hayven` CLI.**
 
+[![CI](https://github.com/Davidb3l/Hayvenhurst-dev/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Davidb3l/Hayvenhurst-dev/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/Davidb3l/Hayvenhurst-dev?include_prereleases&sort=semver)](https://github.com/Davidb3l/Hayvenhurst-dev/releases)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 ![status](https://img.shields.io/badge/status-pre--release%20(0.x)-orange)
 ![languages](https://img.shields.io/badge/languages-Python%20·%20TS%20·%20JS%20·%20Rust%20·%20Go-blue)
+![platforms](https://img.shields.io/badge/platforms-macOS%20·%20Linux%20·%20Windows-lightgrey)
 
-[Site](https://hayvenhurst.dev) · [Quickstart](docs/QUICKSTART.md) · [Why Hayvenhurst](docs/WHY_HAYVENHURST.md) · [Integration](docs/INTEGRATION.md) · [Architecture](ARCHITECTURE.md)
+[Site](https://hayvenhurst.dev) · [Quickstart](docs/QUICKSTART.md) · [Why Hayvenhurst](docs/WHY_HAYVENHURST.md) · [Integration](docs/INTEGRATION.md) · [Architecture](ARCHITECTURE.md) · [Contributing](CONTRIBUTING.md)
+
+Part of **[Sothis](https://getsothis.com)**, the local-first suite for running a fleet of AI coding agents on one repo ([suite repo](https://github.com/Davidb3l/Sothis)).
 
 </div>
 
@@ -127,7 +132,17 @@ The index is embedding-free — building it is a parse plus a SQLite write — s
 
 ## Status, license, contact
 
-**Pre-release (`0.x`)** — expect breaking changes in every `0.x` release until v1.0; see [`CHANGELOG.md`](CHANGELOG.md). **MIT** licensed ([LICENSE](LICENSE)); all runtime dependencies are permissive. Security reports and contact: [`dev@hayvenhurst.dev`](mailto:dev@hayvenhurst.dev) ([SECURITY.md](SECURITY.md)). Contributions welcome with signed-off commits ([CONTRIBUTING.md](CONTRIBUTING.md)).
+**Pre-release (`0.x`)** — expect breaking changes in every `0.x` release until v1.0; see [`CHANGELOG.md`](CHANGELOG.md). **MIT** licensed ([LICENSE](LICENSE)); all runtime dependencies are permissive. Security reports and contact: [`dev@hayvenhurst.dev`](mailto:dev@hayvenhurst.dev) ([SECURITY.md](SECURITY.md)). Contributions welcome with signed-off commits ([CONTRIBUTING.md](CONTRIBUTING.md)); questions and help: [SUPPORT.md](SUPPORT.md).
+
+### Part of the Sothis suite
+
+Hayvenhurst is the code graph of **[Sothis](https://getsothis.com)** ([repo](https://github.com/Davidb3l/Sothis)), five local-first tools for running many coding agents against one repository. Each stands alone; together they compose through plain CLIs and hooks:
+
+- **[Sirius Forester](https://github.com/Davidb3l/Sirius-Forester)**: the foreman. Claims work, locks the code it touches, gates on affected tests.
+- **Hayvenhurst** (this repo): the live code graph behind those locks and test selections.
+- **[Ametrite](https://github.com/Davidb3l/Ametrite)**: the local issue tracker and knowledge base.
+- **[Catryna Wikinelli](https://github.com/Davidb3l/Catryna-Wikinelli)**: docs that the code cannot silently outgrow.
+- **[PingMyBell](https://github.com/Davidb3l/pingmybell)**: rings the human when a decision is needed.
 
 ---
 
