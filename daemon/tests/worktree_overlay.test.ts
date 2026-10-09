@@ -12,6 +12,7 @@
 // a sandboxed `$HAYVEN_HOME` (never `$HOME`: Bun caches `os.homedir()`) and a
 // dead `$HAYVEN_PORT`, so `init`'s best-effort hot-add cannot reach a real
 // daemon. Binary-gated like the other native suites.
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -91,16 +92,51 @@ function hvEnv(cwd: string, env: Record<string, string>, ...args: string[]): Run
  * SQLite's shared-memory wal-index, rewritten by any connection that merely
  * OPENS a WAL database (the seed's checkpoint does), and holds no data.
  */
+/**
+ * The LOGICAL content of main's indexes: every row of every table, hashed.
+ *
+ * Not file bytes. Seeding an overlay checkpoints main's WAL into its main file
+ * (`copySqlite` must, to copy a consistent snapshot), which moves bytes between
+ * `index.sqlite` and `index.sqlite-wal` without changing a single row. A byte
+ * comparison passed locally only when the WAL happened to be empty already and
+ * failed on CI when it was not. What this test guards is that overlay work
+ * never WRITES main's data, so compare the data.
+ */
+function sqliteContentHash(path: string): string {
+  const db = new Database(path, { readonly: true });
+  try {
+    const h = new Bun.CryptoHasher("sha256");
+    const tables = db
+      .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+      .all() as Array<{ name: string }>;
+    for (const { name } of tables) {
+      h.update(`\u0000table:${name}\u0000`);
+      const rows = db.query(`SELECT * FROM "${name.replace(/"/g, '""')}"`).all() as Array<Record<string, unknown>>;
+      const lines = rows.map((r) =>
+        JSON.stringify(r, (_k, v) => (v instanceof Uint8Array ? Buffer.from(v).toString("hex") : v)),
+      );
+      for (const line of lines.sort()) h.update(line + "\n");
+    }
+    return h.digest("hex");
+  } finally {
+    db.close();
+  }
+}
+
 function mainIndexFingerprint(repo: string): Record<string, string> {
   const out: Record<string, string> = {};
   const add = (p: string): void => {
-    if (p.endsWith("-shm")) return;
-    if (existsSync(p)) out[p] = new Bun.CryptoHasher("sha256").update(readFileSync(p)).digest("hex");
+    if (existsSync(p)) out[p] = sqliteContentHash(p);
   };
   add(join(repo, ".hayven/index.sqlite"));
   out["branchDirs"] = branchDirs(repo).join(",");
   for (const d of branchDirs(repo)) {
-    for (const f of readdirSync(join(repo, ".hayven/branches", d))) add(join(repo, ".hayven/branches", d, f));
+    const dir = join(repo, ".hayven/branches", d);
+    out[`files:${d}`] = readdirSync(dir)
+      .filter((f) => !/\.sqlite-(wal|shm)$/.test(f))
+      .sort()
+      .join(",");
+    add(join(dir, "index.sqlite"));
   }
   return out;
 }
