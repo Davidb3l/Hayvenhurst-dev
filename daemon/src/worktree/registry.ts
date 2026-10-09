@@ -25,7 +25,7 @@ import { join } from "node:path";
 
 import { withFileLockSync } from "../util/file_lock.ts";
 import { canonicalRoot, type HayvenPaths } from "../util/paths.ts";
-import { detectLinkedWorktree, gitCommonDir, gitDirOf, gitToplevel } from "./git.ts";
+import { detectLinkedWorktree, revParsePathProbe } from "./git.ts";
 
 /** Hard cap on registered overlays per project. Each one is a full index copy. */
 export const MAX_WORKTREE_OVERLAYS = 16;
@@ -171,33 +171,74 @@ export type WorktreeValidation =
   | { ok: false; reason: string };
 
 /**
- * Is `candidate` a linked worktree of the repo whose main checkout is
+ * Three-way verdict on a candidate worktree. `invalid` is POSITIVE evidence
+ * (the path is gone, or git ran and said it is not a worktree of this repo);
+ * `unknown` means git could not answer at all (missing, timed out, killed).
+ * `add` refuses both; `prune` deletes only on `invalid`.
+ */
+export type WorktreeVerdict =
+  | { kind: "ok"; path: string }
+  | { kind: "invalid"; reason: string }
+  | { kind: "unknown"; reason: string };
+
+/**
+ * Is `candidate` a linked worktree of the repo whose MAIN checkout is
  * `mainRoot`? The returned `path` is the worktree's canonical TOP-LEVEL, so
  * registering a subdirectory registers the worktree that contains it.
  *
- * The identity test is the shared git dir: `git rev-parse --git-common-dir`
- * from the candidate must equal the main checkout's. That is what "a worktree
- * OF THIS REPO" means to git, and it holds wherever the worktree lives on disk.
- * The main checkout itself has the same common dir, so it is excluded
- * separately: its private git dir IS the common dir.
+ * Three tests, each closing a way to register something the read path can
+ * never resolve:
+ *   1. same shared git dir (`git rev-parse --git-common-dir`): a worktree OF
+ *      THIS REPO, wherever it lives on disk;
+ *   2. not the main checkout itself (its private git dir IS the common dir);
+ *   3. the main checkout that `detectLinkedWorktree` derives for it is
+ *      EXACTLY this project's root. Reads resolve a worktree to its project
+ *      through that derivation, so a project that is itself a linked worktree,
+ *      or a repo whose main is bare / uses `--separate-git-dir`, would accept a
+ *      registration that no read ever finds.
  */
+export function classifyWorktree(candidate: string, mainRoot: string): WorktreeVerdict {
+  if (!existsSync(candidate)) return { kind: "invalid", reason: `${candidate} does not exist` };
+  const top = revParsePathProbe(candidate, "--show-toplevel");
+  if (top.kind === "error") return { kind: "unknown", reason: `git could not run in ${candidate}: ${top.message}` };
+  if (top.kind === "exit") {
+    return /not a git repository/i.test(top.stderr)
+      ? { kind: "invalid", reason: `${candidate} is not inside a git working tree` }
+      : { kind: "unknown", reason: `git rev-parse failed in ${candidate}: ${top.stderr.trim()}` };
+  }
+  const theirs = revParsePathProbe(top.path, "--git-common-dir");
+  const ours = revParsePathProbe(mainRoot, "--git-common-dir");
+  if (theirs.kind !== "ok" || ours.kind !== "ok") {
+    return { kind: "unknown", reason: `could not read the git common dir of ${top.path} or ${mainRoot}` };
+  }
+  if (theirs.path !== ours.path) {
+    return {
+      kind: "invalid",
+      reason: `${top.path} is a worktree of a different repository (${theirs.path}, not ${ours.path})`,
+    };
+  }
+  const own = revParsePathProbe(top.path, "--git-dir");
+  if (own.kind !== "ok") return { kind: "unknown", reason: `could not read the git dir of ${top.path}` };
+  const project = canonicalRoot(mainRoot);
+  if (top.path === project || own.path === ours.path) {
+    return { kind: "invalid", reason: `${top.path} is the main checkout itself, not a linked worktree` };
+  }
+  const linked = detectLinkedWorktree(top.path);
+  if (linked === null || linked.mainRoot !== project) {
+    return {
+      kind: "invalid",
+      reason:
+        `${top.path} belongs to the main checkout ${linked?.mainRoot ?? "(none: a bare or separate-git-dir repository)"}, ` +
+        `not to this project (${project}). Overlays can only be registered from the repository's main checkout.`,
+    };
+  }
+  return { kind: "ok", path: top.path };
+}
+
+/** {@link classifyWorktree} for `add`: anything but `ok` is a refusal. */
 export function validateWorktree(candidate: string, mainRoot: string): WorktreeValidation {
-  if (!existsSync(candidate)) return { ok: false, reason: `${candidate} does not exist` };
-  const top = gitToplevel(candidate);
-  if (top === null) return { ok: false, reason: `${candidate} is not inside a git working tree` };
-  const theirs = gitCommonDir(top);
-  const ours = gitCommonDir(mainRoot);
-  if (theirs === null || ours === null) {
-    return { ok: false, reason: `could not read the git common dir of ${top} or ${mainRoot}` };
-  }
-  if (theirs !== ours) {
-    return { ok: false, reason: `${top} is a worktree of a different repository (${theirs}, not ${ours})` };
-  }
-  const ownGitDir = gitDirOf(top);
-  if (top === canonicalRoot(mainRoot) || ownGitDir === ours) {
-    return { ok: false, reason: `${top} is the main checkout itself, not a linked worktree` };
-  }
-  return { ok: true, path: top };
+  const v = classifyWorktree(candidate, mainRoot);
+  return v.kind === "ok" ? { ok: true, path: v.path } : { ok: false, reason: v.reason };
 }
 
 /** A read-path resolution: this cwd is inside a REGISTERED worktree. */
@@ -250,9 +291,12 @@ export function pruneWorktreeOverlays(paths: HayvenPaths): PruneResult {
   const before = readWorktreeRegistryStrict(paths);
   const verdicts = new Map<string, string>();
   for (const e of before) {
-    const v = validateWorktree(e.path, paths.repoRoot);
-    if (!v.ok) verdicts.set(e.id, v.reason);
-    else if (v.path !== e.path) verdicts.set(e.id, `${e.path} now resolves to ${v.path}`);
+    // POSITIVE EVIDENCE ONLY. This runs on every daemon start; a git that is
+    // missing, slow or killed must leave registrations alone, not delete a
+    // live worker's overlay. `unknown` keeps the entry.
+    const v = classifyWorktree(e.path, paths.repoRoot);
+    if (v.kind === "invalid") verdicts.set(e.id, v.reason);
+    else if (v.kind === "ok" && v.path !== e.path) verdicts.set(e.id, `${e.path} now resolves to ${v.path}`);
   }
   const removed =
     verdicts.size === 0

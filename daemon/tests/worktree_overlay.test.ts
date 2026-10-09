@@ -71,6 +71,36 @@ function hv(cwd: string, ...args: string[]): Run {
   return { code: p.exitCode ?? -1, stdout: p.stdout.toString(), stderr: p.stderr.toString() };
 }
 
+function hvEnv(cwd: string, env: Record<string, string>, ...args: string[]): Run {
+  const p = Bun.spawnSync([process.execPath, CLI, ...args], {
+    cwd,
+    env: { ...process.env, HAYVEN_HOME: home, HAYVEN_PORT: DEAD_PORT, HAYVEN_NATIVE_BIN: bin ?? "", ...env },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  return { code: p.exitCode ?? -1, stdout: p.stdout.toString(), stderr: p.stderr.toString() };
+}
+
+/**
+ * sha256 of main's legacy index and every per-branch index DATA file (main +
+ * `-wal`), keyed by path, plus the branch dir names. `-shm` is excluded: it is
+ * SQLite's shared-memory wal-index, rewritten by any connection that merely
+ * OPENS a WAL database (the seed's checkpoint does), and holds no data.
+ */
+function mainIndexFingerprint(repo: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  const add = (p: string): void => {
+    if (p.endsWith("-shm")) return;
+    if (existsSync(p)) out[p] = new Bun.CryptoHasher("sha256").update(readFileSync(p)).digest("hex");
+  };
+  add(join(repo, ".hayven/index.sqlite"));
+  out["branchDirs"] = branchDirs(repo).join(",");
+  for (const d of branchDirs(repo)) {
+    for (const f of readdirSync(join(repo, ".hayven/branches", d))) add(join(repo, ".hayven/branches", d, f));
+  }
+  return out;
+}
+
 function json<T>(r: Run): T {
   if (r.code !== 0) throw new Error(`exit ${r.code}\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
   return JSON.parse(r.stdout) as T;
@@ -199,12 +229,19 @@ maybe("worktree overlays (E2E, native binary)", () => {
       expect(queryIds(wt, "thirdThing")).not.toContain("src/a/thirdThing");
       expect(queryIds(wt, "existingFn")).toContain("src/a/existingFn");
 
-      // A worker reset to a NEW base tip (Sirius does this every iteration).
+      // The worker COMMITS on its detached head...
+      write(wt, "src/w.ts", "export function workerOnlyFn() {\n  return 9;\n}\n");
+      git(wt, ["add", "-A"]);
+      git(wt, ["-c", "user.email=t@t.t", "-c", "user.name=t", "commit", "-q", "-m", "worker"]);
+      expect(queryIds(wt, "workerOnlyFn")).toContain("src/w/workerOnlyFn");
+      // ...then is reset to a NEW base tip that does not contain that commit
+      // (Sirius does this every iteration). The old head's symbols must go.
       write(repo, "src/b.ts", "export function committedOnMain() {\n  return 5;\n}\n");
       git(repo, ["add", "-A"]);
       git(repo, ["commit", "-q", "-m", "main moves"]);
       git(wt, ["checkout", "-q", "--detach", git(repo, ["rev-parse", "HEAD"]).trim()]);
       expect(queryIds(wt, "committedOnMain")).toContain("src/b/committedOnMain");
+      expect(queryIds(wt, "workerOnlyFn")).toEqual([]);
 
       const list = json<{ worktrees: Array<{ path: string; freshness: string }> }>(hv(repo, "worktree", "list", "--json"));
       expect(list.worktrees).toEqual([expect.objectContaining({ path: wt, freshness: "fresh" })]);
@@ -338,27 +375,207 @@ maybe("worktree overlays (E2E, native binary)", () => {
   );
 
   test(
-    `the ${MAX_WORKTREE_OVERLAYS + 1}th overlay is refused, naming \`hayven worktree prune\``,
+    `the ${MAX_WORKTREE_OVERLAYS + 1}th LIVE overlay is refused, naming \`hayven worktree prune\``,
     () => {
       const repo = makeRepo();
-      // Fill the registry to the cap with entries whose worktrees do not exist:
-      // the cap counts registrations, and prune is what reclaims dead ones.
-      const filler = Array.from({ length: MAX_WORKTREE_OVERLAYS }, (_, i) => {
-        const path = join(repo, `.sirius/worktrees/gone-${i}`);
+      // Sixteen REAL worktrees, registered straight into the registry (building
+      // sixteen overlays would only slow the test; the cap counts registrations).
+      const live = Array.from({ length: MAX_WORKTREE_OVERLAYS }, (_, i) => {
+        const path = addWorktree(repo, join(repo, `.sirius/worktrees/live-${i}`));
         return { path, id: overlayId(path), created_at: new Date().toISOString(), seed_head: null };
       });
-      writeFileSync(join(repo, ".hayven/worktrees.json"), JSON.stringify({ version: 1, worktrees: filler }));
+      writeFileSync(join(repo, ".hayven/worktrees.json"), JSON.stringify({ version: 1, worktrees: live }));
 
       const wt = addWorktree(repo, join(repo, ".sirius/worktrees/w17"));
       const refused = hv(repo, "worktree", "add", wt);
       expect(refused.code).toBe(1);
       expect(refused.stderr).toContain("hayven worktree prune");
       expect(existsSync(join(repo, ".hayven/worktrees", overlayId(wt)))).toBe(false);
+      // Nothing live was pruned to make room.
+      const reg = JSON.parse(readFileSync(join(repo, ".hayven/worktrees.json"), "utf8")) as { worktrees: unknown[] };
+      expect(reg.worktrees.length).toBe(MAX_WORKTREE_OVERLAYS);
+    },
+    SLOW,
+  );
 
-      // Prune reclaims the dead registrations, after which it fits.
-      const pruned = json<{ removed: unknown[] }>(hv(repo, "worktree", "prune", "--json"));
-      expect(pruned.removed.length).toBe(MAX_WORKTREE_OVERLAYS);
+  test(
+    "at the cap, add first prunes DEAD registrations, then succeeds",
+    () => {
+      const repo = makeRepo();
+      const dead = Array.from({ length: MAX_WORKTREE_OVERLAYS }, (_, i) => {
+        const path = join(repo, `.sirius/worktrees/gone-${i}`);
+        return { path, id: overlayId(path), created_at: new Date().toISOString(), seed_head: null };
+      });
+      writeFileSync(join(repo, ".hayven/worktrees.json"), JSON.stringify({ version: 1, worktrees: dead }));
+      const wt = addWorktree(repo, join(repo, ".sirius/worktrees/w17"));
+      const r = hv(repo, "worktree", "add", wt);
+      expect(r.code).toBe(0);
+      expect(r.stderr).toContain(`pruned ${MAX_WORKTREE_OVERLAYS} overlay(s)`);
+      const reg = JSON.parse(readFileSync(join(repo, ".hayven/worktrees.json"), "utf8")) as {
+        worktrees: Array<{ path: string }>;
+      };
+      expect(reg.worktrees.map((e) => e.path)).toEqual([wt]);
+    },
+    SLOW,
+  );
+
+  test(
+    "prune keeps entries when git cannot run (no positive evidence)",
+    () => {
+      const repo = makeRepo();
+      const wt = addWorktree(repo, join(repo, ".sirius/worktrees/w1"));
       expect(hv(repo, "worktree", "add", wt).code).toBe(0);
+      // A PATH with no `git` on it: every git probe fails to spawn.
+      const noGit = tmp("hv-wt-nogit-");
+      const r = hvEnv(repo, { PATH: noGit }, "worktree", "prune", "--json");
+      expect(json<{ removed: unknown[] }>(r).removed).toEqual([]);
+      expect(existsSync(join(repo, ".hayven/worktrees", overlayId(wt), "index.sqlite"))).toBe(true);
+      // A git that RUNS but fails (not "not a git repository") is no evidence either.
+      const failing = tmp("hv-wt-badgit-");
+      writeFileSync(join(failing, "git"), "#!/bin/sh\necho 'fatal: transient failure' >&2\nexit 1\n", { mode: 0o755 });
+      const r2 = hvEnv(repo, { PATH: `${failing}:${process.env["PATH"] ?? ""}` }, "worktree", "prune", "--json");
+      expect(json<{ removed: unknown[] }>(r2).removed).toEqual([]);
+      // Real evidence still prunes.
+      rmSync(wt, { recursive: true, force: true });
+      expect(json<{ removed: unknown[] }>(hv(repo, "worktree", "prune", "--json")).removed.length).toBe(1);
+    },
+    SLOW,
+  );
+
+  test(
+    "add refuses a worktree when the project is itself a linked worktree (unusable registration)",
+    () => {
+      const origin = tmp("hv-wt-origin-");
+      git(origin, ["init", "-q", "-b", "main"]);
+      git(origin, ["config", "user.email", "t@t.t"]);
+      git(origin, ["config", "user.name", "t"]);
+      write(origin, "src/a.ts", "export function existingFn() {\n  return 1;\n}\n");
+      write(origin, ".gitignore", ".sirius/\n");
+      git(origin, ["add", "-A"]);
+      git(origin, ["commit", "-q", "-m", "base"]);
+      // The hayven PROJECT lives in a linked worktree, not the main checkout.
+      const project = addWorktree(origin, join(tmp("hv-wt-proj-"), "p"));
+      expect(hv(project, "init", "--yes").code).toBe(0);
+      const sibling = addWorktree(origin, join(tmp("hv-wt-sib-"), "s"));
+      const r = hv(project, "worktree", "add", sibling);
+      expect(r.code).toBe(1);
+      expect(r.stderr).toContain("main checkout");
+      expect(existsSync(join(project, ".hayven/worktrees.json"))).toBe(false);
+    },
+    SLOW,
+  );
+
+  test(
+    "main's uncommitted edits never reach an overlay, even after `git stash`; main's index is untouched",
+    () => {
+      const repo = makeRepo();
+      // Main edits a file and indexes the edit.
+      write(repo, "src/a.ts", "export function existingFn() {\n  return 1;\n}\nexport function mainScratchFn() {\n  return 7;\n}\n");
+      expect(hv(repo, "ingest").code).toBe(0);
+      expect(queryIds(repo, "mainScratchFn")).toContain("src/a/mainScratchFn");
+
+      // Dirty main: a fresh overlay must not carry the edit.
+      const w1 = addWorktree(repo, join(repo, ".sirius/worktrees/w1"));
+      const before = mainIndexFingerprint(repo);
+      expect(hv(repo, "worktree", "add", w1).code).toBe(0);
+      expect(queryIds(w1, "mainScratchFn")).toEqual([]);
+      expect(queryIds(w1, "existingFn")).toContain("src/a/existingFn");
+      // Overlay work leaves main's index and branch caches byte-identical.
+      expect(mainIndexFingerprint(repo)).toEqual(before);
+
+      // The stash repro: main is now CLEAN, but its index still holds the edit.
+      git(repo, ["stash", "-q"]);
+      expect(queryIds(repo, "mainScratchFn")).toContain("src/a/mainScratchFn");
+      const w2 = addWorktree(repo, join(repo, ".sirius/worktrees/w2"));
+      expect(hv(repo, "worktree", "add", w2).code).toBe(0);
+      expect(queryIds(w2, "mainScratchFn")).toEqual([]);
+      expect(queryIds(w2, "existingFn")).toContain("src/a/existingFn");
+    },
+    SLOW,
+  );
+
+  test(
+    "a seed killed before its first reconcile never reads as fresh and never serves main's edits",
+    async () => {
+      const repo = makeRepo();
+      write(repo, "src/a.ts", "export function existingFn() {\n  return 1;\n}\nexport function mainScratchFn() {\n  return 7;\n}\n");
+      expect(hv(repo, "ingest").code).toBe(0);
+      const wt = addWorktree(repo, join(repo, ".sirius/worktrees/w1"));
+
+      // A `git` that parks on the post-seed `diff --name-status`, so we can kill
+      // the CLI in the window between the seed's rename and its re-parse.
+      const realGit = Bun.which("git");
+      if (realGit === null) throw new Error("git not found");
+      const shim = tmp("hv-wt-shim-");
+      const sentinel = join(shim, "parked");
+      writeFileSync(
+        join(shim, "git"),
+        `#!/bin/sh\ncase "$*" in *"diff --name-status"*) echo $$ > "${sentinel}"; exec sleep 60;; esac\nexec "${realGit}" "$@"\n`,
+        { mode: 0o755 },
+      );
+      const child = Bun.spawn([process.execPath, CLI, "worktree", "add", wt], {
+        cwd: repo,
+        env: {
+          ...process.env,
+          HAYVEN_HOME: home,
+          HAYVEN_PORT: DEAD_PORT,
+          HAYVEN_NATIVE_BIN: bin ?? "",
+          PATH: `${shim}:${process.env["PATH"] ?? ""}`,
+        },
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      const deadline = Date.now() + 30_000;
+      while (!existsSync(sentinel) && Date.now() < deadline) await Bun.sleep(50);
+      expect(existsSync(sentinel)).toBe(true);
+      const overlay = join(repo, ".hayven/worktrees", overlayId(wt), "index.sqlite");
+      expect(existsSync(overlay)).toBe(true); // the seed is in place
+      child.kill(9);
+      await child.exited;
+      try {
+        process.kill(Number(readFileSync(sentinel, "utf8").trim()), 9);
+      } catch {
+        // already gone
+      }
+
+      const list = json<{ worktrees: Array<{ freshness: string }> }>(hv(repo, "worktree", "list", "--json"));
+      expect(list.worktrees[0]?.freshness).not.toBe("fresh");
+      expect(queryIds(wt, "mainScratchFn")).toEqual([]);
+      expect(queryIds(wt, "existingFn")).toContain("src/a/existingFn");
+      const after = json<{ worktrees: Array<{ freshness: string }> }>(hv(repo, "worktree", "list", "--json"));
+      expect(after.worktrees[0]?.freshness).toBe("fresh");
+    },
+    SLOW,
+  );
+
+  test(
+    "delete + rename in the worktree; an ownerless refresh lock does not stall reads; no-op refresh skips re-resolution",
+    () => {
+      const repo = makeRepo();
+      const wt = addWorktree(repo, join(repo, ".sirius/worktrees/w1"));
+      expect(hv(repo, "worktree", "add", wt).code).toBe(0);
+
+      // A clean, unchanged worktree: nothing to re-parse, so no resolver pass.
+      const noop = json<{ reresolved: boolean; reparsed: number; deleted: number }>(hv(wt, "ingest", "--json"));
+      expect(noop.reparsed).toBe(0);
+      expect(noop.deleted).toBe(0);
+      expect(noop.reresolved).toBe(false);
+
+      git(wt, ["mv", "src/a.ts", "src/a2.ts"]);
+      git(wt, ["rm", "-q", "src/a.test.ts"]);
+      const ids = queryIds(wt, "existingFn");
+      expect(ids).toContain("src/a2/existingFn");
+      expect(ids).not.toContain("src/a/existingFn");
+      expect(queryIds(wt, "a.test")).not.toContain("src/a.test");
+      const changed = json<{ reresolved: boolean }>(hv(wt, "ingest", "--json"));
+      expect(changed.reresolved).toBe(true);
+
+      // A refresh lock left EMPTY by a process killed between open and write.
+      writeFileSync(join(repo, ".hayven/worktrees", overlayId(wt), "refresh.lock"), "");
+      write(wt, "src/late.ts", "export function lateFn() {\n  return 1;\n}\n");
+      const t0 = Date.now();
+      expect(queryIds(wt, "lateFn")).toContain("src/late/lateFn");
+      expect(Date.now() - t0).toBeLessThan(30_000);
     },
     SLOW,
   );

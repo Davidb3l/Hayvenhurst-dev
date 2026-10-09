@@ -83,13 +83,50 @@ export function git(cwd: string, args: string[]): string | null {
   }
 }
 
+/**
+ * A git invocation's outcome, kept THREE-way on purpose. "git said no" (it
+ * ran and exited non-zero, e.g. `not a git repository`) is evidence about the
+ * repository; "git could not run" (missing binary, timeout, a signal) is
+ * evidence about nothing. Collapsing both into `null` let `prune` delete an
+ * overlay because `git` was briefly unavailable at daemon start.
+ */
+export type GitProbe =
+  | { kind: "ok"; out: string }
+  | { kind: "exit"; status: number; stderr: string }
+  | { kind: "error"; message: string };
+
+/** Run `git -C <cwd> <args>` and classify the outcome. Never throws. */
+export function gitProbe(cwd: string, args: string[]): GitProbe {
+  try {
+    const res = spawnSync("git", ["-C", cwd, ...args], {
+      encoding: "utf8",
+      timeout: GIT_TIMEOUT_MS,
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    if (res.error !== undefined) return { kind: "error", message: res.error.message };
+    if (res.status === null) return { kind: "error", message: `git killed by ${res.signal ?? "a signal"}` };
+    if (res.status !== 0) return { kind: "exit", status: res.status, stderr: String(res.stderr ?? "") };
+    return { kind: "ok", out: String(res.stdout ?? "") };
+  } catch (err) {
+    return { kind: "error", message: (err as Error).message };
+  }
+}
+
 /** A `rev-parse` path answer, made absolute (git reports some relative to `-C`). */
+export function revParsePathProbe(
+  cwd: string,
+  flag: string,
+): { kind: "ok"; path: string } | Exclude<GitProbe, { kind: "ok" }> {
+  const r = gitProbe(cwd, ["rev-parse", flag]);
+  if (r.kind !== "ok") return r;
+  const p = r.out.trim();
+  if (p.length === 0) return { kind: "exit", status: 0, stderr: `empty answer to rev-parse ${flag}` };
+  return { kind: "ok", path: canonicalRoot(isAbsolute(p) ? p : resolve(cwd, p)) };
+}
+
 function revParsePath(cwd: string, flag: string): string | null {
-  const out = git(cwd, ["rev-parse", flag]);
-  if (out === null) return null;
-  const p = out.trim();
-  if (p.length === 0) return null;
-  return canonicalRoot(isAbsolute(p) ? p : resolve(cwd, p));
+  const r = revParsePathProbe(cwd, flag);
+  return r.kind === "ok" ? r.path : null;
 }
 
 /** `git rev-parse --git-common-dir`, absolute + canonical. */

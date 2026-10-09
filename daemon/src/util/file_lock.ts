@@ -46,6 +46,16 @@ export class FileLockTimeoutError extends Error {
   }
 }
 
+/**
+ * Staleness window for a lockfile with NO readable owner token: empty (the
+ * holder died between `open` and `write`) or garbage. Nobody can ever touch or
+ * release such a file, so waiting out a long `staleMs` (two minutes for an
+ * overlay refresh) would only stall every reader behind a corpse. A genuine
+ * holder writes its token in the same breath as creating the file, so a few
+ * seconds of an unchanged, ownerless file is already conclusive.
+ */
+const UNREADABLE_STALE_MS = 5_000;
+
 /** How often an async holder refreshes the lockfile's mtime. Well under any sane `staleMs`. */
 const TOUCH_INTERVAL_MS = 1_000;
 
@@ -135,7 +145,7 @@ function step(
   } else if (watch.mtime !== mtime) {
     watch.mtime = mtime; // first sighting, or the holder touched it
     watch.since = Date.now();
-  } else if (Date.now() - watch.since >= opts.staleMs) {
+  } else if (Date.now() - watch.since >= (pid === null ? Math.min(opts.staleMs, UNREADABLE_STALE_MS) : opts.staleMs)) {
     reclaim(path, holder);
     watch.mtime = null;
   }

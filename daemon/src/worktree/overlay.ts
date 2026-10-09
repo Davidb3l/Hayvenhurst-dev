@@ -36,6 +36,8 @@ import { join } from "node:path";
 import type { HayvenConfig } from "../config/defaults.ts";
 import { copySqlite, gitDiffSince, gitUntracked, hasSeedableContent, resolveReadIndex } from "../db/branch_index.ts";
 import { isSourcePath } from "../db/freshness.ts";
+import { INGEST_IN_PROGRESS_KEY } from "../db/index_health.ts";
+import { readIngestDirty } from "../db/ingest_dirty.ts";
 import { SchemaTooNewError } from "../db/migrations.ts";
 import { Db } from "../db/queries.ts";
 import { reresolveAllEdges, runIngest as drainIngest } from "../graph/ingest.ts";
@@ -54,6 +56,14 @@ export const OVERLAY_INCREMENTAL_CAP = 2000;
 /** `stats` keys owned by the overlay layer. */
 const STAMP_KEY = "overlay_fingerprint";
 const DIRTY_KEY = "overlay_dirty";
+/**
+ * "1" on an overlay that is a fresh SEED awaiting its first reconcile: a
+ * faithful copy of main whose `overlay_dirty` already names what must be
+ * re-parsed. It is a usable BASE (amend it, do not rebuild it) but never
+ * fresh. Cleared, atomically with taking the ingest marker, before the first
+ * destructive write.
+ */
+const SEED_PENDING_KEY = "overlay_seed_pending";
 
 const SQLITE_FILES = ["", "-wal", "-shm", "-journal"] as const;
 
@@ -75,6 +85,8 @@ export interface OverlayRefreshResult {
   readonly reparsed: number;
   /** Source files purged because they no longer exist. */
   readonly deleted: number;
+  /** Whether the whole-graph edge re-resolution pass ran (skipped when nothing changed). */
+  readonly reresolved: boolean;
   /** Graph node count after the refresh. */
   readonly nodes: number;
   /** The worktree HEAD the overlay now reflects. */
@@ -87,6 +99,8 @@ interface OverlayState {
   readonly dirty: string[];
   readonly head: string | null;
   readonly integrityOk: boolean;
+  /** See {@link SEED_PENDING_KEY}. */
+  readonly seedPending: boolean;
   readonly nodes: number;
 }
 
@@ -114,11 +128,12 @@ function readOverlayState(sqlite: string): OverlayState | null {
       dirty,
       head: db.getStat("last_ingest_git_head"),
       integrityOk: integrity.ok,
+      seedPending: db.getStat(SEED_PENDING_KEY) === "1",
       nodes: db.counts().nodes,
     };
   } catch (err) {
     if (err instanceof SchemaTooNewError) throw err;
-    return { stamp: null, dirty: [], head: null, integrityOk: false, nodes: 0 };
+    return { stamp: null, dirty: [], head: null, integrityOk: false, seedPending: false, nodes: 0 };
   } finally {
     try {
       db?.close();
@@ -134,35 +149,89 @@ function removeSqliteFiles(sqlite: string): void {
 
 /**
  * Replace the overlay with a snapshot of the main project's CURRENT read index.
- * Returns the seed path plus the main checkout's dirty paths, or `null` when
- * main has nothing seedable (the caller then does a full ingest).
+ * Returns the seed path, or `null` when main has nothing seedable (or we cannot
+ * tell what it holds), and the caller does a full ingest instead.
  *
- * Why main's dirty paths ride along: the main index may have been built from
- * main's UNCOMMITTED edits, and `git diff <main head>` inside the worktree knows
- * nothing about them. Treating them as "dirty at the last refresh" re-parses
- * those files from the worktree's own copy, so main's scratch edits never leak
- * into a worktree's answers.
+ * WHAT THE SEED MUST RE-PARSE. The main index may hold UNCOMMITTED content,
+ * and `git diff <seed head>` inside the worktree knows nothing about it. The
+ * set to re-parse from the worktree's own copy is the union of
+ *   - `last_ingest_dirty`, what main was dirty with WHEN IT WAS INDEXED (a
+ *     `git stash` after the ingest makes main clean while its index still holds
+ *     the stashed code), and
+ *   - main's CURRENT dirty set (an index older than the record, or edits the
+ *     daemon watcher folded in since).
+ *
+ * CRASH SAFETY. That union is written INTO the seed, together with an
+ * in-progress marker and {@link SEED_PENDING_KEY}, BEFORE the seed is renamed
+ * into place. A process killed at any point after the rename therefore leaves
+ * an overlay that (a) can never read as fresh, and (b) still knows which files
+ * to re-parse. Keeping the list in memory instead let a kill between the
+ * rename and the re-parse produce an overlay that later stamped itself fresh
+ * while serving main's uncommitted edits.
  */
-function seedFromMain(target: OverlayTarget, sqlite: string): { from: string; mainDirty: string[] } | null {
+function seedFromMain(target: OverlayTarget, sqlite: string): { from: string } | null {
   const src = resolveReadIndex(target.paths, target.config).path;
   if (!existsSync(src) || !hasSeedableContent(src)) return null;
   // Snapshot to a temp file beside the overlay, then RENAME it into place. A
   // reader that opened the old overlay keeps its (unlinked) inode, and one that
   // opens now sees either the old file or the complete new one, never a
-  // half-copied database. The old file's `-wal`/`-shm` must go first: SQLite
-  // would replay a stale WAL from the previous generation onto the new file.
-  // A fixed name is safe: seeding only ever runs under the overlay's refresh
-  // lock, and a leftover from a crashed seed is simply overwritten here.
+  // half-copied database. A fixed name is safe: seeding only ever runs under
+  // the overlay's refresh lock, and a leftover from a crashed seed is simply
+  // overwritten here.
   const tmp = `${sqlite}.seed.tmp`;
   removeSqliteFiles(tmp);
   copySqlite(src, tmp);
+
+  const current = gitStatus(target.paths.repoRoot)?.paths ?? null;
+  const db = new Db(tmp);
+  try {
+    const recorded = readIngestDirty(db);
+    if (recorded === null && current === null) {
+      // We cannot say what uncommitted content the main index holds. A full
+      // parse of the worktree is slower but cannot serve someone else's edits.
+      db.close();
+      removeSqliteFiles(tmp);
+      return null;
+    }
+    if (recorded === null) {
+      process.stderr.write(
+        "note: the main index does not record which files were dirty when it was built (it predates this " +
+          "hayven); seeding against main's current changes only. Run `hayven ingest` in the main checkout to fix.\n",
+      );
+    }
+    const dirty = [...new Set([...(recorded ?? []), ...(current ?? [])])].sort();
+    db.transaction(() => {
+      db.setStat(DIRTY_KEY, JSON.stringify(dirty));
+      db.setStat(STAMP_KEY, "");
+      db.setStat(SEED_PENDING_KEY, "1");
+      // A legacy-format marker on purpose: it is ADOPTABLE, so the refresh that
+      // reconciles this seed takes it over with `beginIngest` and retracts it
+      // with its own success, instead of leaving an orphan token behind.
+      db.setStat(INGEST_IN_PROGRESS_KEY, String(Date.now()));
+    });
+    // Back to a self-contained, non-WAL file before the rename (see copySqlite).
+    db.handle.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    db.handle.exec("PRAGMA journal_mode = DELETE");
+    db.close();
+  } catch (err) {
+    try {
+      db.close();
+    } catch {
+      // already closed
+    }
+    removeSqliteFiles(tmp);
+    throw err;
+  }
+  for (const s of SQLITE_FILES) if (s !== "") rmSync(tmp + s, { force: true });
+  // The old generation's `-wal`/`-shm` must go before the rename: SQLite would
+  // replay a stale WAL onto the new file.
   for (const s of SQLITE_FILES) if (s !== "") rmSync(sqlite + s, { force: true });
   renameSync(tmp, sqlite);
   // Node markdown from the previous generation describes a graph we just threw
   // away; without this the directory only ever grows.
   rmSync(overlayNodesDir(target.paths, target.entry.id), { recursive: true, force: true });
   mkdirSync(overlayNodesDir(target.paths, target.entry.id), { recursive: true });
-  return { from: src, mainDirty: gitStatus(target.paths.repoRoot)?.paths ?? [] };
+  return { from: src };
 }
 
 interface ChangeSet {
@@ -219,6 +288,7 @@ function writeStamp(db: Db, fp: WorktreeFingerprint): void {
     // reconciled with, or the files between the two would never be re-parsed.
     if (fp.head !== null) db.setStat("last_ingest_git_head", fp.head);
     db.setStat(DIRTY_KEY, JSON.stringify(fp.dirty));
+    db.setStat(SEED_PENDING_KEY, "");
     db.setStat(STAMP_KEY, fp.hash);
   });
 }
@@ -263,7 +333,16 @@ export async function refreshOverlay(target: OverlayTarget, opts: RefreshOptions
     }
     let state = readOverlayState(sqlite);
     if (!opts.full && !opts.force && state !== null && state.integrityOk && state.stamp === fp.hash) {
-      return { action: "fresh", seeded: false, seededFrom: null, reparsed: 0, deleted: 0, nodes: state.nodes, head: fp.head };
+      return {
+        action: "fresh",
+        seeded: false,
+        seededFrom: null,
+        reparsed: 0,
+        deleted: 0,
+        reresolved: false,
+        nodes: state.nodes,
+        head: fp.head,
+      };
     }
 
     let seeded = false;
@@ -274,12 +353,14 @@ export async function refreshOverlay(target: OverlayTarget, opts: RefreshOptions
       if (s === null) return false;
       seeded = true;
       seededFrom = s.from;
-      prevDirty = s.mainDirty;
       state = readOverlayState(sqlite);
+      prevDirty = state?.dirty ?? [];
       return true;
     };
+    // A pending seed is a usable BASE despite its marker: it is an intact copy
+    // of main plus the list of what to re-parse (see `seedFromMain`).
     const usable = (s: OverlayState | null): s is OverlayState & { head: string } =>
-      s !== null && s.integrityOk && s.head !== null && s.nodes > 0;
+      s !== null && (s.integrityOk || s.seedPending) && s.head !== null && s.nodes > 0;
 
     let plan: ChangeSet | null = null;
     if (!opts.full) {
@@ -316,13 +397,20 @@ export async function refreshOverlay(target: OverlayTarget, opts: RefreshOptions
     };
 
     const db = openWritable(sqlite);
+    let reresolved = false;
     try {
       if (plan !== null) {
         // Raise the in-progress marker and RETRACT the stamp before the first
         // destructive write, so nothing between here and `writeStamp` can be
         // mistaken for a fresh overlay by a concurrent or later reader.
-        db.beginIngest();
-        db.setStat(STAMP_KEY, "");
+        // One transaction: take the marker (adopting a pending seed's) AND drop
+        // the seed-pending flag, so no crash can leave "seed pending" on a graph
+        // the purge below has already started to change.
+        db.transaction(() => {
+          db.beginIngest();
+          db.setStat(STAMP_KEY, "");
+          db.setStat(SEED_PENDING_KEY, "");
+        });
         const orphanIds: string[] = [];
         for (const f of [...plan.deleted, ...plan.changed]) {
           orphanIds.push(...db.nodeIdsForFile(f));
@@ -364,7 +452,10 @@ export async function refreshOverlay(target: OverlayTarget, opts: RefreshOptions
             db.endIngest();
           });
         }
-        if (plan !== null) {
+        // Nothing re-parsed and nothing purged: the graph is byte-for-byte what
+        // it was, so the whole-graph resolver pass would only burn time.
+        if (plan !== null && (plan.changed.length > 0 || plan.deleted.length > 0)) {
+          reresolved = true;
           try {
             // Callers in UNCHANGED files may point at entities that moved; the
             // resolver pass is what keeps cross-file edges right after a partial
@@ -376,7 +467,10 @@ export async function refreshOverlay(target: OverlayTarget, opts: RefreshOptions
         }
       }
       if (plan === null) {
-        db.setStat(STAMP_KEY, "");
+        db.transaction(() => {
+          db.setStat(STAMP_KEY, "");
+          db.setStat(SEED_PENDING_KEY, "");
+        });
         const run = startParse(parseBase);
         await drainIngest({
           db,
@@ -407,6 +501,7 @@ export async function refreshOverlay(target: OverlayTarget, opts: RefreshOptions
         seededFrom,
         reparsed: plan?.changed.length ?? -1,
         deleted: plan?.deleted.length ?? 0,
+        reresolved,
         nodes,
         head: fp.head,
       };
@@ -438,13 +533,15 @@ export function overlayStatus(target: OverlayTarget): OverlayStatus {
   try {
     state = readOverlayState(sqlitePath);
   } catch {
-    state = { stamp: null, dirty: [], head: null, integrityOk: false, nodes: 0 };
+    state = { stamp: null, dirty: [], head: null, integrityOk: false, seedPending: false, nodes: 0 };
   }
   const base = { nodes: state?.nodes ?? 0, head: state?.head ?? null, sqlitePath };
   if (!existsSync(target.entry.path)) return { ...base, freshness: "worktree-gone" };
   const fp = worktreeFingerprint(target.entry.path);
   if (fp === null) return { ...base, freshness: "worktree-gone" };
   if (state === null) return { ...base, freshness: "missing" };
+  // A pending seed is not broken: the next read reconciles it.
+  if (state.seedPending) return { ...base, freshness: "stale" };
   if (!state.integrityOk) return { ...base, freshness: "broken" };
   return { ...base, freshness: state.stamp === fp.hash ? "fresh" : "stale" };
 }

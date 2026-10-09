@@ -95,9 +95,8 @@ async function add(args: ParsedArgs, ctx: ProjectContext): Promise<number> {
     return 1;
   }
   const seedHead = mainIndexHead(ctx);
-  let outcome: { entry: WorktreeEntry; added: boolean };
-  try {
-    outcome = mutateWorktreeRegistry<{ entry: WorktreeEntry; added: boolean }>(ctx.paths, (entries) => {
+  const register = (): { entry: WorktreeEntry; added: boolean } =>
+    mutateWorktreeRegistry<{ entry: WorktreeEntry; added: boolean }>(ctx.paths, (entries) => {
       const existing = entries.find((e) => e.path === v.path);
       if (existing !== undefined) return { entries, result: { entry: existing, added: false } };
       if (entries.length >= MAX_WORKTREE_OVERLAYS) {
@@ -115,6 +114,24 @@ async function add(args: ParsedArgs, ctx: ProjectContext): Promise<number> {
       };
       return { entries: [...entries, entry], result: { entry, added: true } };
     });
+  let outcome: { entry: WorktreeEntry; added: boolean };
+  try {
+    try {
+      outcome = register();
+    } catch (err) {
+      if (!(err instanceof OverlayCapError)) throw err;
+      // At the cap, reclaim DEAD registrations first (positive evidence only,
+      // the same rule as `prune`) and try once more. Sirius deletes worktrees
+      // without telling us, so the cap is usually full of ghosts, and refusing
+      // a live worker over them would make the operator do by hand what this
+      // command can prove is safe.
+      const pruned = pruneWorktreeOverlays(ctx.paths);
+      if (pruned.removed.length === 0) throw err;
+      process.stderr.write(
+        `note: pruned ${pruned.removed.length} overlay(s) whose worktree is gone to make room.\n`,
+      );
+      outcome = register();
+    }
   } catch (err) {
     process.stderr.write(`error: ${(err as Error).message}\n`);
     return 1;

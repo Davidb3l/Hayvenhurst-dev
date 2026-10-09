@@ -13,6 +13,7 @@ import { existsSync, mkdirSync } from "node:fs";
 
 import { gitDiffSince, gitUntracked, resolveWriteIndex } from "../db/branch_index.ts";
 import { isSourcePath } from "../db/freshness.ts";
+import { nextIngestDirty, writeIngestDirty } from "../db/ingest_dirty.ts";
 import { Db } from "../db/queries.ts";
 import {
   readGitHead,
@@ -230,6 +231,7 @@ export async function runIngest(args: ParsedArgs): Promise<number> {
   if (incrementalFiles !== null && incrementalFiles.length === 0) {
     const now = Date.now();
     const head = readGitHead(paths.repoRoot);
+    const dirtyRecord = nextIngestDirty(db, paths.repoRoot, false);
     // Nothing was re-parsed, so nothing is half-written — but we DID stamp the
     // in-progress marker before the per-file purge above, and returning without
     // clearing it would leave the index flagged BROKEN forever. Record success
@@ -237,6 +239,7 @@ export async function runIngest(args: ParsedArgs): Promise<number> {
     db.transaction(() => {
       db.setStat("last_ingest_at", String(now));
       if (head) db.setStat("last_ingest_git_head", head);
+      writeIngestDirty(db, dirtyRecord);
       // NOT authoritative: this run re-parsed nothing, so its live `counts()` is
       // not its own output and must never LOWER the watermark — a concurrent
       // process holding the graph cleared would otherwise have us commit 0 and

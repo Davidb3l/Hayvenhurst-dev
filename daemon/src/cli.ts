@@ -171,7 +171,10 @@ ${section("coordination")}
 Flags:
   -h, --help                 Show this help and exit
   -v, --version              Show version and exit
-  --root <path>              Resolve the project as if run from <path> (e.g. a registered worktree)
+  --root <path>              Resolve the project from <path> instead of the cwd (e.g. a registered
+                             worktree). Honored by commands that locate their project through the
+                             shared resolver (graph reads, ingest, worktree, claim, ...); NOT by
+                             init (use --cwd), config, doctor or projects
 
 See https://hayvenhurst.dev for more.`;
 }
