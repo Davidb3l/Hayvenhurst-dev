@@ -199,10 +199,26 @@ jobs:
           echo "checksum=${tarball}.sha256" >> "$GITHUB_OUTPUT"
 
       # ---- Sign with Sigstore (keyless OIDC) ----
+      # v3.0.0's bundled TUF trust root predates a Sigstore root rotation and
+      # dies with "root was signed by 0/3 keys" (Sirius Forester's v0.1.1 build
+      # failed on all 5 platforms exactly there, 2026-08-24). Track the v3
+      # line's latest: the bundle format (`<tarball>.sigstore.json`) is
+      # unchanged, so bundles published by earlier releases verify the same way.
       - name: Sign tarball with Sigstore
-        uses: sigstore/gh-action-sigstore-python@v3.0.0
+        uses: sigstore/gh-action-sigstore-python@v3.5.0
         with:
           inputs: ${{ steps.bundle.outputs.tarball }}
+
+      # upload-artifact's if-no-files-found only fires when NONE of the listed
+      # paths exist, so a tarball whose bundle is missing would still upload and
+      # the release would ship unsigned with nobody told. Check each file.
+      - name: Require checksum and signature bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in "${{ steps.bundle.outputs.checksum }}" "${{ steps.bundle.outputs.tarball }}.sigstore.json"; do
+            [ -s "$f" ] || { echo "::error::missing release asset: $f (refusing to publish an unsigned/unchecksummed tarball)"; exit 1; }
+          done
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@v7
@@ -215,7 +231,7 @@ jobs:
             ${{ steps.bundle.outputs.tarball }}
             ${{ steps.bundle.outputs.tarball }}.sigstore.json
             ${{ steps.bundle.outputs.checksum }}
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 30
 
   release:
