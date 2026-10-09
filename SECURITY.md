@@ -100,11 +100,11 @@ Tys=
 
 ## Verifying releases
 
-Every release since v0.0.6 is signed with [Sigstore](https://www.sigstore.dev/) by this repository's release workflow (keyless, GitHub OIDC). Each platform tarball on the [releases page](https://github.com/Davidb3l/Hayvenhurst-dev/releases) ships with a `.sha256` checksum and a `.sigstore.json` bundle. The installers (`plugin/scripts/install-hayven.sh` and `install-hayven.ps1`) check both and refuse a bad or missing signature. To verify by hand:
+Every release since v0.0.6 is signed with [Sigstore](https://www.sigstore.dev/) by this repository's release workflow (keyless, GitHub OIDC). Each platform tarball on the [releases page](https://github.com/Davidb3l/Hayvenhurst-dev/releases) ships with a `.sha256` checksum and a `.sigstore.json` bundle. The installers (`plugin/scripts/install-hayven.sh` and `install-hayven.ps1`) check both and refuse a bad signature or a missing bundle. If neither `cosign` (3 or later) nor `sigstore` is installed they warn and continue on the checksum alone; pass `--require-signature` (`-RequireSignature` on Windows) to make that fatal. To verify by hand (requires cosign 3 or later):
 
 ```sh
 TAG=v0.0.7; T=hayvenhurst-${TAG#v}-macos-arm64.tar.gz
-shasum -a 256 -c "$T.sha256"
+shasum -a 256 -c "$T.sha256"     # or: sha256sum -c "$T.sha256"
 cosign verify-blob --bundle "$T.sigstore.json" \
   --certificate-identity "https://github.com/Davidb3l/Hayvenhurst-dev/.github/workflows/release.yml@refs/tags/$TAG" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
@@ -119,9 +119,9 @@ Summary of what Hayvenhurst is designed to mitigate, and how far each defense go
 
 - **Malicious agent claims**: guarded by the three-layer conflict defense (semantic claims, pre-merge verify, adversarial preview).
 - **Prompt injection via codebase content**: the daemon treats LLM-generated summaries as data, not commands, and the context packer only reads files inside the repository, refusing credential-shaped paths.
-- **Remote access to the daemon**: it binds to loopback by default, refuses a non-loopback bind without `--allow-remote-access`, checks the `Host` header (DNS-rebinding defense), and origin-gates cross-origin mutations and WebSocket upgrades. The daemon has no user authentication, so the loopback bind is the boundary.
-- **Sync data tampering**: operations are content-addressed (Blake3), so a corrupted or altered operation does not match its id. Peers exchange a writer identity, but that identity is self-asserted, **not authenticated**: anyone who can reach a daemon's sync routes can claim any writer id. Peer authentication (RFC-002, shared-secret pairing) is designed but not built; until then, do not expose sync beyond machines you trust.
-- **Release tampering**: release tarballs are signed via Sigstore and the installers verify the signature (see above). A binary you place on disk yourself is not re-verified at runtime.
+- **Remote access to the daemon**: it binds to loopback by default, refuses a non-loopback bind without `--allow-remote-access`, checks the `Host` header on a loopback bind (DNS-rebinding defense), and origin-gates cross-origin mutations and WebSocket upgrades. The daemon has no user authentication, so the loopback bind is the boundary.
+- **Sync data tampering: not defended today.** Sync uses Blake3 Merkle trees to find where two peers diverge, but operations are not integrity-checked on receipt: an operation's id is its (clock, writer) pair, not a hash of its content, and a peer can push any content under any writer id. Writer identity is self-asserted, **not authenticated**. Peer authentication (RFC-002, shared-secret pairing) is proposed but not approved or built. Until then, do not sync with machines you do not trust.
+- **Release tampering**: release tarballs are signed via Sigstore, and the installers verify the signature when a verifier is installed (mandatory with `--require-signature`; see above). A binary you place on disk yourself is not re-verified at runtime.
 - **Skill injection**: Hayvenhurst ships a single first-party Skill. No third-party marketplace in v1.
 
 Out of scope:

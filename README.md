@@ -129,7 +129,7 @@ The index is embedding-free — building it is a parse plus a SQLite write — s
 
 ### Part of the Sothis suite
 
-Hayvenhurst is the code graph of **[Sothis](https://getsothis.com)** ([repo](https://github.com/Davidb3l/Sothis)), five local-first tools for running many coding agents against one repository. Each stands alone; together they compose through plain CLIs:
+Hayvenhurst is the code graph of **[Sothis](https://getsothis.com)** ([repo](https://github.com/Davidb3l/Sothis)), five local-first tools for running many coding agents against one repository. Each stands alone; together they compose through plain CLIs and hooks:
 
 - **[Sirius Forester](https://github.com/Davidb3l/Sirius-Forester)**: the foreman. Claims work, locks the code it touches, gates on affected tests.
 - **Hayvenhurst** (this repo): the live code graph behind those locks and test selections.
