@@ -1003,14 +1003,16 @@ export function registerProject(root: string, alias?: string): ProjectEntry {
  *   - "missing right now": a PRESENT row with the same id is a COPY of the
  *     repo (`cp -r` copies `.hayven/config.json` too). Both are real; giving
  *     the original's alias to the copy would be wrong.
- *   - "...and its PARENT exists, and it is not a volume's root": "missing" is
+ *   - "...and its PARENT exists, and it is not on a mount location": "missing" is
  *     not "moved". An unmounted external drive or a sleeping SMB share makes
  *     the original read as missing while it still exists, and without this a
  *     COPY on the laptop would take its alias the moment it registered. A
- *     present parent proves the filesystem holding the old root is mounted. A
- *     repo AT a volume's root (`/Volumes/Repo`) loses itself but not its parent
- *     when unmounted, so those are never auto-relocated either (see
- *     {@link isOnMountLocation}); `hayven projects relocate` handles them.
+ *     present parent usually proves the filesystem is mounted, but not under
+ *     a conventional mount location: a volume root (`/Volumes/Repo`) keeps its
+ *     parent, and a Linux mount point (`/mnt/data`) survives as an empty dir.
+ *     So nothing at or below /Volumes, /mnt, /media or /run/media is ever
+ *     auto-relocated (see {@link isOnMountLocation}); `hayven projects
+ *     relocate` handles those.
  *     The guarantee is therefore "a copy cannot take the alias while the
  *     original is present or its volume visibly unmounted", not "never".
  *   - "exactly one": two missing rows with one identity means the history is
