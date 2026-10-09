@@ -20,6 +20,7 @@ import {
   isRegistrableRoot,
   pruneMissingProjects,
   readRegistryRaw,
+  recordProjectIdentities,
   relocateProject,
   renameProject,
   sameProjectRoot,
@@ -50,13 +51,17 @@ export const PROJECTS_USAGE = `hayven projects <subcommand>
                                 location.
   rename <old> <new>            Change a project's alias. Refuses a name that is
                                 already taken or would need sanitizing.
-  relocate <alias> <new-root> [--force]
+  relocate <alias> <new-root> [--force] [--serve]
                                 Point an alias at the repo's new location (after
                                 moving it). If <new-root> is already registered
                                 under another alias (e.g. lydgr-2), that row is
-                                folded in and removed. Refuses when <new-root> is
-                                a different project (its .hayven/config.json
-                                writer_id differs) unless --force.
+                                folded in and removed. Without --force it refuses
+                                when <new-root> is a different project (its
+                                .hayven/config.json writer_id differs), when the
+                                alias's OLD root still exists, or when the folded
+                                row recorded a different identity. A running
+                                daemon serves it again only if it was serving it
+                                before, or with --serve.
   prune [--missing-for <dur>] [--dry-run]
                                 Remove every project whose root is missing right
                                 now. <dur> (0, 30m, 24h, 7d; default 0) keeps the
@@ -217,13 +222,61 @@ function rowFor(entry: ProjectEntry, live: LiveDaemon): ProjectRow {
   };
 }
 
-/** Probe the daemon, or report why we could not even work out where it is. */
-async function probeLive(): Promise<LiveDaemon> {
+/**
+ * Probe the daemon, or report why we could not even work out where it is.
+ * `mutating` turns on the stricter sandbox rule in `connectLiveDaemon`.
+ */
+async function probeLive(mutating = false): Promise<LiveDaemon> {
   const base = daemonBaseUrl();
   if (base instanceof Error) {
     return { kind: "unmanaged", base: "(unknown)", message: `could not read the daemon address: ${base.message}` };
   }
-  return connectLiveDaemon(base);
+  return connectLiveDaemon(base, { mutating });
+}
+
+/**
+ * After a command that talked to a live daemon, put back any `id` its
+ * registry write dropped.
+ *
+ * WHY: a daemon older than `id` (every installed v0.0.7) rewrites
+ * projects.json from its own reader on each hot-add, and that reader drops
+ * fields it does not know. One `rename` against such a daemon therefore
+ * erased the identity of EVERY project, silently disabling auto-relocation for
+ * all of them. Reading each present root's identity again is cheap and only
+ * writes when something was lost.
+ */
+function restoreIdentities(live: LiveDaemon): void {
+  if (live.kind !== "up") return;
+  try {
+    const roots = readRegistryRaw()
+      .filter((e) => isAbsolute(e.root))
+      .map((e) => e.root);
+    const restored = recordProjectIdentities(roots);
+    if (restored > 0) out(`restored the recorded identity of ${restored} project(s) the daemon's write dropped`);
+  } catch (err) {
+    process.stderr.write(`note: could not re-check project identities: ${(err as Error).message}\n`);
+  }
+}
+
+/**
+ * Serve again the projects we stopped for a removal that the locked pass then
+ * did NOT make (a drive remounted between the plan and the write, or a
+ * concurrent edit). Without this they would stay registered but unserved
+ * until a restart, and nothing would say so.
+ */
+async function reserveKept(
+  live: LiveDaemon,
+  stopped: readonly ServedProject[],
+  removed: readonly ProjectEntry[],
+  why: string,
+): Promise<ServedProject[]> {
+  const kept = stopped.filter((p) => !removed.some((e) => isAbsolute(e.root) && sameProjectRoot(e.root, p.root)));
+  if (live.kind !== "up") return kept;
+  for (const p of kept) {
+    out(`daemon: "${p.alias}" ${why}; kept it and serving it again`);
+    out(describeServe(await serveLive(live.base, p.root, p.alias), p.alias));
+  }
+  return kept;
 }
 
 async function listProjects(args: ParsedArgs): Promise<number> {
@@ -368,7 +421,7 @@ async function removeCmd(args: ParsedArgs): Promise<number> {
     // Let the registry phrase the miss: it says which reading was used.
     return fail(unregisterProjectDetailed(arg).message);
   }
-  const live = await probeLive();
+  const live = await probeLive(true);
   const stop = await stopServed(live, matched);
   if (stop instanceof Error) return fail(stop.message);
 
@@ -376,16 +429,19 @@ async function removeCmd(args: ParsedArgs): Promise<number> {
   if (!outcome.removed) {
     // Raced with another writer between our read and the locked one.
     await restoreServed(live, stop.stopped);
+    restoreIdentities(live);
     return fail(outcome.message);
   }
   for (const e of outcome.removedEntries) out(`removed "${e.alias}" (${e.root})`);
   if (outcome.backup !== null) out(`backup: ${outcome.backup}`);
-  for (const p of stop.stopped) out(`daemon: stopped serving "${p.alias}"`);
+  const kept = await reserveKept(live, stop.stopped, outcome.removedEntries, "was not removed after all");
+  for (const p of stop.stopped) if (!kept.includes(p)) out(`daemon: stopped serving "${p.alias}"`);
   reportPrimary(
     stop.primary,
     "forgetting it (a daemon started from that repo registers it again)",
   );
   if (stop.stopped.length === 0 && stop.primary.length === 0) reportUntouched(live);
+  restoreIdentities(live);
   return 0;
 }
 
@@ -402,7 +458,7 @@ async function renameCmd(args: ParsedArgs): Promise<number> {
     out(`"${oldAlias}" already has that alias; nothing to do`);
     return 0;
   }
-  const live = await probeLive();
+  const live = await probeLive(true);
   const stop = await stopServed(live, [plan.previous]);
   if (stop instanceof Error) return fail(stop.message);
 
@@ -411,6 +467,7 @@ async function renameCmd(args: ParsedArgs): Promise<number> {
     change = renameProject(oldAlias, newAlias);
   } catch (err) {
     await restoreServed(live, stop.stopped);
+    restoreIdentities(live);
     return fail((err as Error).message);
   }
   out(`renamed "${change.previous.alias}" -> "${change.entry.alias}" (${change.entry.root})`);
@@ -423,6 +480,7 @@ async function renameCmd(args: ParsedArgs): Promise<number> {
   }
   reportPrimary(stop.primary, `the new alias "${change.entry.alias}"`);
   if (stop.stopped.length === 0 && stop.primary.length === 0) reportUntouched(live);
+  restoreIdentities(live);
   return 0;
 }
 
@@ -431,6 +489,8 @@ async function relocateCmd(args: ParsedArgs): Promise<number> {
   if (!alias || !newRoot) return fail("relocate requires <alias> <new-root>", 2);
   const force = boolFlag(args, "force");
   if (force instanceof Error) return fail(force.message, 2);
+  const serve = boolFlag(args, "serve");
+  if (serve instanceof Error) return fail(serve.message, 2);
   let plan;
   try {
     plan = relocateProject(alias, newRoot, { force, dryRun: true });
@@ -441,7 +501,7 @@ async function relocateCmd(args: ParsedArgs): Promise<number> {
     out(`"${alias}" is already registered at ${plan.entry.root}; nothing to do`);
     return 0;
   }
-  const live = await probeLive();
+  const live = await probeLive(true);
   // Everything that might be serving either location: the row itself (at its
   // old root), the row being folded in, and the new root under any alias.
   const involved: ProjectEntry[] = [plan.previous, { alias, root: plan.entry.root }];
@@ -454,6 +514,7 @@ async function relocateCmd(args: ParsedArgs): Promise<number> {
     change = relocateProject(alias, newRoot, { force });
   } catch (err) {
     await restoreServed(live, stop.stopped);
+    restoreIdentities(live);
     return fail((err as Error).message);
   }
   out(`relocated "${alias}": ${change.previous.root} -> ${change.entry.root}`);
@@ -463,12 +524,22 @@ async function relocateCmd(args: ParsedArgs): Promise<number> {
   if (change.backup !== null) out(`backup: ${change.backup}`);
   for (const p of stop.stopped) out(`daemon: stopped serving "${p.alias}" (${p.root})`);
   if (live.kind === "up" && stop.primary.length === 0) {
-    // Served again even if it was not served before: it was most likely
-    // skipped at start BECAUSE its root was missing, and now it is not.
-    out(describeServe(await serveLive(live.base, change.entry.root, alias), alias));
+    // Served again only if it WAS served (under either location or alias), or
+    // the user asked. Starting to serve a project is opening its index and a
+    // watcher in someone's long-lived daemon; a registry fix-up must not do
+    // that as a side effect.
+    if (stop.stopped.length > 0 || serve) {
+      out(describeServe(await serveLive(live.base, change.entry.root, alias), alias));
+    } else {
+      out(
+        `daemon: was not serving "${alias}", so it was left that way. To serve it now: ` +
+          `\`hayven daemon register ${change.entry.root}\` (or re-run relocate with --serve).`,
+      );
+    }
   }
   reportPrimary(stop.primary, `serving "${alias}" from ${change.entry.root}`);
   if (live.kind !== "up") reportUntouched(live);
+  restoreIdentities(live);
   return 0;
 }
 
@@ -491,15 +562,17 @@ async function pruneCmd(args: ParsedArgs): Promise<number> {
     for (const e of plan.removed) out(`  ${e.alias} -> ${e.root}`);
     return 0;
   }
-  const live = await probeLive();
+  const live = await probeLive(true);
   const stop = await stopServed(live, plan.removed);
   if (stop instanceof Error) return fail(stop.message);
   const done = pruneMissingProjects({ minMissingMs });
   out(`removed ${done.removed.length} project(s) ${criteria}:`);
   for (const e of done.removed) out(`  ${e.alias} -> ${e.root}`);
   if (done.backup !== null) out(`backup: ${done.backup}`);
-  for (const p of stop.stopped) out(`daemon: stopped serving "${p.alias}"`);
+  const kept = await reserveKept(live, stop.stopped, done.removed, "came back before it could be removed");
+  for (const p of stop.stopped) if (!kept.includes(p)) out(`daemon: stopped serving "${p.alias}"`);
   reportPrimary(stop.primary, "forgetting it");
   if (stop.stopped.length === 0 && stop.primary.length === 0) reportUntouched(live);
+  restoreIdentities(live);
   return 0;
 }

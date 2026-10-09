@@ -180,7 +180,7 @@ describe("auto-relocation (moving a repo keeps its alias)", () => {
     expect(outcome.ambiguousWith?.id).toBe(ID_A);
   });
 
-  it("never steals the alias of a PRESENT repo with the same id (a copy)", () => {
+  it("a copy does not take the alias while the original is present", () => {
     const original = makeRepo("orig", ID_A);
     registerProject(original);
     const copy = makeRepo("copy", ID_A); // cp -r copies config.json too

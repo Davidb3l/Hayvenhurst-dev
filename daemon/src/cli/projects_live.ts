@@ -14,11 +14,33 @@
  * what keeps a sandboxed test, or a user with a relocated `$HAYVEN_HOME`, from
  * stopping or re-pointing projects in SOMEONE ELSE's daemon.
  */
+import { homedir } from "node:os";
+
 import { loadConfig } from "../config/load.ts";
 import { DETACH_HEALTH_TIMEOUT_MS, DETACH_PROBE_TIMEOUT_MS } from "../daemon/detach.ts";
 import { sameProjectRoot, type ProjectEntry } from "../daemon/registry.ts";
-import { detectRepoRoot } from "../util/paths.ts";
+import { canonicalRoot, detectRepoRoot } from "../util/paths.ts";
 import { hotAddToRunningDaemon, probeDaemonGlobalHome, type HotAddResult } from "./_shared.ts";
+
+/**
+ * True when `$HAYVEN_HOME` is EXPLICITLY set to something other than the real
+ * home: a sandbox (a test, a second install). Pure, so it is testable without
+ * touching the real environment.
+ *
+ * Used to close the hole the home handshake leaves open: a daemon that
+ * predates `global_home` (every installed v0.0.7) answers "unknown", and
+ * "unknown" deliberately proceeds so ordinary users can still manage their
+ * daemon. A SANDBOXED process is the one case where proceeding is how test
+ * fixtures used to leak into a real registry, so for mutations it must not.
+ */
+export function homeIsSandboxed(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+  realHome: string = homedir(),
+): boolean {
+  const envValue = env["HAYVEN_HOME"];
+  if (envValue === undefined || envValue.trim().length === 0) return false;
+  return canonicalRoot(envValue.trim()) !== canonicalRoot(realHome);
+}
 
 /** One project a live daemon reports serving (`GET /api/projects`). */
 export interface ServedProject {
@@ -62,7 +84,7 @@ export function daemonBaseUrl(cwd: string = process.cwd()): string | Error {
  * mutation, and a mismatch is final: see `_shared.ts` for the incident (86
  * fixture rows in a real registry) that made it necessary.
  */
-export async function connectLiveDaemon(base: string): Promise<LiveDaemon> {
+export async function connectLiveDaemon(base: string, opts: { mutating?: boolean } = {}): Promise<LiveDaemon> {
   const homes = await probeDaemonGlobalHome(base);
   if (homes.kind === "mismatch") {
     return {
@@ -98,6 +120,21 @@ export async function connectLiveDaemon(base: string): Promise<LiveDaemon> {
       kind: "unmanaged",
       base,
       message: `the daemon at ${base} does not support live project management; changes load on \`hayven daemon restart\`.`,
+    };
+  }
+  // The daemon answered but did not say which home it serves. For a READ, or
+  // for an ordinary user (default home), that is fine and we proceed, exactly
+  // as the hot-add does. For a MUTATION from a SANDBOXED home it is not: every
+  // installed v0.0.7 daemon reports no home, so the handshake above is blind,
+  // and stopping/re-serving projects in it from a test or a second install is
+  // the leak the handshake exists to stop. Edit our own registry only.
+  if (homes.kind === "unknown" && opts.mutating === true && homeIsSandboxed()) {
+    return {
+      kind: "unmanaged",
+      base,
+      message:
+        `the daemon at ${base} does not report which HAYVEN_HOME it serves, and this one is set to ` +
+        `${process.env["HAYVEN_HOME"] ?? ""}; it was left alone, and only this home's registry was changed.`,
     };
   }
   const projects: ServedProject[] = [];

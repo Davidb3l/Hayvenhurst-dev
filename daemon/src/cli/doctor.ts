@@ -17,7 +17,7 @@ import { locateCheckIgnoredBinary, probeCheckIgnored } from "../native/ignore.ts
 import { Db } from "../db/queries.ts";
 import { ftsAvailable } from "../db/migrations.ts";
 import { resolveReadIndex } from "../db/branch_index.ts";
-import { detectRepoRoot, hayvenPathsFor, isDirectory } from "../util/paths.ts";
+import { detectRepoRoot, hayvenPathsFor } from "../util/paths.ts";
 import { readRegistryRaw, type ProjectEntry } from "../daemon/registry.ts";
 import { loadConfig } from "../config/load.ts";
 import { detectHardware, recommendTier3Model } from "../hardware/detect.ts";
@@ -339,6 +339,13 @@ function collect(): DoctorReport {
  * hayven WORKS, and peers read an envelope `ok:false` as "hayven is absent"
  * (SUITE_CONTRACTS §3.1). Never throws, for the same reason.
  *
+ * NEVER STATS A ROOT. `doctor --json` is the suite discovery handshake, and one
+ * `stat` on a hung NFS/SMB mount (exactly the kind of root that goes missing)
+ * blocks for minutes, which peers read as "hayven is absent". The row reports
+ * the `missing_since` stamps the daemon-start prune already wrote instead, and
+ * says the data is as of that start. A root that vanished since then shows up
+ * after the next start; one that came back is cleared by it.
+ *
  * Exported for tests.
  */
 export function registryCheck(entries?: readonly ProjectEntry[]): DoctorCheck {
@@ -348,26 +355,27 @@ export function registryCheck(entries?: readonly ProjectEntry[]): DoctorCheck {
   } catch (err) {
     return { name: "registry", ok: true, detail: `could not read the registry: ${(err as Error).message}`, gating: false };
   }
-  // Non-absolute hand-edited rows are not "missing" (they cannot be stat'd at
-  // all); `hayven projects` lists them as invalid.
-  const missing = rows.filter((e) => isAbsolute(e.root) && !isDirectory(e.root));
+  // Non-absolute hand-edited rows are never stamped (the prune cannot stat
+  // them); `hayven projects` lists them as invalid.
+  const missing = rows.filter((e) => isAbsolute(e.root) && e.missing_since !== undefined);
   if (missing.length === 0) {
     return {
       name: "registry",
       ok: true,
-      detail: `${rows.length} registered project(s), none missing`,
+      detail: `${rows.length} registered project(s), none missing as of the last daemon start`,
       gating: false,
     };
   }
   const listed = missing
-    .map((e) => `${e.alias} (${e.root}${e.missing_since ? `, missing since ${e.missing_since.slice(0, 10)}` : ""})`)
+    .map((e) => `${e.alias} (${e.root}, missing since ${e.missing_since!.slice(0, 10)})`)
     .join("; ");
   const first = missing[0]!.alias;
   return {
     name: "registry",
     ok: false,
     detail:
-      `WARNING: ${missing.length} of ${rows.length} registered project(s) have a missing root: ${listed}. ` +
+      `WARNING: ${missing.length} of ${rows.length} registered project(s) had a missing root as of the ` +
+      `last daemon start: ${listed}. ` +
       `Moved? \`hayven projects relocate ${first} <new-root>\`. ` +
       `Gone? \`hayven projects remove ${first}\`, or \`hayven projects prune\` to drop every missing one.`,
     gating: false,

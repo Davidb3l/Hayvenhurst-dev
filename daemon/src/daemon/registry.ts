@@ -894,6 +894,35 @@ function graceStartMs(stamp: string | undefined, nowMs: number): number | null {
   return parsed;
 }
 
+/**
+ * Directories whose CHILDREN are conventionally mount points: `/Volumes/<x>`
+ * (macOS), `/mnt/<x>`, `/media/<x>`, and `/media/<user>/<x>` or
+ * `/run/media/<user>/<x>` (Linux desktops).
+ */
+const VOLUME_PARENTS = new Set(["/Volumes", "/mnt", "/media"]);
+const PER_USER_VOLUME_GRANDPARENTS = new Set(["/media", "/run/media"]);
+
+/**
+ * True when `root` looks like the ROOT of a mounted volume rather than a
+ * folder inside one.
+ *
+ * Why it matters for auto-relocation: the "is the old filesystem mounted?"
+ * proof is "the old root's PARENT still exists". For a repo INSIDE a volume
+ * (`/Volumes/Drive/code/repo`) unmounting removes the parent too, so the proof
+ * works. For a repo that IS a volume's root (`/Volumes/Repo`), unmounting
+ * removes the repo but leaves `/Volumes` standing, which would read as "moved"
+ * and hand its alias to any copy. Those roots are therefore never
+ * auto-relocated; `hayven projects relocate` still works for them. A volume
+ * mounted somewhere unconventional is not recognized here; the cost is the old
+ * behavior (a copy registered as `<alias>-2` would instead take the alias only
+ * if the original is missing AND its parent exists).
+ */
+export function looksLikeVolumeRoot(root: string): boolean {
+  const r = resolve(root);
+  const parent = dirname(r);
+  return VOLUME_PARENTS.has(parent) || PER_USER_VOLUME_GRANDPARENTS.has(dirname(parent));
+}
+
 /** What {@link registerProjectDetailed} did, so a caller can SAY it. */
 export interface RegisterOutcome {
   /** The entry now on disk for this root. */
@@ -911,6 +940,40 @@ export interface RegisterOutcome {
    * — and the caller should print the exact `hayven projects relocate` command.
    */
   readonly ambiguousWith?: ProjectEntry;
+  /** Why `ambiguousWith` was not re-pointed automatically. Set with it. */
+  readonly ambiguousReason?: AmbiguityReason;
+}
+
+/**
+ * Why a likely move was NOT auto-relocated. Each one changes what the user
+ * should be told (see `relocationNotes` in cli/daemon.ts).
+ */
+export type AmbiguityReason =
+  /** The old row, or this root, has no recorded identity to compare. */
+  | "unknown-identity"
+  /** Both identities are known and they differ. */
+  | "id-mismatch"
+  /** Several missing rows carry this identity; picking one would be a guess. */
+  | "several-matches"
+  /**
+   * The old root's parent is missing too, or it sat at a volume's root: that
+   * looks like an UNMOUNTED drive, not a move, and a copy must not take over.
+   */
+  | "parent-missing"
+  /** The caller cannot let that alias move right now (the live primary). */
+  | "alias-busy";
+
+/** Options for {@link registerProjectDetailed}. */
+export interface RegisterOptions {
+  /**
+   * Aliases that must NOT be re-pointed by auto-relocation. The live daemon
+   * passes its primary: the primary's runtime owns the port and cannot be
+   * retired, so re-pointing its alias at a new root leaves that alias served
+   * from the OLD root and every hot-add from the new one refused. Blocked, the
+   * move registers as `<alias>-N` (the old behavior, which works) and is
+   * reported as `alias-busy` so the user is told how to finish it.
+   */
+  readonly blockedAliases?: Iterable<string>;
 }
 
 /**
@@ -944,8 +1007,18 @@ export function registerProject(root: string, alias?: string): ProjectEntry {
  *   - "not already registered": a root that has its own row is never merged
  *     into another; that would be a rename nobody asked for.
  *   - "missing right now": a PRESENT row with the same id is a COPY of the
- *     repo (`cp -r` copies `.hayven/config.json` too). Both are real; stealing
- *     the original's alias for the copy would be wrong.
+ *     repo (`cp -r` copies `.hayven/config.json` too). Both are real; giving
+ *     the original's alias to the copy would be wrong.
+ *   - "...and its PARENT exists, and it is not a volume's root": "missing" is
+ *     not "moved". An unmounted external drive or a sleeping SMB share makes
+ *     the original read as missing while it still exists, and without this a
+ *     COPY on the laptop would take its alias the moment it registered. A
+ *     present parent proves the filesystem holding the old root is mounted. A
+ *     repo AT a volume's root (`/Volumes/Repo`) loses itself but not its parent
+ *     when unmounted, so those are never auto-relocated either (see
+ *     {@link looksLikeVolumeRoot}); `hayven projects relocate` handles them.
+ *     The guarantee is therefore "a copy cannot take the alias while the
+ *     original is present or its volume visibly unmounted", not "never".
  *   - "exactly one": two missing rows with one identity means the history is
  *     already tangled. Picking either is a guess, and a wrong guess silently
  *     re-points somebody's alias, so we register normally and report it.
@@ -959,7 +1032,11 @@ export function registerProject(root: string, alias?: string): ProjectEntry {
  * `POST /api/projects`, so only rows that are actual candidates (same identity,
  * or holding the alias we would pick) are ever stat'd, never the whole file.
  */
-export function registerProjectDetailed(root: string, alias?: string): RegisterOutcome {
+export function registerProjectDetailed(
+  root: string,
+  alias?: string,
+  opts: RegisterOptions = {},
+): RegisterOutcome {
   // CANONICALIZE on the way in — do not store the caller's spelling. An
   // already-absolute path used to be stored verbatim, so `registerProject(r)`
   // followed by `registerProject(r + "/")` produced TWO entries (`myrepo` and
@@ -972,9 +1049,20 @@ export function registerProjectDetailed(root: string, alias?: string): RegisterO
   const isCandidate = (e: ProjectEntry): boolean =>
     isAbsolute(e.root) && ((identity !== undefined && e.id === identity) || e.alias === baseAlias);
   const present = new Map<string, boolean>();
+  const stat = (path: string): boolean => {
+    let known = present.get(path);
+    if (known === undefined) {
+      known = isDirectory(path);
+      present.set(path, known);
+    }
+    return known;
+  };
   for (const e of readRegistryRaw()) {
-    if (isCandidate(e) && !present.has(e.root)) present.set(e.root, isDirectory(e.root));
+    // The parent too, for same-identity candidates only: it is the proof that
+    // a missing root MOVED rather than went offline (see above).
+    if (isCandidate(e) && !stat(e.root) && identity !== undefined && e.id === identity) stat(dirname(e.root));
   }
+  const blocked = new Set(opts.blockedAliases ?? []);
   return withRegistryLock(() => {
     // RAW, not the filtered view: this is a read → modify → write, and rewriting
     // from a filtered list would silently delete whatever the filter hid.
@@ -1001,35 +1089,53 @@ export function registerProjectDetailed(root: string, alias?: string): RegisterO
 
     // A row is "missing" only on an observed absence. The fallback stat covers
     // a candidate that appeared between the pre-lock read and this one.
-    const isMissing = (e: ProjectEntry): boolean =>
-      isAbsolute(e.root) && !(present.get(e.root) ?? isDirectory(e.root));
+    const isMissing = (e: ProjectEntry): boolean => isAbsolute(e.root) && !stat(e.root);
     const sameIdentity =
       identity === undefined ? [] : entries.filter((e) => e.id === identity && isMissing(e));
 
+    let ambiguousWith: ProjectEntry | undefined;
+    let ambiguousReason: AmbiguityReason | undefined;
     if (sameIdentity.length === 1) {
       const moved = sameIdentity[0]!;
-      const others = entries.filter((e) => e !== moved);
-      // The moved row's alias is unique already (it held it), so it needs no
-      // `deriveAlias`. An explicit alias is honored exactly as a plain register
-      // would honor it.
-      const finalAlias = alias ? deriveAlias(abs, alias, others) : moved.alias;
-      const entry = makeEntry(finalAlias, abs, identity);
-      writeRegistry([...others, entry].sort((a, b) => a.alias.localeCompare(b.alias)));
-      return { entry, relocatedFrom: moved.root };
+      const unmounted = !stat(dirname(moved.root)) || looksLikeVolumeRoot(moved.root);
+      if (!unmounted && !blocked.has(moved.alias)) {
+        const others = entries.filter((e) => e !== moved);
+        // The moved row's alias is unique already (it held it), so it needs no
+        // `deriveAlias`. An explicit alias is honored exactly as a plain
+        // register would honor it.
+        const finalAlias = alias ? deriveAlias(abs, alias, others) : moved.alias;
+        const entry = makeEntry(finalAlias, abs, identity);
+        // An automatic re-point rewrites a registration nobody asked about, so
+        // it gets the same undo as the user-commanded mutations.
+        backupRegistry();
+        writeRegistry([...others, entry].sort((a, b) => a.alias.localeCompare(b.alias)));
+        return { entry, relocatedFrom: moved.root };
+      }
+      ambiguousWith = moved;
+      ambiguousReason = unmounted ? "parent-missing" : "alias-busy";
+    } else if (sameIdentity.length > 1) {
+      ambiguousWith = sameIdentity.find((e) => e.alias === baseAlias) ?? sameIdentity[0];
+      ambiguousReason = "several-matches";
+    } else {
+      const holder = entries.find((e) => e.alias === baseAlias);
+      if (holder !== undefined && isMissing(holder)) {
+        ambiguousWith = holder;
+        ambiguousReason = holder.id === undefined || identity === undefined ? "unknown-identity" : "id-mismatch";
+      }
     }
 
-    const holder = entries.find((e) => e.alias === baseAlias);
-    const ambiguousWith =
-      holder !== undefined && isMissing(holder) ? holder : sameIdentity.length > 1 ? sameIdentity[0] : undefined;
     const entry = makeEntry(deriveAlias(abs, alias, entries), abs, identity);
     writeRegistry([...entries, entry].sort((a, b) => a.alias.localeCompare(b.alias)));
-    return ambiguousWith !== undefined ? { entry, ambiguousWith } : { entry };
+    return ambiguousWith !== undefined && ambiguousReason !== undefined
+      ? { entry, ambiguousWith, ambiguousReason }
+      : { entry };
   });
 }
 
 /**
  * Record the CURRENT identity of each of `roots` on its registry row (when the
- * row exists and the id changed). Never creates rows. Writes only on change.
+ * row exists and the id changed). Never creates rows. Writes only on change,
+ * and returns how many rows it updated.
  *
  * WHY a separate call, after a daemon has opened its projects: the identity is
  * minted by `CrdtState` (`loadOrCreateWriterId`) the first time a daemon opens
@@ -1038,24 +1144,25 @@ export function registerProjectDetailed(root: string, alias?: string): RegisterO
  * the NEXT daemon start, and moving it before then (while it is being served)
  * would still produce `<alias>-2`.
  */
-export function recordProjectIdentities(roots: readonly string[]): void {
+export function recordProjectIdentities(roots: readonly string[]): number {
   const found = new Map<string, string>();
   for (const root of roots) {
     const id = readProjectIdentity(root);
     if (id !== undefined) found.set(canonicalRoot(root), id);
   }
-  if (found.size === 0) return;
-  withRegistryLock(() => {
+  if (found.size === 0) return 0;
+  return withRegistryLock(() => {
     const entries = readRegistryRaw();
-    let changed = false;
+    let changed = 0;
     const next = entries.map((e) => {
       if (!isAbsolute(e.root)) return e;
       const id = found.get(canonicalRoot(e.root));
       if (id === undefined || id === e.id) return e;
-      changed = true;
+      changed++;
       return makeEntry(e.alias, e.root, id, e.missing_since);
     });
-    if (changed) writeRegistry(next);
+    if (changed > 0) writeRegistry(next);
+    return changed;
   });
 }
 
@@ -1259,6 +1366,14 @@ export interface RelocateOutcome extends RegistryChange {
  * for that alias from the wrong codebase. An UNKNOWN identity on either side is
  * not a mismatch: that is exactly the pre-`id` registry this command exists to
  * repair.
+ *
+ * Two more refusals without `force`, both "this is probably not a move":
+ *   - The row's OLD root still exists. Re-pointing it would silently stop
+ *     serving a live repo under its alias; a copy or a second checkout should
+ *     be registered on its own instead.
+ *   - The row being FOLDED in (`replaced`, already registered at the target)
+ *     recorded a different identity than the target has now: what that row
+ *     described is not what lives there, so deleting it loses information.
  */
 export function relocateProject(
   alias: string,
@@ -1275,16 +1390,27 @@ export function relocateProject(
     );
   }
   const identity = readProjectIdentity(abs);
+  // Stat the row's old root OUTSIDE the lock (a dead mount can block for tens
+  // of seconds; see `pruneStaleProjects`).
+  const before = readRegistryRaw().find((e) => e.alias === alias);
+  const oldRootPresent =
+    before !== undefined &&
+    isAbsolute(before.root) &&
+    canonicalRoot(before.root) !== abs &&
+    isDirectory(before.root);
   return withRegistryLock(() => {
     const entries = readRegistryRaw();
     const previous = entries.find((e) => e.alias === alias);
     if (!previous) throw unknownAliasError(alias, entries);
-    if (
-      previous.id !== undefined &&
-      identity !== undefined &&
-      previous.id !== identity &&
-      opts.force !== true
-    ) {
+    const force = opts.force === true;
+    if (oldRootPresent && previous.root === before?.root && !force) {
+      throw new Error(
+        `"${alias}" still exists at ${previous.root}, so this would move the registration away from a ` +
+          "live repo. If that folder is a stale copy, re-run with --force; to track both, register " +
+          `the new one on its own (\`hayven daemon register ${abs}\`).`,
+      );
+    }
+    if (previous.id !== undefined && identity !== undefined && previous.id !== identity && !force) {
       throw new Error(
         `${abs} is a different project than "${alias}" was: its .hayven/config.json writer_id is ` +
           `${identity}, but "${alias}" was registered with ${previous.id}. ` +
@@ -1293,6 +1419,18 @@ export function relocateProject(
     }
     const isAtTarget = (e: ProjectEntry): boolean => isAbsolute(e.root) && canonicalRoot(e.root) === abs;
     const replaced = entries.find((e) => e !== previous && isAtTarget(e));
+    if (
+      replaced?.id !== undefined &&
+      identity !== undefined &&
+      replaced.id !== identity &&
+      !force
+    ) {
+      throw new Error(
+        `"${replaced.alias}" is registered at ${abs} with identity ${replaced.id}, but the project there ` +
+          `now has ${identity}. Folding it into "${alias}" would drop that record; re-run with --force ` +
+          "if that is intended.",
+      );
+    }
     // The id describes what lives at the target NOW; fall back to the row's own
     // only when the target has none yet (a project the daemon never started in).
     const entry = makeEntry(alias, abs, identity ?? previous.id);

@@ -108,7 +108,7 @@ export const COMMANDS: readonly Command[] = [
   { name: "daemon", group: "common", run: runDaemon,
     help: "daemon <start|stop|status> Daemon control" },
   { name: "projects", group: "common", run: runProjects,
-    help: "projects [list|remove|rename|relocate|prune] [--json]  Manage registered projects (fix a moved repo: relocate); `hayven projects help` for details" },
+    help: "projects [list [--json]|remove|rename|relocate|prune]  Manage registered projects (fix a moved repo: relocate); `hayven projects help` for details" },
   { name: "doctor", group: "common", run: runDoctor,
     help: "doctor [--json]            Check Bun, native binary, and config (--json: the SUITE_CONTRACTS §3 discovery envelope)" },
   { name: "config", group: "common", run: runConfig,

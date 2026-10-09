@@ -77,10 +77,12 @@ import {
   registerProjectDetailed,
   sameProjectRoot,
   unregisterProjectDetailed,
+  type AmbiguityReason,
   type RegisterOutcome,
 } from "../daemon/registry.ts";
 import { parseMaxFiles, refuseIfOverCeiling } from "./init.ts";
 import { hotAddToRunningDaemon, requireProject } from "./_shared.ts";
+import { connectLiveDaemon } from "./projects_live.ts";
 import { VERSION } from "../version.ts";
 
 /** Hard cap on repos one daemon serves live — a DoS backstop for the add endpoint
@@ -872,9 +874,18 @@ async function registerDaemonProject(args: ParsedArgs): Promise<number> {
     process.stderr.write(verdict);
     return 1;
   }
+  const cfg = loadConfig(root).config;
+  const base = `http://${cfg.daemon_host}:${cfg.daemon_port}`;
+  // Same rule the daemon applies to itself in `addProjectLive`: never
+  // auto-relocate onto the alias a running daemon serves as its PRIMARY. This
+  // command persists BEFORE it hot-adds, so if it re-pointed that alias here
+  // the daemon would then refuse the add (the primary cannot be retired) and
+  // the moved repo would not be served at all.
+  const live = await connectLiveDaemon(base);
+  const blockedAliases = live.kind === "up" && live.primary !== null ? [live.primary] : [];
   let outcome: RegisterOutcome;
   try {
-    outcome = registerProjectDetailed(root, alias);
+    outcome = registerProjectDetailed(root, alias, { blockedAliases });
   } catch (err) {
     process.stderr.write(`error: ${(err as Error).message}\n`);
     return 1;
@@ -884,8 +895,6 @@ async function registerDaemonProject(args: ParsedArgs): Promise<number> {
   for (const line of relocationNotes(outcome)) process.stdout.write(`${line}\n`);
 
   // If a daemon is already up, hot-add so the repo appears WITHOUT a restart.
-  const cfg = loadConfig(root).config;
-  const base = `http://${cfg.daemon_host}:${cfg.daemon_port}`;
   const hot = await hotAddToRunningDaemon(root, base, alias);
   switch (hot.kind) {
     case "added":
@@ -925,11 +934,34 @@ export function relocationNotes(outcome: RegisterOutcome): string[] {
   }
   const other = outcome.ambiguousWith;
   if (other === undefined) return [];
+  const fix = `  hayven projects relocate ${other.alias} ${outcome.entry.root}`;
+  const why: Record<Exclude<AmbiguityReason, "alias-busy">, string> = {
+    "unknown-identity": "the identity on record is unknown",
+    "id-mismatch": "the identity on record does not match this repo's",
+    "several-matches": "several missing projects carry this repo's identity",
+    "parent-missing":
+      `the folder that held it is missing too (or it was a volume's root), which looks like an ` +
+      "unmounted drive rather than a move",
+  };
+  if (outcome.ambiguousReason === "alias-busy") {
+    // The running daemon serves "<alias>" as its PRIMARY from the old root and
+    // cannot drop it live. Relocate FIRST, then restart: the other order
+    // restarts into `<alias>-N` as the primary and needs a second restart.
+    return [
+      `note: this looks like "${other.alias}" (${other.root}), moved. The running daemon serves ` +
+        `"${other.alias}" as its primary project, so it was registered as "${outcome.entry.alias}" for now. ` +
+        "To keep the alias, run:",
+      fix,
+      "  hayven daemon restart",
+    ];
+  }
+  const reason =
+    outcome.ambiguousReason !== undefined ? why[outcome.ambiguousReason] : "the move could not be proven";
   return [
     `note: "${other.alias}" is registered at ${other.root}, which is missing. If this repo is that one, moved, run:`,
-    `  hayven projects relocate ${other.alias} ${outcome.entry.root}`,
-    `(that folds "${outcome.entry.alias}" back into "${other.alias}"; it could not be done automatically ` +
-      `because the identity on record ${other.id === undefined ? "is unknown" : "does not match"}).`,
+    fix,
+    `(that folds "${outcome.entry.alias}" back into "${other.alias}"; it was not done automatically because ` +
+      `${reason}).`,
   ];
 }
 
@@ -2303,9 +2335,6 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
       const already = [...runtimes.values()].find((rt) => canonicalRoot(rt.deps.paths.repoRoot) === root);
       if (already) return { alias: already.alias, root, added: false };
 
-      if (runtimes.size >= MAX_LIVE_PROJECTS) {
-        throw new Error(`project cap reached (${MAX_LIVE_PROJECTS} served) — remove one before adding another`);
-      }
       const paths = hayvenPathsFor(root);
       if (!existsSync(paths.hayvenDir)) {
         throw new Error(`no .hayven/ directory at ${root} — run \`hayven init\` there first`);
@@ -2326,7 +2355,14 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
       //
       // Persist first (this is what derives the alias), then check it against
       // the LIVE map before opening anything.
-      const registered = registerProjectDetailed(root, aliasHint);
+      //
+      // The PRIMARY's alias is BLOCKED from auto-relocation: its runtime owns
+      // the port and cannot be retired below, so re-pointing its alias at a new
+      // root would leave that alias served from the old root and refuse this
+      // add, i.e. every `claim`/`sync` from a moved primary repo would fail.
+      // Blocked, the move registers as `<alias>-N` and is served now; the
+      // `alias-busy` note tells the user how to fold it back.
+      const registered = registerProjectDetailed(root, aliasHint, { blockedAliases: [primaryAlias] });
       const entry = registered.entry;
       // Nobody reads this route's caller output for a relocation (a `claim`
       // from a moved repo hot-adds silently), so the log is where it is said.
@@ -2392,6 +2428,14 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
           // free; a leaked handle on a DELETED root is logged and survivable.
           logger.warn("stale runtime shutdown failed; continuing", { error: (err as Error).message });
         }
+      }
+      // The cap is checked AFTER the stale runtime above is retired, not
+      // before: a move REPLACES a runtime rather than adding one, and checking
+      // first would refuse it at exactly the cap. The cost is that a refused
+      // add has already been persisted, the same trade the collision check
+      // below makes; the next start loads it if there is room.
+      if (runtimes.size >= MAX_LIVE_PROJECTS) {
+        throw new Error(`project cap reached (${MAX_LIVE_PROJECTS} served) — remove one before adding another`);
       }
       if (runtimes.has(entry.alias)) {
         const held = runtimes.get(entry.alias)!;
