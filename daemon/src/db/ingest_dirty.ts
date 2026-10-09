@@ -83,11 +83,22 @@ export function readIngestDirty(db: Db): IngestDirty | null {
  */
 export function nextIngestDirty(db: Db, repoRoot: string, authoritative: boolean): IngestDirty | null {
   if (!existsSync(join(repoRoot, HAYVEN_DIR_NAME, WORKTREE_REGISTRY_FILE))) return null;
+  const prior = authoritative ? null : readIngestDirty(db);
+  // ONLY A FULL REBUILD MAY START A TRUSTED LIST. An incremental ingest with
+  // no prior record cannot know what the index already holds: an edit indexed
+  // before recording began (no registry yet, or the registry was removed and
+  // re-created) and since stashed is still in the index, yet would appear in
+  // neither the old record (there is none) nor today's dirty set. Starting a
+  // `paths` record here would tell the next seed "nothing else is dirty", and
+  // it would serve that stashed edit as fresh. `unknown` makes every seed do a
+  // full worktree parse until main's next full rebuild: slower, never wrong.
+  if (!authoritative && prior === null) return { kind: "unknown" };
+  // Sticky until a full rebuild, and decided before spending a git call whose
+  // answer would be discarded anyway.
+  if (prior !== null && prior.kind !== "paths") return prior;
   const status = gitStatus(repoRoot, DIRTY_STATUS_TIMEOUT_MS);
   if (status === null) return { kind: "unknown" };
   const current = status.paths.filter(isSourcePath);
-  const prior = authoritative ? null : readIngestDirty(db);
-  if (prior !== null && prior.kind !== "paths") return prior; // sticky until a full rebuild
   const merged = [...new Set([...(prior?.paths ?? []), ...current])].sort();
   return merged.length > DIRTY_RECORD_CAP ? { kind: "overflow" } : { kind: "paths", paths: merged };
 }

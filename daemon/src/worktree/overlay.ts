@@ -85,8 +85,8 @@ function noteMissingDirtyRecordOnce(target: OverlayTarget): void {
   if (existsSync(flag)) return;
   process.stderr.write(
     "note: the main index has no record of which files were uncommitted when it was built, so this worktree " +
-      "overlay is built with a full parse. The next `hayven ingest` (or daemon re-index) in the main checkout " +
-      "records it, and later overlays seed incrementally.\n",
+      "overlay is built with a full parse. Run `hayven ingest --full` in the main checkout once to start the " +
+      "record; later overlays then seed incrementally.\n",
   );
   try {
     mkdirSync(worktreesDir(target.paths), { recursive: true });

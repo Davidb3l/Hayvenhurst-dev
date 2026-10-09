@@ -508,7 +508,8 @@ maybe("worktree overlays (E2E, native binary)", () => {
       // Main edits a file and indexes the edit.
       write(repo, "src/a.ts", "export function existingFn() {\n  return 1;\n}\nexport function mainScratchFn() {\n  return 7;\n}\n");
       enableDirtyRecord(repo);
-      expect(hv(repo, "ingest").code).toBe(0);
+      // Only a FULL rebuild may start a trusted record (see nextIngestDirty).
+      expect(hv(repo, "ingest", "--full").code).toBe(0);
       expect(queryIds(repo, "mainScratchFn")).toContain("src/a/mainScratchFn");
 
       // Dirty main: a fresh overlay must not carry the edit.
@@ -537,7 +538,8 @@ maybe("worktree overlays (E2E, native binary)", () => {
       const repo = makeRepo();
       write(repo, "src/a.ts", "export function existingFn() {\n  return 1;\n}\nexport function mainScratchFn() {\n  return 7;\n}\n");
       enableDirtyRecord(repo);
-      expect(hv(repo, "ingest").code).toBe(0);
+      // Only a FULL rebuild may start a trusted record (see nextIngestDirty).
+      expect(hv(repo, "ingest", "--full").code).toBe(0);
       const wt = addWorktree(repo, join(repo, ".sirius/worktrees/w1"));
 
       // A `git` that parks on the post-seed `diff --name-status`, so we can kill
@@ -690,7 +692,7 @@ maybe("worktree overlays (E2E, native binary)", () => {
       enableDirtyRecord(repo);
       write(repo, "notes.md", "# not source\n");
       write(repo, "src/untracked.ts", "export const u = 1;\n");
-      expect(hvEnv(repo, env, "ingest").code).toBe(0);
+      expect(hvEnv(repo, env, "ingest", "--full").code).toBe(0);
       expect(readFileSync(shim.log, "utf8")).toContain("status");
       expect(JSON.parse(mainStat(repo, LAST_INGEST_DIRTY_KEY) ?? "null")).toEqual(["src/a.ts", "src/untracked.ts"]);
     },
@@ -703,7 +705,7 @@ maybe("worktree overlays (E2E, native binary)", () => {
       const repo = makeRepo();
       enableDirtyRecord(repo);
       write(repo, "src/a.ts", "export function existingFn() {\n  return 2;\n}\n");
-      expect(hv(repo, "ingest").code).toBe(0);
+      expect(hv(repo, "ingest", "--full").code).toBe(0);
       expect(JSON.parse(mainStat(repo, LAST_INGEST_DIRTY_KEY) ?? "null")).toEqual(["src/a.ts"]);
 
       const slow = gitShim(`case "$*" in *" status "*) exec sleep 8;; esac`);
@@ -758,6 +760,32 @@ maybe("worktree overlays (E2E, native binary)", () => {
       expect(r2.stderr).not.toContain("no record of which files were uncommitted");
       expect(queryIds(w1, "mainScratchFn")).toEqual([]);
       expect(queryIds(w2, "existingFn")).toContain("src/a/existingFn");
+    },
+    SLOW,
+  );
+
+  test(
+    "an INCREMENTAL ingest cannot start the record: a later seed still excludes an edit indexed before recording",
+    () => {
+      // Review repro: the edit is indexed before any registry exists, then
+      // stashed. A routine incremental ingest after registration must not write
+      // a "nothing dirty" record, or the next overlay is seeded with the edit.
+      const repo = makeRepo();
+      write(repo, "src/a.ts", "export function existingFn() {\n  return 1;\n}\nexport function stashedFn() {\n  return 7;\n}\n");
+      expect(hv(repo, "ingest").code).toBe(0);
+      git(repo, ["stash", "-q"]);
+      const w1 = addWorktree(repo, join(repo, ".sirius/worktrees/w1"));
+      expect(json<{ action: string }>(hv(repo, "worktree", "add", w1, "--json")).action).toBe("full");
+      expect(hv(repo, "ingest").code).toBe(0); // incremental: index still holds stashedFn
+      const w2 = addWorktree(repo, join(repo, ".sirius/worktrees/w2"));
+      expect(json<{ action: string }>(hv(repo, "worktree", "add", w2, "--json")).action).toBe("full");
+      expect(queryIds(w2, "stashedFn")).toEqual([]);
+      // A full rebuild of main starts a trusted record; overlays seed again.
+      expect(hv(repo, "ingest", "--full").code).toBe(0);
+      const w3 = addWorktree(repo, join(repo, ".sirius/worktrees/w3"));
+      expect(json<{ action: string }>(hv(repo, "worktree", "add", w3, "--json")).action).not.toBe("full");
+      expect(queryIds(w3, "stashedFn")).toEqual([]);
+      expect(queryIds(w3, "existingFn")).toContain("src/a/existingFn");
     },
     SLOW,
   );
