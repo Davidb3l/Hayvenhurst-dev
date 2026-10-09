@@ -229,6 +229,9 @@ function list(args: ParsedArgs, ctx: ProjectContext): number {
   if (rows.some((r) => r.freshness === "worktree-gone")) {
     lines.push("Run `hayven worktree prune` to drop the overlays whose worktree is gone.");
   }
+  if (rows.some((r) => r.freshness === "unknown")) {
+    lines.push("Freshness is unknown where git did not answer (missing, slow or failing); nothing was changed.");
+  }
   process.stdout.write(lines.join("\n") + "\n");
   return 0;
 }

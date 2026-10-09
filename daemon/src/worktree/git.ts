@@ -23,6 +23,16 @@ import { canonicalRoot, findUp } from "../util/paths.ts";
 
 const GIT_TIMEOUT_MS = 10_000;
 
+/**
+ * The environment every git call here runs with. `LC_ALL=C` because some
+ * callers classify git's STDERR (`not a git repository` is positive evidence a
+ * worktree is gone, anything else is not), and a localized git would turn
+ * every such message into "unknown".
+ */
+function gitEnv(): NodeJS.ProcessEnv {
+  return { ...process.env, LC_ALL: "C" };
+}
+
 /** A linked git worktree, located purely from the filesystem. */
 export interface LinkedWorktree {
   /** The worktree's top-level directory (holds the `.git` FILE), canonical. */
@@ -69,11 +79,12 @@ export function detectLinkedWorktree(start: string): LinkedWorktree | null {
 }
 
 /** Run `git -C <cwd> <args>`; stdout on exit 0, else null. Never throws. */
-export function git(cwd: string, args: string[]): string | null {
+export function git(cwd: string, args: string[], timeoutMs: number = GIT_TIMEOUT_MS): string | null {
   try {
     const res = spawnSync("git", ["-C", cwd, ...args], {
+      env: gitEnv(),
       encoding: "utf8",
-      timeout: GIT_TIMEOUT_MS,
+      timeout: timeoutMs,
       maxBuffer: 64 * 1024 * 1024,
     });
     if (res.status !== 0 || typeof res.stdout !== "string") return null;
@@ -99,6 +110,7 @@ export type GitProbe =
 export function gitProbe(cwd: string, args: string[]): GitProbe {
   try {
     const res = spawnSync("git", ["-C", cwd, ...args], {
+      env: gitEnv(),
       encoding: "utf8",
       timeout: GIT_TIMEOUT_MS,
       maxBuffer: 64 * 1024 * 1024,
@@ -155,6 +167,7 @@ export function gitHead(cwd: string): string | null {
 export function isAncestor(cwd: string, ancestor: string, descendant: string): boolean {
   try {
     const res = spawnSync("git", ["-C", cwd, "merge-base", "--is-ancestor", ancestor, descendant], {
+      env: gitEnv(),
       timeout: GIT_TIMEOUT_MS,
     });
     return res.status === 0;
@@ -175,8 +188,8 @@ export function isAncestor(cwd: string, ancestor: string, descendant: string): b
  * directory to `dir/` — an edit inside a new directory does not change the
  * directory's mtime, so the collapsed form would hide it from the fingerprint.
  */
-export function gitStatus(cwd: string): { raw: string; paths: string[] } | null {
-  const raw = git(cwd, ["--no-optional-locks", "status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+export function gitStatus(cwd: string, timeoutMs: number = GIT_TIMEOUT_MS): { raw: string; paths: string[] } | null {
+  const raw = git(cwd, ["--no-optional-locks", "status", "--porcelain=v1", "-z", "--untracked-files=all"], timeoutMs);
   if (raw === null) return null;
   const tokens = raw.split("\0");
   const paths: string[] = [];

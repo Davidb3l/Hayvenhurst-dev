@@ -17,7 +17,11 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpath
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { loadConfig } from "../src/config/load.ts";
+import { DIRTY_RECORD_CAP, LAST_INGEST_DIRTY_KEY } from "../src/db/ingest_dirty.ts";
 import { Db } from "../src/db/queries.ts";
+import { hayvenPathsFor } from "../src/util/paths.ts";
+import { overlayTestHooks, refreshOverlay } from "../src/worktree/overlay.ts";
 import { MAX_WORKTREE_OVERLAYS, overlayId } from "../src/worktree/registry.ts";
 
 function findBinary(): string | null {
@@ -99,6 +103,38 @@ function mainIndexFingerprint(repo: string): Record<string, string> {
     for (const f of readdirSync(join(repo, ".hayven/branches", d))) add(join(repo, ".hayven/branches", d, f));
   }
   return out;
+}
+
+/**
+ * Create an EMPTY worktree registry, which is what turns on the per-ingest
+ * dirty-file record (`db/ingest_dirty.ts`). Tests that exercise the seed's
+ * record path call this before main's ingest.
+ */
+function enableDirtyRecord(repo: string): void {
+  const f = join(repo, ".hayven/worktrees.json");
+  if (!existsSync(f)) writeFileSync(f, JSON.stringify({ version: 1, worktrees: [] }));
+}
+
+function mainStat(repo: string, key: string): string | null {
+  const dbPath = existsSync(join(repo, ".hayven/branches/main/index.sqlite"))
+    ? join(repo, ".hayven/branches/main/index.sqlite")
+    : join(repo, ".hayven/index.sqlite");
+  const db = new Db(dbPath, { readonly: true });
+  try {
+    return db.getStat(key);
+  } finally {
+    db.close();
+  }
+}
+
+/** A `git` shim dir: logs every invocation to `<dir>/log`, then runs `body` or the real git. */
+function gitShim(body = ""): { dir: string; log: string } {
+  const realGit = Bun.which("git");
+  if (realGit === null) throw new Error("git not found");
+  const dir = tmp("hv-wt-gitshim-");
+  const log = join(dir, "log");
+  writeFileSync(join(dir, "git"), `#!/bin/sh\necho "$*" >> "${log}"\n${body}\nexec "${realGit}" "$@"\n`, { mode: 0o755 });
+  return { dir, log };
 }
 
 function json<T>(r: Run): T {
@@ -471,6 +507,7 @@ maybe("worktree overlays (E2E, native binary)", () => {
       const repo = makeRepo();
       // Main edits a file and indexes the edit.
       write(repo, "src/a.ts", "export function existingFn() {\n  return 1;\n}\nexport function mainScratchFn() {\n  return 7;\n}\n");
+      enableDirtyRecord(repo);
       expect(hv(repo, "ingest").code).toBe(0);
       expect(queryIds(repo, "mainScratchFn")).toContain("src/a/mainScratchFn");
 
@@ -499,6 +536,7 @@ maybe("worktree overlays (E2E, native binary)", () => {
     async () => {
       const repo = makeRepo();
       write(repo, "src/a.ts", "export function existingFn() {\n  return 1;\n}\nexport function mainScratchFn() {\n  return 7;\n}\n");
+      enableDirtyRecord(repo);
       expect(hv(repo, "ingest").code).toBe(0);
       const wt = addWorktree(repo, join(repo, ".sirius/worktrees/w1"));
 
@@ -576,6 +614,166 @@ maybe("worktree overlays (E2E, native binary)", () => {
       const t0 = Date.now();
       expect(queryIds(wt, "lateFn")).toContain("src/late/lateFn");
       expect(Date.now() - t0).toBeLessThan(30_000);
+    },
+    SLOW,
+  );
+
+  test(
+    "a seed copied while main was mid-ingest is abandoned for a full parse, never amended",
+    async () => {
+      const repo = makeRepo();
+      enableDirtyRecord(repo);
+      expect(hv(repo, "ingest", "--full").code).toBe(0);
+      const wt = addWorktree(repo, join(repo, ".sirius/worktrees/w1"));
+      const entry = { path: wt, id: overlayId(wt), created_at: new Date().toISOString(), seed_head: null };
+      writeFileSync(join(repo, ".hayven/worktrees.json"), JSON.stringify({ version: 1, worktrees: [entry] }));
+
+      // Make the COPY look exactly like one taken while a daemon ingest was
+      // half-way through: main's own in-flight marker, and a file's rows gone.
+      overlayTestHooks.afterSeedCopy = (tmpPath) => {
+        const db = new Db(tmpPath);
+        try {
+          db.setStat("ingest_in_progress", JSON.stringify([{ t: "424242:main:ingest", at: Date.now() }]));
+          db.deleteNodesByFile("src/a.ts");
+        } finally {
+          db.close();
+        }
+      };
+      let result;
+      try {
+        result = await refreshOverlay(
+          { paths: hayvenPathsFor(repo), config: loadConfig(repo).config, entry },
+          { binary: bin ?? undefined },
+        );
+      } finally {
+        delete overlayTestHooks.afterSeedCopy;
+      }
+      expect(result.seeded).toBe(false);
+      expect(result.action).toBe("full");
+      const overlay = new Db(join(repo, ".hayven/worktrees", entry.id, "index.sqlite"), { readonly: true });
+      try {
+        expect(overlay.nodeIdsForFile("src/a.ts")).toContain("src/a/existingFn");
+        expect(overlay.checkIndexIntegrity().ok).toBe(true);
+      } finally {
+        overlay.close();
+      }
+
+      // "Pending seed" is accepted ONLY with the seed's own marker. The same
+      // flag beside a FOREIGN in-progress marker means a partial graph: it must
+      // be rebuilt, not amended.
+      const forged = new Db(join(repo, ".hayven/worktrees", entry.id, "index.sqlite"));
+      try {
+        forged.setStat("overlay_seed_pending", "1");
+        forged.setStat("overlay_fingerprint", "");
+        forged.setStat("ingest_in_progress", JSON.stringify([{ t: "424242:main:ingest", at: Date.now() }]));
+        forged.deleteNodesByFile("src/a.ts");
+      } finally {
+        forged.close();
+      }
+      expect(queryIds(wt, "existingFn")).toContain("src/a/existingFn");
+    },
+    SLOW,
+  );
+
+  test(
+    "without a worktree registry, ingest runs no extra `git status`; with one it records source paths only",
+    () => {
+      const repo = makeRepo();
+      const shim = gitShim();
+      const env = { PATH: `${shim.dir}:${process.env["PATH"] ?? ""}` };
+      write(repo, "src/a.ts", "export function existingFn() {\n  return 2;\n}\n");
+      expect(hvEnv(repo, env, "ingest").code).toBe(0);
+      const before = existsSync(shim.log) ? readFileSync(shim.log, "utf8") : "";
+      expect(before.split("\n").filter((l) => / status /.test(` ${l} `))).toEqual([]);
+      expect(mainStat(repo, LAST_INGEST_DIRTY_KEY)).toBeNull();
+
+      enableDirtyRecord(repo);
+      write(repo, "notes.md", "# not source\n");
+      write(repo, "src/untracked.ts", "export const u = 1;\n");
+      expect(hvEnv(repo, env, "ingest").code).toBe(0);
+      expect(readFileSync(shim.log, "utf8")).toContain("status");
+      expect(JSON.parse(mainStat(repo, LAST_INGEST_DIRTY_KEY) ?? "null")).toEqual(["src/a.ts", "src/untracked.ts"]);
+    },
+    SLOW,
+  );
+
+  test(
+    "a slow or failing `git status` marks the record unknown (2s budget), and the next seed parses in full",
+    () => {
+      const repo = makeRepo();
+      enableDirtyRecord(repo);
+      write(repo, "src/a.ts", "export function existingFn() {\n  return 2;\n}\n");
+      expect(hv(repo, "ingest").code).toBe(0);
+      expect(JSON.parse(mainStat(repo, LAST_INGEST_DIRTY_KEY) ?? "null")).toEqual(["src/a.ts"]);
+
+      const slow = gitShim(`case "$*" in *" status "*) exec sleep 8;; esac`);
+      write(repo, "src/a.ts", "export function existingFn() {\n  return 3;\n}\n");
+      const t0 = Date.now();
+      expect(hvEnv(repo, { PATH: `${slow.dir}:${process.env["PATH"] ?? ""}` }, "ingest").code).toBe(0);
+      expect(Date.now() - t0).toBeLessThan(6_000);
+      // Not deleted: marked unknown, sticky across incremental ingests.
+      expect(mainStat(repo, LAST_INGEST_DIRTY_KEY)).toBe("unknown");
+      expect(hv(repo, "ingest").code).toBe(0);
+      expect(mainStat(repo, LAST_INGEST_DIRTY_KEY)).toBe("unknown");
+
+      const wt = addWorktree(repo, join(repo, ".sirius/worktrees/w1"));
+      const added = json<{ seeded: boolean; action: string }>(hv(repo, "worktree", "add", wt, "--json"));
+      expect(added.seeded).toBe(false);
+      expect(added.action).toBe("full");
+    },
+    SLOW,
+  );
+
+  test(
+    `more than ${DIRTY_RECORD_CAP} dirty source files records overflow, and the seed parses in full`,
+    () => {
+      const repo = makeRepo();
+      enableDirtyRecord(repo);
+      for (let i = 0; i <= DIRTY_RECORD_CAP; i++) write(repo, `src/gen/f${i}.ts`, `export const v${i} = ${i};\n`);
+      expect(hv(repo, "ingest", "--full").code).toBe(0);
+      expect(mainStat(repo, LAST_INGEST_DIRTY_KEY)).toBe("overflow");
+      const wt = addWorktree(repo, join(repo, ".sirius/worktrees/w1"));
+      const added = json<{ seeded: boolean; action: string }>(hv(repo, "worktree", "add", wt, "--json"));
+      expect(added.seeded).toBe(false);
+      expect(added.action).toBe("full");
+      expect(queryIds(wt, "v7")).toEqual([]); // main's untracked files never reach the overlay
+    },
+    SLOW,
+  );
+
+  test(
+    "with no record yet, overlays are fully parsed (main's edits excluded) and the note prints once",
+    () => {
+      const repo = makeRepo();
+      // Main indexed an edit, then stashed it, all BEFORE any registry existed.
+      write(repo, "src/a.ts", "export function existingFn() {\n  return 1;\n}\nexport function mainScratchFn() {\n  return 7;\n}\n");
+      expect(hv(repo, "ingest").code).toBe(0);
+      git(repo, ["stash", "-q"]);
+      const w1 = addWorktree(repo, join(repo, ".sirius/worktrees/w1"));
+      const w2 = addWorktree(repo, join(repo, ".sirius/worktrees/w2"));
+      const r1 = hv(repo, "worktree", "add", w1, "--json");
+      const r2 = hv(repo, "worktree", "add", w2, "--json");
+      expect(json<{ action: string }>(r1).action).toBe("full");
+      expect(r1.stderr).toContain("no record of which files were uncommitted");
+      expect(r2.stderr).not.toContain("no record of which files were uncommitted");
+      expect(queryIds(w1, "mainScratchFn")).toEqual([]);
+      expect(queryIds(w2, "existingFn")).toContain("src/a/existingFn");
+    },
+    SLOW,
+  );
+
+  test(
+    "worktree list says freshness is unknown, not gone, when git cannot run",
+    () => {
+      const repo = makeRepo();
+      const wt = addWorktree(repo, join(repo, ".sirius/worktrees/w1"));
+      expect(hv(repo, "worktree", "add", wt).code).toBe(0);
+      const noGit = { PATH: tmp("hv-wt-nogit-") };
+      const listed = json<{ worktrees: Array<{ freshness: string }> }>(hvEnv(repo, noGit, "worktree", "list", "--json"));
+      expect(listed.worktrees[0]?.freshness).toBe("unknown");
+      const text = hvEnv(repo, noGit, "worktree", "list");
+      expect(text.stdout).not.toContain("hayven worktree prune");
+      expect(text.stdout).toContain("unknown");
     },
     SLOW,
   );

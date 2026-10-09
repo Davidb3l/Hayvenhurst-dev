@@ -47,9 +47,12 @@ export interface WorktreeEntry {
   readonly seed_head: string | null;
 }
 
+/** The registry's file name inside `.hayven/`. */
+export const WORKTREE_REGISTRY_FILE = "worktrees.json";
+
 /** `<main>/.hayven/worktrees.json`. */
 export function worktreeRegistryFile(paths: HayvenPaths): string {
-  return join(paths.hayvenDir, "worktrees.json");
+  return join(paths.hayvenDir, WORKTREE_REGISTRY_FILE);
 }
 
 /** `<main>/.hayven/worktrees` — parent of every overlay directory. */

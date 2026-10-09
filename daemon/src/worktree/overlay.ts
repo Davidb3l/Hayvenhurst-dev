@@ -30,7 +30,7 @@
  *   - One refresh per overlay at a time (`refresh.lock`); a waiter re-checks
  *     the fingerprint after the lock, so N concurrent reads cost one ingest.
  */
-import { existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { HayvenConfig } from "../config/defaults.ts";
@@ -47,8 +47,8 @@ import { startParse } from "../native/process.ts";
 import { withFileLock } from "../util/file_lock.ts";
 import { rootLogger, type Logger } from "../util/log.ts";
 import type { HayvenPaths } from "../util/paths.ts";
-import { gitStatus, isAncestor, worktreeFingerprint, type WorktreeFingerprint } from "./git.ts";
-import { overlayDir, overlayNodesDir, overlaySqlitePath, type WorktreeEntry } from "./registry.ts";
+import { gitProbe, gitStatus, isAncestor, worktreeFingerprint, type WorktreeFingerprint } from "./git.ts";
+import { overlayDir, overlayNodesDir, overlaySqlitePath, worktreesDir, type WorktreeEntry } from "./registry.ts";
 
 /** Same ceiling as `cli/ingest.ts`: past this, a clean full parse is simpler and not slower. */
 export const OVERLAY_INCREMENTAL_CAP = 2000;
@@ -64,6 +64,37 @@ const DIRTY_KEY = "overlay_dirty";
  * destructive write.
  */
 const SEED_PENDING_KEY = "overlay_seed_pending";
+/** Value prefix of the in-progress marker a seed writes (see `seedFromMain`). */
+const SEED_MARKER_PREFIX = "overlay-seed:";
+
+/**
+ * Test seams. `afterSeedCopy` runs on the temp seed right after it is copied
+ * from main and before it is checked, so a test can make the copy look exactly
+ * like one taken mid-ingest without racing a real daemon.
+ */
+export const overlayTestHooks: { afterSeedCopy?: (tmpPath: string) => void } = {};
+
+/**
+ * Say ONCE per project why a worktree was fully parsed instead of seeded: the
+ * main index was built before any worktree was registered, so it carries no
+ * record of its uncommitted files. Main's next ingest (or daemon re-index)
+ * writes one, after which overlays seed incrementally.
+ */
+function noteMissingDirtyRecordOnce(target: OverlayTarget): void {
+  const flag = join(worktreesDir(target.paths), ".dirty-record-noted");
+  if (existsSync(flag)) return;
+  process.stderr.write(
+    "note: the main index has no record of which files were uncommitted when it was built, so this worktree " +
+      "overlay is built with a full parse. The next `hayven ingest` (or daemon re-index) in the main checkout " +
+      "records it, and later overlays seed incrementally.\n",
+  );
+  try {
+    mkdirSync(worktreesDir(target.paths), { recursive: true });
+    writeFileSync(flag, "");
+  } catch {
+    // worst case the note repeats
+  }
+}
 
 const SQLITE_FILES = ["", "-wal", "-shm", "-journal"] as const;
 
@@ -128,7 +159,14 @@ function readOverlayState(sqlite: string): OverlayState | null {
       dirty,
       head: db.getStat("last_ingest_git_head"),
       integrityOk: integrity.ok,
-      seedPending: db.getStat(SEED_PENDING_KEY) === "1",
+      // Pending only if the flag is set AND the sole thing wrong is OUR seed
+      // marker. Any other marker (main's own in-flight ingest carried over in
+      // the copy, or a refresh that died mid-purge) means the graph may be
+      // partial, and a partial graph must be rebuilt, never amended.
+      seedPending:
+        db.getStat(SEED_PENDING_KEY) === "1" &&
+        integrity.reason === "ingest-interrupted" &&
+        (db.getStat(INGEST_IN_PROGRESS_KEY) ?? "").startsWith(SEED_MARKER_PREFIX),
       nodes: db.counts().nodes,
     };
   } catch (err) {
@@ -182,32 +220,52 @@ function seedFromMain(target: OverlayTarget, sqlite: string): { from: string } |
   removeSqliteFiles(tmp);
   copySqlite(src, tmp);
 
-  const current = gitStatus(target.paths.repoRoot)?.paths ?? null;
+  overlayTestHooks.afterSeedCopy?.(tmp);
+
   const db = new Db(tmp);
   try {
-    const recorded = readIngestDirty(db);
-    if (recorded === null && current === null) {
-      // We cannot say what uncommitted content the main index holds. A full
-      // parse of the worktree is slower but cannot serve someone else's edits.
+    // CHECK THE COPY, NOT THE SOURCE. `hasSeedableContent(src)` above ran
+    // BEFORE the copy; a daemon ingest that starts in between leaves the copy
+    // holding main's own in-progress marker over a half-written graph. Writing
+    // our seed marker over that would launder it into a "pending seed" that
+    // the next step amends and stamps fresh. A copy that is not provably whole
+    // is abandoned, and the worktree gets a full parse instead.
+    const integrity = db.checkIndexIntegrity();
+    const abandon = (why: string): null => {
       db.close();
       removeSqliteFiles(tmp);
+      rootLogger().child("worktree").info("overlay seed abandoned; full parse instead", {
+        worktree: target.entry.path,
+        why,
+      });
       return null;
+    };
+    if (!integrity.ok || integrity.nodes <= 0) {
+      return abandon(`main index copy is not whole (${integrity.reason}: ${integrity.detail})`);
     }
+    // What uncommitted content does the main index hold? Without a usable
+    // record we cannot say, and amending a seed whose dirt we cannot name could
+    // serve main's edits as the worktree's code. A full parse cannot.
+    const recorded = readIngestDirty(db);
     if (recorded === null) {
-      process.stderr.write(
-        "note: the main index does not record which files were dirty when it was built (it predates this " +
-          "hayven); seeding against main's current changes only. Run `hayven ingest` in the main checkout to fix.\n",
-      );
+      noteMissingDirtyRecordOnce(target);
+      return abandon("main index has no last_ingest_dirty record");
     }
-    const dirty = [...new Set([...(recorded ?? []), ...(current ?? [])])].sort();
+    if (recorded.kind !== "paths") return abandon(`main's dirty record is ${recorded.kind}`);
+    const current = gitStatus(target.paths.repoRoot)?.paths ?? null;
+    if (current === null) return abandon("git status failed in the main checkout");
+    const dirty = [...new Set([...recorded.paths, ...current])].sort();
     db.transaction(() => {
       db.setStat(DIRTY_KEY, JSON.stringify(dirty));
       db.setStat(STAMP_KEY, "");
       db.setStat(SEED_PENDING_KEY, "1");
-      // A legacy-format marker on purpose: it is ADOPTABLE, so the refresh that
-      // reconciles this seed takes it over with `beginIngest` and retracts it
-      // with its own success, instead of leaving an orphan token behind.
-      db.setStat(INGEST_IN_PROGRESS_KEY, String(Date.now()));
+      // OUR marker, recognizably so. Two properties matter: it is ADOPTABLE
+      // (it parses as an unowned declaration, so the refresh that reconciles
+      // this seed takes it over with `beginIngest` and retracts it on success
+      // instead of leaving an orphan), and it is DISTINGUISHABLE from any
+      // marker main itself wrote, so `usable()` can accept "pending seed" for
+      // this marker and for nothing else.
+      db.setStat(INGEST_IN_PROGRESS_KEY, `${SEED_MARKER_PREFIX}${Date.now()}`);
     });
     // Back to a self-contained, non-WAL file before the rename (see copySqlite).
     db.handle.exec("PRAGMA wal_checkpoint(TRUNCATE)");
@@ -396,6 +454,13 @@ export async function refreshOverlay(target: OverlayTarget, opts: RefreshOptions
       includeFixtures,
     };
 
+    // A full parse over a BROKEN overlay starts from an empty file. Clearing
+    // the graph in place would keep the dead refresh's in-progress token, and
+    // `clearGraph` only reaps tokens whose owner is provably dead, so a token
+    // it cannot judge would leave the rebuilt overlay reading broken forever.
+    // (A pending seed is not broken, and an abandoned reseed already left the
+    // previous file untouched; only a genuinely unhealthy one is discarded.)
+    if (plan === null && state !== null && !state.integrityOk && !state.seedPending) removeSqliteFiles(sqlite);
     const db = openWritable(sqlite);
     let reresolved = false;
     try {
@@ -517,7 +582,8 @@ export type OverlayFreshness =
   | "stale" // will re-ingest on the next read
   | "missing" // no overlay index on disk (rebuilt on the next read)
   | "broken" // a refresh died mid-way; the next read reseeds
-  | "worktree-gone"; // `hayven worktree prune` will drop it
+  | "worktree-gone" // `hayven worktree prune` will drop it
+  | "unknown"; // git could not answer (missing, slow, failing): no verdict
 
 export interface OverlayStatus {
   readonly freshness: OverlayFreshness;
@@ -538,7 +604,15 @@ export function overlayStatus(target: OverlayTarget): OverlayStatus {
   const base = { nodes: state?.nodes ?? 0, head: state?.head ?? null, sqlitePath };
   if (!existsSync(target.entry.path)) return { ...base, freshness: "worktree-gone" };
   const fp = worktreeFingerprint(target.entry.path);
-  if (fp === null) return { ...base, freshness: "worktree-gone" };
+  if (fp === null) {
+    // "Gone" only on POSITIVE evidence, the same rule as prune: git ran and
+    // said this is not a repository. A missing, slow or failing git says
+    // nothing about the worktree, and telling the user to prune on that basis
+    // would have them delete a live worker's overlay.
+    const probe = gitProbe(target.entry.path, ["rev-parse", "--show-toplevel"]);
+    const gone = probe.kind === "exit" && /not a git repository/i.test(probe.stderr);
+    return { ...base, freshness: gone ? "worktree-gone" : "unknown" };
+  }
   if (state === null) return { ...base, freshness: "missing" };
   // A pending seed is not broken: the next read reconciles it.
   if (state.seedPending) return { ...base, freshness: "stale" };
