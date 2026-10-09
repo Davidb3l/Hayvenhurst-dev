@@ -62,8 +62,9 @@ export const PROJECTS_USAGE = `hayven projects <subcommand>
                                 now. <dur> (0, 30m, 24h, 7d; default 0) keeps the
                                 ones that have not been missing that long.
 
-Every change backs up projects.json first (projects.json.bak-YYYYMMDD-HHMMSS,
-newest 10 kept). With a daemon running, it is updated live, with no restart,
+Every change backs up projects.json first (projects.json.hayven-backup-
+YYYYMMDD-HHMMSS, newest 10 kept; hand-made projects.json.bak-* files are
+never touched). With a daemon running, it is updated live, with no restart,
 except for its PRIMARY project, which changes on \`hayven daemon restart\`.
 
 list --json prints an array of objects with these fields:

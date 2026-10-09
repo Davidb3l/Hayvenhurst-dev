@@ -332,11 +332,12 @@ function collect(): DoctorReport {
  * `doctor` is where people look when "hayven can't find my project", so the
  * ghost rows, and the exact `hayven projects` command for each, belong here.
  *
- * A WARNING, never a failure: the row is `ok:true` and `gating:false`. A
- * missing registration is a fact about one project the user may have deleted
- * on purpose, not about whether hayven WORKS, and peers read an envelope
- * `ok:false` as "hayven is absent" (SUITE_CONTRACTS §3.1). Never throws, for
- * the same reason.
+ * A WARNING, never a failure: the row is `ok:false` with `gating:false` when a
+ * root is missing, the same convention as `tier3_model` and `index_integrity`,
+ * so `computeOk` keeps the ENVELOPE `ok:true`. A missing registration is a fact
+ * about one project the user may have deleted on purpose, not about whether
+ * hayven WORKS, and peers read an envelope `ok:false` as "hayven is absent"
+ * (SUITE_CONTRACTS §3.1). Never throws, for the same reason.
  *
  * Exported for tests.
  */
@@ -364,7 +365,7 @@ export function registryCheck(entries?: readonly ProjectEntry[]): DoctorCheck {
   const first = missing[0]!.alias;
   return {
     name: "registry",
-    ok: true,
+    ok: false,
     detail:
       `WARNING: ${missing.length} of ${rows.length} registered project(s) have a missing root: ${listed}. ` +
       `Moved? \`hayven projects relocate ${first} <new-root>\`. ` +

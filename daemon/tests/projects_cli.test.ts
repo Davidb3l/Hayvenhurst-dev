@@ -88,7 +88,7 @@ function makeRepo(name: string, writerId?: string, extra: Record<string, unknown
 }
 
 function backups(): string[] {
-  return readdirSync(join(home, ".hayven")).filter((n) => n.startsWith("projects.json.bak-"));
+  return readdirSync(join(home, ".hayven")).filter((n) => n.startsWith("projects.json.hayven-backup-"));
 }
 
 describe("readProjectIdentity", () => {
@@ -350,19 +350,29 @@ describe("backups", () => {
     expect(backupRegistry()).toBeNull();
   });
 
-  it("names them projects.json.bak-YYYYMMDD-HHMMSS, suffixes same-second ones, keeps the newest 10", () => {
+  it("names them projects.json.hayven-backup-YYYYMMDD-HHMMSS, suffixes same-second ones, keeps the newest 10", () => {
     registerProject(makeRepo("a"));
     const at = new Date(2026, 9, 9, 8, 7, 6);
     const made: string[] = [];
     for (let i = 0; i < 13; i++) made.push(backupRegistry(at)!);
-    expect(made[0]!.endsWith("projects.json.bak-20261009-080706")).toBe(true);
-    expect(made[1]!.endsWith("projects.json.bak-20261009-080706-2")).toBe(true);
+    expect(made[0]!.endsWith("projects.json.hayven-backup-20261009-080706")).toBe(true);
+    expect(made[1]!.endsWith("projects.json.hayven-backup-20261009-080706-2")).toBe(true);
     const left = backups();
     expect(left).toHaveLength(10);
     // The three OLDEST went; the newest survived.
-    expect(left).toContain("projects.json.bak-20261009-080706-13");
-    expect(left).not.toContain("projects.json.bak-20261009-080706");
-    expect(left).not.toContain("projects.json.bak-20261009-080706-3");
+    expect(left).toContain("projects.json.hayven-backup-20261009-080706-13");
+    expect(left).not.toContain("projects.json.hayven-backup-20261009-080706");
+    expect(left).not.toContain("projects.json.hayven-backup-20261009-080706-3");
+  });
+
+  it("never counts or deletes hand-made projects.json.bak-* copies", () => {
+    registerProject(makeRepo("a"));
+    const dir = join(home, ".hayven");
+    writeFileSync(join(dir, "projects.json.bak-20260805-020734"), "{}\n");
+    const at = new Date(2026, 9, 9, 8, 7, 6);
+    for (let i = 0; i < 12; i++) backupRegistry(at);
+    expect(readdirSync(dir)).toContain("projects.json.bak-20260805-020734");
+    expect(backups()).toHaveLength(10);
   });
 
   it("every user-commanded mutation backs up; the daemon-start prune does not", () => {
@@ -388,7 +398,7 @@ describe("doctor registry check", () => {
       { alias: "ghost", root: join(ws, "ghost"), missing_since: "2026-10-01T00:00:00.000Z" },
     ]);
     expect(row.name).toBe("registry");
-    expect(row.ok).toBe(true);
+    expect(row.ok).toBe(false);
     expect(row.gating).toBe(false);
     expect(row.detail).toContain("WARNING");
     expect(row.detail).toContain("ghost");

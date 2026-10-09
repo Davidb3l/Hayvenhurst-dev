@@ -137,7 +137,7 @@ hayven projects prune [--missing-for 7d] [--dry-run]   # forget every project wh
 
 Moving a repo usually needs no command at all. Each project's `.hayven/config.json` carries a `writer_id` that moves with it, so the next `hayven daemon start` (or `daemon register`) from the new location recognizes the repo and keeps its alias instead of registering `<alias>-2`. When it cannot prove the match (the old entry predates this, or the ids differ), it registers the repo normally and prints the exact `hayven projects relocate` command. `hayven doctor` lists any registered project whose folder is missing.
 
-Every change backs up `projects.json` first (`projects.json.bak-YYYYMMDD-HHMMSS`, newest 10 kept). With a daemon running, it is updated live, except for the project the daemon was started from (its primary), which picks up the change on `hayven daemon restart`. `hayven projects help` documents every flag and JSON field.
+Every change backs up `projects.json` first (`projects.json.hayven-backup-YYYYMMDD-HHMMSS`, newest 10 kept; hand-made `.bak-*` copies are never touched). With a daemon running, it is updated live, except for the project the daemon was started from (its primary), which picks up the change on `hayven daemon restart`. `hayven projects help` documents every flag and JSON field.
 
 Daemon output goes to `~/.hayven/logs/daemon.out.log` (structured logs in `~/.hayven/logs/daemon.log`); check there if `start` reports the daemon did not become healthy.
 

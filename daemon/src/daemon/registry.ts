@@ -1069,10 +1069,17 @@ export function recordProjectIdentities(roots: readonly string[]): void {
 // mattered.
 // ---------------------------------------------------------------------------
 
-/** How many `projects.json.bak-*` files survive. Newest first. */
+/**
+ * How many `projects.json.hayven-backup-*` files survive. Newest first.
+ *
+ * Only OUR backups count toward the cap and only ours are ever deleted. People
+ * already keep hand-made `projects.json.bak-*` copies next to the registry
+ * (from hand-editing it before this command existed); a cap that matched those
+ * would quietly delete a user's own backup ten mutations later.
+ */
 const BACKUPS_KEPT = 10;
 
-/** `YYYYMMDD-HHMMSS` in LOCAL time, matching backups users already made by hand. */
+/** `YYYYMMDD-HHMMSS` in LOCAL time, the stamp format of hand-made backups too. */
 function backupStamp(d: Date): string {
   const p = (n: number): string => String(n).padStart(2, "0");
   return (
@@ -1082,7 +1089,7 @@ function backupStamp(d: Date): string {
 }
 
 /**
- * Copy `projects.json` to `projects.json.bak-YYYYMMDD-HHMMSS` (suffixed `-2`,
+ * Copy `projects.json` to `projects.json.hayven-backup-YYYYMMDD-HHMMSS` (suffixed `-2`,
  * `-3`, … when two mutations land in one second) and keep only the newest
  * {@link BACKUPS_KEPT}. Returns the backup path, or null when there was no file
  * to back up.
@@ -1103,7 +1110,7 @@ export function backupRegistry(now: Date = new Date()): string | null {
   } catch {
     return null; // nothing registered yet: nothing to lose
   }
-  const base = `${file}.bak-${backupStamp(now)}`;
+  const base = `${file}.hayven-backup-${backupStamp(now)}`;
   // Next suffix = ONE MORE THAN THE HIGHEST already present, not the first
   // free one. Once the cap below has deleted the oldest backup of a second,
   // "first free" would hand its name (the bare stamp) to the NEWEST copy, and
@@ -1136,7 +1143,7 @@ export function backupRegistry(now: Date = new Date()): string | null {
 function trimBackups(): void {
   try {
     const dir = globalHayvenDir();
-    const prefix = `${basename(registryFile())}.bak-`;
+    const prefix = `${basename(registryFile())}.hayven-backup-`;
     const backups = readdirSync(dir)
       .filter((name) => name.startsWith(prefix))
       .map((name) => {
