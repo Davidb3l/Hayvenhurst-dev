@@ -98,15 +98,31 @@ Tys=
 -----END PGP PUBLIC KEY BLOCK-----
 ```
 
+## Verifying releases
+
+Every release since v0.0.6 is signed with [Sigstore](https://www.sigstore.dev/) by this repository's release workflow (keyless, GitHub OIDC). Each platform tarball on the [releases page](https://github.com/Davidb3l/Hayvenhurst-dev/releases) ships with a `.sha256` checksum and a `.sigstore.json` bundle. The installers (`plugin/scripts/install-hayven.sh` and `install-hayven.ps1`) check both and refuse a bad or missing signature. To verify by hand:
+
+```sh
+TAG=v0.0.7; T=hayvenhurst-${TAG#v}-macos-arm64.tar.gz
+shasum -a 256 -c "$T.sha256"
+cosign verify-blob --bundle "$T.sigstore.json" \
+  --certificate-identity "https://github.com/Davidb3l/Hayvenhurst-dev/.github/workflows/release.yml@refs/tags/$TAG" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  "$T"
+```
+
+Pin the identity to the exact tag: a signature from any other workflow or repository is not ours. The checksum alone only catches a corrupted download, since it is served from the same place as the tarball.
+
 ## Threat model
 
-The full threat model lives in section 14.6 of the PRD. Summary of what Hayvenhurst is designed to mitigate:
+Summary of what Hayvenhurst is designed to mitigate, and how far each defense goes today:
 
-- **Malicious agent claims** — guarded by the three-layer conflict defense (semantic claims, pre-merge verify, adversarial preview).
-- **Prompt injection via codebase content** — daemon treats LLM-generated summaries as data, not commands.
-- **Sync data tampering** — operations are content-addressed (Blake3); peers are authenticated via public-key challenge.
-- **Native binary tampering** — release tarballs are signed via Sigstore; daemon refuses unsigned binaries in default config.
-- **Skill injection** — Hayvenhurst ships a single first-party Skill. No third-party marketplace in v1.
+- **Malicious agent claims**: guarded by the three-layer conflict defense (semantic claims, pre-merge verify, adversarial preview).
+- **Prompt injection via codebase content**: the daemon treats LLM-generated summaries as data, not commands, and the context packer only reads files inside the repository, refusing credential-shaped paths.
+- **Remote access to the daemon**: it binds to loopback by default, refuses a non-loopback bind without `--allow-remote-access`, checks the `Host` header (DNS-rebinding defense), and origin-gates cross-origin mutations and WebSocket upgrades. The daemon has no user authentication, so the loopback bind is the boundary.
+- **Sync data tampering**: operations are content-addressed (Blake3), so a corrupted or altered operation does not match its id. Peers exchange a writer identity, but that identity is self-asserted, **not authenticated**: anyone who can reach a daemon's sync routes can claim any writer id. Peer authentication (RFC-002, shared-secret pairing) is designed but not built; until then, do not expose sync beyond machines you trust.
+- **Release tampering**: release tarballs are signed via Sigstore and the installers verify the signature (see above). A binary you place on disk yourself is not re-verified at runtime.
+- **Skill injection**: Hayvenhurst ships a single first-party Skill. No third-party marketplace in v1.
 
 Out of scope:
 

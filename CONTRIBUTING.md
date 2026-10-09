@@ -45,11 +45,15 @@ cd daemon && bun run dev
 1. Open an issue first if your change is non-trivial — saves you wasted work if the direction is wrong.
 2. Branch from `main`. Keep branches focused; one logical change per PR.
 3. Add tests for behavior changes.
-4. Run the linter and type checker (`bun run check` in `daemon/`, `cargo clippy` in `native/`).
+4. Run the type checker and lints (`bun run typecheck` at the repo root, `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` in `native/`).
 5. Sign off every commit (`git commit -s`).
 6. Open the PR with the template. The PR title becomes the commit message after squash merge.
 
 The maintainer aims to respond within a few days. If the PR is not the right fit, you will hear why and what would change that.
+
+## Questions
+
+See [SUPPORT.md](SUPPORT.md) for where to ask.
 
 ## Reporting bugs
 
