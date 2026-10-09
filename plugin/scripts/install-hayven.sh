@@ -1,21 +1,49 @@
 #!/bin/sh
-# install-hayven.sh — download + install the platform-correct `hayven` (and
+# install-hayven.sh - download + install the platform-correct `hayven` (and
 # `hayven-native`) binaries from a Hayvenhurst GitHub Release.
 #
 # WHY this exists: the Claude Code plugin is git-based, so installing the
 # plugin only clones the repo's text files (the Agent Skill). It does NOT
-# deliver the compiled `hayven` CLI / `hayven-native` binary — those are
+# deliver the compiled `hayven` CLI / `hayven-native` binary - those are
 # platform-specific and large, and are deliberately NOT committed to git.
 # Claude Code has no native "ship a binary with a plugin" mechanism that
 # fits that constraint (the plugin `bin/` directory only exposes executables
 # already committed to the plugin repo). So this script is the realistic
 # bridge: detect the OS/arch, map to the matching release tarball asset
 # (mirroring .github/workflows/release.yml's platform matrix), download it,
-# verify its sha256 against the published `<tarball>.sha256`, and install the
-# binaries into a known location.
+# verify its sha256 and its Sigstore signature, and install the binaries into
+# a known location.
 #
-# Idempotent + safe to re-run. POSIX sh (macOS / Linux). Windows is not
-# covered here — see the note in plugin/README.md.
+# SECURITY: the `<tarball>.sha256` is served from the same origin as the
+# tarball, so on its own it only catches a corrupted download, not a tampered
+# release: anyone who can replace the tarball can replace its checksum too.
+# Authenticity comes from the Sigstore bundle (`<tarball>.sigstore.json`), whose
+# Fulcio certificate binds the artifact to THIS repo's release workflow. We pin
+# both the signer identity and the OIDC issuer; otherwise an attacker could sign
+# a malicious tarball with their own identity and it would still "verify".
+#
+# A bad signature ALWAYS aborts. A MISSING bundle ALWAYS aborts: the tarball
+# came from the same origin and every release since v0.0.6 publishes a bundle,
+# so "tarball but no bundle" is a signature-stripping downgrade, not a benign
+# 404. (v0.0.5 and older predate signing; install those by hand.)
+#
+# The one soft case is a box with no verifier installed (`cosign` or
+# `sigstore`): we cannot check, so we warn loudly and continue on TLS plus the
+# checksum. An attacker cannot induce that state remotely (it depends on what is
+# installed locally). Pass --require-signature (or HAYVEN_REQUIRE_SIGNATURE=1)
+# to make it fatal too.
+#
+# NOTE: the trust anchor follows HAYVEN_REPO. Overriding it points both the
+# download AND the expected signer at that repo, so verification then only
+# proves "that repo signed its own artifact". Do not set it to a repo you do
+# not trust.
+#
+# Idempotent + safe to re-run. POSIX sh, covering macOS, Linux AND Windows:
+# under Git Bash / MSYS2 / Cygwin `uname -s` reports MINGW*/MSYS*/CYGWIN*, and
+# this script installs the windows-x64 release asset (the binaries inside are
+# hayven.exe and hayven-native.exe). windows-x64 is the only Windows asset, so
+# a non-x64 Windows box is refused by name rather than 404ing on a download.
+# With no POSIX layer at all (PowerShell only), use install-hayven.ps1 instead.
 #
 # Usage:
 #   install-hayven.sh                 # download + install latest release
@@ -24,11 +52,13 @@
 #                                     #   already installed, 3 if missing
 #   install-hayven.sh --version vX.Y.Z   # install a specific tag
 #   install-hayven.sh --prefix DIR    # install into DIR/bin (default below)
+#   install-hayven.sh --require-signature  # abort unless the signature verifies
 #
 # Environment:
 #   HAYVEN_INSTALL_PREFIX   override the install prefix (same as --prefix)
 #   HAYVEN_RELEASE_TAG      pin a release tag (same as --version)
 #   HAYVEN_REPO             override owner/repo (default Davidb3l/Hayvenhurst-dev)
+#   HAYVEN_REQUIRE_SIGNATURE=1   same as --require-signature
 
 set -eu
 
@@ -36,7 +66,7 @@ REPO="${HAYVEN_REPO:-Davidb3l/Hayvenhurst-dev}"
 TAG="${HAYVEN_RELEASE_TAG:-}"
 # HOME may be unset or empty (launchd/systemd, some CI runners, slim
 # containers). Under `set -u` a bare `$HOME` ABORTS the script at expansion
-# time — so this hook, which SessionStart runs in every repo, died before
+# time - so this hook, which SessionStart runs in every repo, died before
 # printing anything instead of reporting install status. Resolve it ONCE and
 # tolerate absence; only the install path genuinely needs a real home, and it
 # says so below rather than silently installing into `/.local/bin`.
@@ -47,18 +77,21 @@ HOME_DIR="${HOME:-}"
 DEFAULT_PREFIX="${HAYVEN_INSTALL_PREFIX:-${CLAUDE_PLUGIN_DATA:-${HOME_DIR:+$HOME_DIR/.local}}}"
 PREFIX="$DEFAULT_PREFIX"
 MODE="install"
+# Make a missing verifier fatal. A BAD signature is fatal regardless.
+REQUIRE_SIG="${HAYVEN_REQUIRE_SIGNATURE:-0}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --check) MODE="check" ;;
+    --require-signature) REQUIRE_SIG=1 ;;
     --version)
-      [ -n "${2:-}" ] || { echo "install-hayven: --version needs a tag (e.g. v0.0.5)" >&2; exit 2; }
+      [ -n "${2:-}" ] || { echo "install-hayven: --version needs a tag (e.g. v0.0.7)" >&2; exit 2; }
       TAG="$2"; shift ;;
     --prefix)
       [ -n "${2:-}" ] || { echo "install-hayven: --prefix needs a directory" >&2; exit 2; }
       PREFIX="$2"; shift ;;
     --help|-h)
-      sed -n '2,31p' "$0"
+      sed -n '2,62p' "$0"
       exit 0
       ;;
     *) echo "install-hayven: unknown argument: $1" >&2; exit 2 ;;
@@ -80,7 +113,22 @@ if [ -z "$PREFIX" ]; then
 fi
 BIN_DIR="$PREFIX/bin"
 
-# ---- platform detection → release asset name -------------------------------
+# Host-shape facts needed BEFORE the platform -> asset mapping runs: --check
+# returns long before detect_platform is called, but it still has to look for
+# the right file name and print the right PATH advice. On Windows the release
+# tarball holds hayven.exe / hayven-native.exe, so every place that names a
+# binary on disk goes through $EXE. (MSYS/Cygwin also resolve a bare `hayven`
+# to hayven.exe, but relying on that makes the script read as if a Unix-named
+# file were installed, which it is not.)
+IS_WINDOWS=0
+IS_CYGWIN=0
+EXE=""
+case "$(uname -s)" in
+  CYGWIN*) IS_WINDOWS=1; IS_CYGWIN=1; EXE=".exe" ;;
+  MINGW*|MSYS*) IS_WINDOWS=1; EXE=".exe" ;;
+esac
+
+# ---- platform detection -> release asset name -------------------------------
 # Mirrors the matrix in .github/workflows/release.yml:
 #   linux-x64-glibc  linux-arm64  macos-x64  macos-arm64  windows-x64
 # Tarball asset name: hayvenhurst-<version>-<platform>.tar.gz
@@ -91,7 +139,11 @@ detect_platform() {
   case "$uname_s" in
     Linux)  os="linux" ;;
     Darwin) os="macos" ;;
-    *) fail "unsupported OS '$uname_s' (this script covers macOS + Linux; on Windows install from the release tarball manually, see plugin/README.md)" ;;
+    # Git Bash reports MINGW64_NT-10.0-<build>; MSYS2's msys shell reports
+    # MSYS_NT-...; Cygwin reports CYGWIN_NT-.... All three run this script
+    # fine and all three want the windows-x64 asset.
+    MINGW*|MSYS*|CYGWIN*) os="windows" ;;
+    *) fail "unsupported OS '$uname_s' (this script covers macOS, Linux, and Windows under Git Bash / MSYS / Cygwin; from PowerShell use install-hayven.ps1)" ;;
   esac
   case "$uname_m" in
     x86_64|amd64) arch="x64" ;;
@@ -101,6 +153,15 @@ detect_platform() {
   # The only x64 Linux release is the glibc build; musl is not a release target.
   if [ "$os" = "linux" ] && [ "$arch" = "x64" ]; then
     PLATFORM="linux-x64-glibc"
+  elif [ "$os" = "windows" ]; then
+    # windows-x64 is the ONLY Windows asset in release.yml's matrix. Fail here
+    # by name rather than letting the download 404 on an asset that was never
+    # built. (Windows-on-ARM usually reports x86_64 through the x64 emulation
+    # layer, in which case the x64 build is the correct answer anyway.)
+    [ "$arch" = "x64" ] || fail "no Windows release asset for CPU arch '$uname_m'.
+        The only Windows asset is hayvenhurst-<version>-windows-x64.tar.gz (x86_64).
+        Run this from an x64 Git Bash, or build hayven from source."
+    PLATFORM="windows-x64"
   else
     PLATFORM="${os}-${arch}"
   fi
@@ -111,7 +172,7 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # ---- suite awareness --------------------------------------------------------
 # Hayvenhurst is the code graph of a four-tool suite: Ametrite holds the task
 # board, Sirius Forester runs the foreman loop, Catryna Wikinelli keeps the
-# living docs. One short nudge, only when something is missing — full fleet
+# living docs. One short nudge, only when something is missing - full fleet
 # control needs all four.
 #
 # suite_repo: true when the cwd already uses any suite tool. The SessionStart
@@ -123,7 +184,7 @@ suite_repo() {
   # project" whenever a session starts in the home dir. That exact conflation,
   # in this same SessionStart hook family, is what let a daemon index the user's
   # entire home tree for six hours. Here it currently only gates a stderr nudge
-  # — but it is one behavior change away from being load-bearing again, so it
+  # - but it is one behavior change away from being load-bearing again, so it
   # gets the same guard as `ensure-daemon.sh`.
   #
   # Guard on HOME being set AND non-empty first: under `set -u` an unset HOME
@@ -181,10 +242,16 @@ fetch_stdout() { # fetch_stdout <url>
 
 sha256_of() { # sha256_of <file> -> hex on stdout
   f="$1"
+  # Fed a FILENAME containing a backslash - which is what $TMP looks like on
+  # Windows whenever TMPDIR is inherited as a native path like C:\Users\...\Temp
+  # - both shasum and sha256sum escape the output line and prefix it with a
+  # literal "\", so awk '{print $1}' yields "\<hex>" and every comparison below
+  # fails as a bogus checksum mismatch. Fed on stdin there is no filename to
+  # escape, and the digest is identical on every platform.
   if have shasum; then
-    shasum -a 256 "$f" | awk '{print $1}'
+    shasum -a 256 < "$f" | awk '{print $1}'
   elif have sha256sum; then
-    sha256sum "$f" | awk '{print $1}'
+    sha256sum < "$f" | awk '{print $1}'
   else
     fail "need shasum or sha256sum to verify the download"
   fi
@@ -211,15 +278,37 @@ resolve_latest_tag() {
   [ -n "$TAG" ] || fail "could not resolve the latest release tag for $REPO (pass --version vX.Y.Z)"
 }
 
+# On Windows a missing PATH entry is the norm, not the exception: ~/.local/bin
+# is a Unix convention that nothing on Windows puts on PATH, so a fresh install
+# lands a working hayven.exe that PowerShell, cmd, editors and Claude Code
+# cannot see. We PRINT the fix; we never mutate the user's PATH from here.
 print_path_hint() {
   case ":$PATH:" in
-    *":$BIN_DIR:"*) : ;; # already on PATH
-    *)
-      log ""
-      log "note: $BIN_DIR is not on your PATH. Add it, e.g.:"
-      log "      export PATH=\"$BIN_DIR:\$PATH\"   # add to ~/.zshrc or ~/.bashrc"
-      ;;
+    *":$BIN_DIR:"*) return 0 ;; # already on PATH
   esac
+  log ""
+  log "note: $BIN_DIR is not on your PATH."
+  if [ "$IS_WINDOWS" = "1" ]; then
+    log ""
+    log "  This shell only (Git Bash):"
+    log "      export PATH=\"$BIN_DIR:\$PATH\"   # add to ~/.bashrc to persist it here"
+    log ""
+    log "  Permanently, for ALL of Windows (PowerShell, cmd, editors, Claude Code):"
+    log "  run this ONCE in PowerShell, then close and reopen your shells:"
+    log ""
+    # Raw registry write, keeping Path's REG_EXPAND_SZ kind: the familiar
+    # [Environment]::SetEnvironmentVariable one-liner flattens it to REG_SZ,
+    # freezing every %VAR% entry. The dummy-variable delete broadcasts it.
+    log '      $d="$env:USERPROFILE\.local\bin"; $k=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("Environment"); $p=[string]$k.GetValue("Path","",[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames); $k.SetValue("Path",($p.TrimEnd(";")+";"+$d).TrimStart(";"),[Microsoft.Win32.RegistryValueKind]::ExpandString); $k.Close(); [Environment]::SetEnvironmentVariable("HAYVEN_PATH_BROADCAST",$null,"User")'
+    log ""
+    log "  That command appends the DEFAULT prefix (%USERPROFILE%\\.local\\bin)."
+    log "  You installed into: $BIN_DIR"
+    log "  If those differ, substitute the Windows form of the path above."
+    log "  (install-hayven.ps1 -AddToPath does this for you.)"
+    log "  Already-running shells, editors and apps must be RESTARTED to see it."
+  else
+    log "      export PATH=\"$BIN_DIR:\$PATH\"   # add to ~/.zshrc or ~/.bashrc"
+  fi
 }
 
 # ---- --check: status only, never downloads ---------------------------------
@@ -229,8 +318,8 @@ if [ "$MODE" = "check" ]; then
     if suite_repo; then suite_hint; fi
     exit 0
   fi
-  if [ -x "$BIN_DIR/hayven" ]; then
-    log "hayven: installed at $BIN_DIR/hayven (not on PATH)"
+  if [ -x "$BIN_DIR/hayven$EXE" ]; then
+    log "hayven: installed at $BIN_DIR/hayven$EXE (not on PATH)"
     print_path_hint
     if suite_repo; then suite_hint; fi
     exit 0
@@ -240,14 +329,108 @@ if [ "$MODE" = "check" ]; then
   exit 3
 fi
 
+# ---- signature verification --------------------------------------------------
+# Verify with whichever Sigstore verifier is on the box. Pin BOTH the signer
+# identity (this repo's release.yml, at this tag) and the OIDC issuer: an
+# unpinned verify only proves "somebody signed this", not "the release workflow
+# signed this".
+verify_signature() {
+  bundle="$1"
+  artifact="$2"
+  # Under Cygwin the verifier is almost always a NATIVE Windows program
+  # (winget's cosign.exe, a Windows python.exe), and unlike MSYS2/Git Bash,
+  # Cygwin does not rewrite POSIX path arguments for native programs - so
+  # cosign.exe would be handed "/tmp/hayven-install.X/..." and fail to open it,
+  # which reads exactly like a verification failure. Give it the Windows form.
+  # (A Cygwin-built verifier accepts C:\... paths too, so this is safe either
+  # way.) MSYS2/Git Bash already convert these arguments automatically.
+  if [ "$IS_CYGWIN" = "1" ] && have cygpath; then
+    bundle="$(cygpath -w "$bundle")"
+    artifact="$(cygpath -w "$artifact")"
+  fi
+  identity="https://github.com/$REPO/.github/workflows/release.yml@refs/tags/$TAG"
+  issuer="https://token.actions.githubusercontent.com"
+
+  sig_fail="SIGNATURE VERIFICATION FAILED for $TARBALL
+        expected signer: $identity
+        expected issuer: $issuer
+        Refusing to install: this artifact was not produced by $REPO's release workflow."
+
+  if have cosign; then
+    log "install-hayven: verifying signature (cosign)"
+    # Keep the verifier's own diagnostics: on a real identity mismatch cosign
+    # prints "expected X, got Y", and an OLD cosign (< 3.x) instead fails to
+    # parse sigstore-python v3's `.sigstore.json` bundle at all. Swallowing
+    # both makes a stale toolchain look identical to a tampered artifact.
+    if ! verify_out="$(cosign verify-blob \
+      --bundle "$bundle" \
+      --certificate-identity "$identity" \
+      --certificate-oidc-issuer "$issuer" \
+      "$artifact" 2>&1)"; then
+      fail "$sig_fail
+
+        verifier output:
+$verify_out
+
+        If your cosign predates v3.0, it cannot read this bundle format:
+        upgrade cosign (or install the \`sigstore\` python tool) and retry."
+    fi
+    log "install-hayven: signature OK (cosign)"
+    return 0
+  fi
+
+  sig_cmd=""
+  if have sigstore; then
+    sig_cmd="sigstore"
+  elif have python3 && python3 -c 'import sigstore' >/dev/null 2>&1; then
+    sig_cmd="python3 -m sigstore"
+  fi
+
+  if [ -n "$sig_cmd" ]; then
+    log "install-hayven: verifying signature (sigstore)"
+    # shellcheck disable=SC2086
+    if ! verify_out="$($sig_cmd verify identity \
+      --bundle "$bundle" \
+      --cert-identity "$identity" \
+      --cert-oidc-issuer "$issuer" \
+      "$artifact" 2>&1)"; then
+      fail "$sig_fail
+
+        verifier output:
+$verify_out"
+    fi
+    log "install-hayven: signature OK (sigstore)"
+    return 0
+  fi
+
+  if [ "$REQUIRE_SIG" = "1" ]; then
+    fail "no signature verifier found, and --require-signature was set.
+        Install one:  brew install cosign   (or)   pip install sigstore"
+  fi
+  log "install-hayven: WARNING: no signature verifier (cosign / sigstore) found."
+  log "install-hayven: WARNING: proceeding on TLS + checksum alone, which cannot"
+  log "install-hayven: WARNING: detect a tampered release. To verify provenance:"
+  log "install-hayven: WARNING:   brew install cosign  (or)  pip install sigstore"
+  log "install-hayven: WARNING: then re-run with --require-signature."
+}
+
 # ---- install ---------------------------------------------------------------
 detect_platform
 resolve_latest_tag
+# Release tags are always v-prefixed. Accept a bare "0.0.7" from --version /
+# HAYVEN_RELEASE_TAG as "v0.0.7" (as install-hayven.ps1 does) instead of
+# building a /releases/download/0.0.7/ URL that 404s. A tag resolved from
+# /releases/latest already carries its "v", so this leaves it untouched.
+case "$TAG" in
+  v*) ;;
+  *) TAG="v$TAG" ;;
+esac
 VERSION="${TAG#v}"
 TARBALL="hayvenhurst-${VERSION}-${PLATFORM}.tar.gz"
 BASE_URL="https://github.com/$REPO/releases/download/$TAG"
 TARBALL_URL="$BASE_URL/$TARBALL"
 CHECKSUM_URL="$TARBALL_URL.sha256"
+BUNDLE_URL="$TARBALL_URL.sigstore.json"
 
 log "install-hayven: repo=$REPO tag=$TAG platform=$PLATFORM"
 log "install-hayven: asset=$TARBALL"
@@ -256,18 +439,38 @@ log "install-hayven: asset=$TARBALL"
 if [ "${HAYVEN_INSTALL_DRY_RUN:-}" = "1" ]; then
   log "DRY RUN: would download: $TARBALL_URL"
   log "DRY RUN: would verify:   $CHECKSUM_URL"
+  log "DRY RUN: would verify:   $BUNDLE_URL"
   log "DRY RUN: would install into: $BIN_DIR"
   exit 0
 fi
 
-TMP="$(mktemp -d "${TMPDIR:-/tmp}/hayven-install.XXXXXX")"
-trap 'rm -rf "$TMP"' EXIT INT TERM
+# Windows inherits TMPDIR as a NATIVE path (C:\Users\...\Temp) often enough to
+# matter here, and GNU tar reads a leading "C:" as a remote host:path spec -
+# `tar -xzf C:\...\x.tar.gz` dies with "Cannot connect to C: resolve failed"
+# rather than extracting anything. Fall back to the POSIX /tmp that MSYS always
+# provides when TMPDIR looks native.
+TMP_BASE="${TMPDIR:-/tmp}"
+if [ "$IS_WINDOWS" = "1" ]; then
+  case "$TMP_BASE" in
+    *\\*|?:*) TMP_BASE="/tmp" ;;
+  esac
+fi
+TMP="$(mktemp -d "$TMP_BASE/hayven-install.XXXXXX")"
+# Cleanup on EXIT only. A trap on INT/TERM that just cleans up RETURNS, and the
+# shell then carries on with the next command: Ctrl-C would delete the temp dir
+# and the install would keep going against files that are gone (or, run from a
+# parent installer, report success). A signal must stop the run, with the
+# conventional 128+N status so a caller can tell "interrupted" from "failed".
+trap 'rm -rf "$TMP"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 log "install-hayven: downloading $TARBALL_URL"
 fetch "$TARBALL_URL" "$TMP/$TARBALL" || fail "download failed: $TARBALL_URL (does a release exist for $TAG / $PLATFORM?)"
 
 # Verify sha256 against the published per-asset checksum file. The release
-# publishes `<tarball>.sha256` in the `shasum -a 256` format: "<hex>  <name>".
+# publishes `<tarball>.sha256` in the `shasum -a 256` format: "<hex>  <name>"
+# (the Windows runner's sha256sum writes "<hex> *<name>"; field 1 is the same).
 log "install-hayven: verifying sha256"
 checksum_line="$(fetch_stdout "$CHECKSUM_URL" 2>/dev/null || true)"
 [ -n "$checksum_line" ] || fail "could not fetch checksum: $CHECKSUM_URL"
@@ -281,27 +484,52 @@ if [ "$expected" != "$actual" ]; then
 fi
 log "install-hayven: checksum OK ($actual)"
 
+# Authenticity. The checksum above came from the same origin as the tarball, so
+# it proves nothing about provenance on its own.
+#
+# A missing bundle is ALWAYS fatal, never a skip. The tarball just downloaded
+# from this same origin, and every release since v0.0.6 publishes
+# <tarball>.sigstore.json (release.yml refuses to publish without it). So
+# "tarball present, bundle absent" is not a benign 404 - it is exactly what an
+# attacker who can serve a tampered tarball would return in order to strip the
+# signature and downgrade us to the checksum, which they also control.
+log "install-hayven: fetching signature bundle"
+fetch "$BUNDLE_URL" "$TMP/$TARBALL.sigstore.json" 2>/dev/null || fail "no Sigstore bundle at $BUNDLE_URL
+        The tarball downloaded but its signature did not. Refusing to install.
+        Every Hayvenhurst release since v0.0.6 publishes <tarball>.sigstore.json,
+        so a missing bundle means the release is malformed or the download was
+        tampered with. (v0.0.5 and older predate signing: install those by hand
+        from the release page, checking the .sha256.)"
+verify_signature "$TMP/$TARBALL.sigstore.json" "$TMP/$TARBALL"
+
 log "install-hayven: extracting"
 tar -xzf "$TMP/$TARBALL" -C "$TMP"
 # The tarball expands to a top-level dir: hayvenhurst-<version>-<platform>/
 STAGE="$TMP/hayvenhurst-${VERSION}-${PLATFORM}"
 [ -d "$STAGE" ] || fail "unexpected tarball layout (no $STAGE)"
-[ -f "$STAGE/hayven" ] || fail "tarball is missing the hayven binary"
+[ -f "$STAGE/hayven$EXE" ] || fail "tarball is missing the hayven$EXE binary"
 
 mkdir -p "$BIN_DIR"
 # Install both binaries; install hayven-native beside hayven so the daemon's
 # subprocess transport finds it. Atomic-ish: write then move into place.
-install_one() { # install_one <name>
+install_one() { # install_one <file name>
   name="$1"
   [ -f "$STAGE/$name" ] || return 0
   tmp_dst="$BIN_DIR/.$name.tmp.$$"
   cp "$STAGE/$name" "$tmp_dst"
+  # Harmless (and still the right thing) under MSYS/Cygwin, which map the x bit
+  # onto the file's ACL.
   chmod +x "$tmp_dst"
-  mv -f "$tmp_dst" "$BIN_DIR/$name"
+  # A running hayven.exe holds a lock on its file on Windows, so the rename
+  # fails there. Say which process to stop rather than leaving a stray temp.
+  if ! mv -f "$tmp_dst" "$BIN_DIR/$name"; then
+    rm -f "$tmp_dst"
+    fail "could not replace $BIN_DIR/$name - is hayven running? Stop it (hayven daemon stop) and re-run."
+  fi
   log "install-hayven: installed $BIN_DIR/$name"
 }
-install_one hayven
-install_one hayven-native
+install_one "hayven$EXE"
+install_one "hayven-native$EXE"
 
 # Bundle viewer/dist + skill/ beside the binary too, so a plugin install gets
 # the same layout a tarball install does (resolveViewerDist / resolveSkillSource

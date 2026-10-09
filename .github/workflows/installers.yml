@@ -1,0 +1,107 @@
+# Smoke-test the release installers on a real Windows box.
+#
+# install-hayven.ps1 cannot be exercised on the macOS/Linux machines it is
+# developed on (no Windows PowerShell 5.1 there), and install-hayven.sh's
+# Git Bash path only runs for real under MINGW. This job installs the latest
+# published release through each of them on windows-latest: PowerShell 5.1,
+# PowerShell 7, and Git Bash. It downloads from GitHub Releases, so it only
+# runs when the installers (or this file) change.
+name: Installers
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "plugin/scripts/install-hayven.*"
+      - ".github/workflows/installers.yml"
+  pull_request:
+    paths:
+      - "plugin/scripts/install-hayven.*"
+      - ".github/workflows/installers.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows installers (PS 5.1, PS 7, Git Bash)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: install-hayven.ps1 under Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pfx = Join-Path $env:RUNNER_TEMP 'ps51'
+          # Record the user Path's registry kind so -AddToPath can be checked
+          # for the REG_EXPAND_SZ -> REG_SZ flattening bug.
+          $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment')
+          $kindBefore = if ($k -and ($k.GetValueNames() -contains 'Path')) { $k.GetValueKind('Path') } else { 'absent' }
+          if ($k) { $k.Close() }
+          Write-Host "user Path kind before: $kindBefore"
+
+          & .\plugin\scripts\install-hayven.ps1 -Prefix $pfx -AddToPath
+          if ($LASTEXITCODE -ne 0) { throw "install exited $LASTEXITCODE" }
+          $exe = Join-Path $pfx 'bin\hayven.exe'
+          foreach ($f in @('bin\hayven.exe', 'bin\hayven-native.exe', 'bin\skill\hayvenhurst.md')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $pfx $f))) { throw "missing $f" }
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $pfx 'bin\viewer\dist'))) { throw 'missing viewer\dist' }
+          $v = & $exe --version
+          Write-Host "installed: $v"
+
+          $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment')
+          $kindAfter = $k.GetValueKind('Path')
+          $raw = [string]$k.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+          $k.Close()
+          Write-Host "user Path kind after: $kindAfter"
+          if ($kindBefore -ne 'absent' -and "$kindAfter" -ne "$kindBefore") { throw "user Path kind changed: $kindBefore -> $kindAfter" }
+          if ($kindBefore -eq 'absent' -and "$kindAfter" -ne 'ExpandString') { throw "new user Path written as $kindAfter, want ExpandString" }
+          if (-not $raw.Contains((Join-Path $pfx 'bin'))) { throw 'bin dir not added to user Path' }
+
+          # Idempotent: a second run is a no-op, not a re-download. (The
+          # installer logs via [Console]::Error, which 2>&1 cannot capture, so
+          # judge by the binary's write time instead of its output.)
+          $before = (Get-Item -LiteralPath $exe).LastWriteTimeUtc
+          & .\plugin\scripts\install-hayven.ps1 -Prefix $pfx
+          if ($LASTEXITCODE -ne 0) { throw "re-run exited $LASTEXITCODE" }
+          if ((Get-Item -LiteralPath $exe).LastWriteTimeUtc -ne $before) { throw 're-run replaced the binary; want a no-op' }
+
+          # -Check reports the prefix install and exits 0.
+          & .\plugin\scripts\install-hayven.ps1 -Prefix $pfx -Check
+          if ($LASTEXITCODE -ne 0) { throw "-Check exited $LASTEXITCODE" }
+          $global:LASTEXITCODE = 0
+
+      - name: install-hayven.ps1 under PowerShell 7, pinned bare version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pfx = Join-Path $env:RUNNER_TEMP 'ps7'
+          # -Check on an empty prefix exits 3. (A fresh step: the previous
+          # step's -AddToPath reached the registry, not this process's PATH.)
+          & ./plugin/scripts/install-hayven.ps1 -Prefix (Join-Path $env:RUNNER_TEMP 'empty') -Check
+          if ($LASTEXITCODE -ne 3) { throw "-Check (missing) exited $LASTEXITCODE, want 3" }
+          & ./plugin/scripts/install-hayven.ps1 -Prefix $pfx -Version 0.0.7
+          if ($LASTEXITCODE -ne 0) { throw "install exited $LASTEXITCODE" }
+          $v = & (Join-Path $pfx 'bin/hayven.exe') --version
+          if ("$v" -notmatch '0\.0\.7') { throw "wrong version: $v" }
+
+          # A release that predates signing has no bundle: must fail closed.
+          & ./plugin/scripts/install-hayven.ps1 -Prefix (Join-Path $env:RUNNER_TEMP 'old') -Version v0.0.5
+          if ($LASTEXITCODE -ne 1) { throw "v0.0.5 (no bundle) exited $LASTEXITCODE, want 1" }
+          if (Test-Path -LiteralPath (Join-Path $env:RUNNER_TEMP 'old\bin\hayven.exe')) { throw 'unsigned release was installed' }
+          $global:LASTEXITCODE = 0
+
+      - name: install-hayven.sh under Git Bash
+        shell: bash
+        run: |
+          set -eu
+          pfx="$RUNNER_TEMP/gitbash"
+          sh plugin/scripts/install-hayven.sh --prefix "$pfx"
+          test -f "$pfx/bin/hayven.exe"
+          test -f "$pfx/bin/hayven-native.exe"
+          "$pfx/bin/hayven.exe" --version
+          sh plugin/scripts/install-hayven.sh --prefix "$pfx" --check

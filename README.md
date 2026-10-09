@@ -20,13 +20,20 @@ Hayvenhurst keeps a **live graph** of your code instead: every function, class, 
 
 ## Install
 
-Prebuilt binaries for **macOS (arm64, x64), Linux (x64-glibc, arm64), and Windows (x64)** ship with every [GitHub release](https://github.com/Davidb3l/Hayvenhurst-dev/releases). The install script detects your platform, downloads the matching tarball, **verifies its sha256** against the published `.sha256` file, and installs `hayven` + `hayven-native` into `~/.local/bin` (macOS/Linux):
+Prebuilt binaries for **macOS (arm64, x64), Linux (x64-glibc, arm64), and Windows (x64)** ship with every [GitHub release](https://github.com/Davidb3l/Hayvenhurst-dev/releases). The install script detects your platform, downloads the matching tarball, **verifies its sha256 and its Sigstore signature** (pinned to this repo's release workflow), and installs `hayven` + `hayven-native` into `~/.local/bin`. macOS, Linux, and Windows under Git Bash / MSYS2 / Cygwin:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Davidb3l/Hayvenhurst-dev/main/plugin/scripts/install-hayven.sh | sh
 ```
 
-Prefer to verify by hand? Grab the tarball and its `.sha256` from the [releases page](https://github.com/Davidb3l/Hayvenhurst-dev/releases), run `shasum -a 256 -c <tarball>.sha256`, and put the extracted `hayven` on your `PATH` (this is also the Windows path). Or build from source with [Bun](https://bun.sh) 1.3+ and a [Rust toolchain](https://rustup.rs/) — see [`docs/QUICKSTART.md`](docs/QUICKSTART.md).
+Windows PowerShell (5.1 or 7), no Git Bash needed:
+
+```powershell
+irm https://raw.githubusercontent.com/Davidb3l/Hayvenhurst-dev/main/plugin/scripts/install-hayven.ps1 -OutFile install-hayven.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install-hayven.ps1 -AddToPath
+```
+
+Signature checks need `cosign` (or the `sigstore` Python tool) on your machine; without one the installers warn and fall back to the checksum, and `--require-signature` / `-RequireSignature` makes that fatal. Prefer to verify by hand? Grab the tarball, its `.sha256` and its `.sigstore.json` from the [releases page](https://github.com/Davidb3l/Hayvenhurst-dev/releases), run `shasum -a 256 -c <tarball>.sha256` and `cosign verify-blob --bundle <tarball>.sigstore.json --certificate-identity https://github.com/Davidb3l/Hayvenhurst-dev/.github/workflows/release.yml@refs/tags/<tag> --certificate-oidc-issuer https://token.actions.githubusercontent.com <tarball>`, and put the extracted `hayven` on your `PATH`. Or build from source with [Bun](https://bun.sh) 1.3+ and a [Rust toolchain](https://rustup.rs/) — see [`docs/QUICKSTART.md`](docs/QUICKSTART.md).
 
 ## Quickstart
 
