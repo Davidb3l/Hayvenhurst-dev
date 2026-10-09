@@ -60,19 +60,29 @@ import {
   DETACH_HEALTH_TIMEOUT_MS,
   type HayvenHealth,
 } from "../daemon/detach.ts";
-import { canonicalRoot, globalHayvenDir, globalLogsDir, hayvenPathsFor, type HayvenPaths } from "../util/paths.ts";
+import {
+  canonicalRoot,
+  globalHayvenDir,
+  globalLogsDir,
+  hayvenPathsFor,
+  isDirectory,
+  type HayvenPaths,
+} from "../util/paths.ts";
 import type { Logger } from "../util/log.ts";
 import { loadConfig } from "../config/load.ts";
 import {
   readRegistry,
   pruneStaleProjects,
-  registerProject,
+  recordProjectIdentities,
+  registerProjectDetailed,
   sameProjectRoot,
   unregisterProjectDetailed,
-  type ProjectEntry,
+  type AmbiguityReason,
+  type RegisterOutcome,
 } from "../daemon/registry.ts";
 import { parseMaxFiles, refuseIfOverCeiling } from "./init.ts";
 import { hotAddToRunningDaemon, requireProject } from "./_shared.ts";
+import { connectLiveDaemon } from "./projects_live.ts";
 import { VERSION } from "../version.ts";
 
 /** Hard cap on repos one daemon serves live — a DoS backstop for the add endpoint
@@ -795,6 +805,9 @@ const DAEMON_USAGE = `hayven daemon <subcommand>
   unregister <alias|path>  Remove a project from the registry. A BARE NAME is an
                            alias, never a path — pass ./name or an absolute path
                            to remove by location.
+
+To rename, relocate (after moving a repo), prune or inspect registrations
+(status, index size, what the running daemon serves), see \`hayven projects help\`.
 `;
 
 export async function runDaemon(args: ParsedArgs): Promise<number> {
@@ -861,18 +874,27 @@ async function registerDaemonProject(args: ParsedArgs): Promise<number> {
     process.stderr.write(verdict);
     return 1;
   }
-  let entry: ProjectEntry;
+  const cfg = loadConfig(root).config;
+  const base = `http://${cfg.daemon_host}:${cfg.daemon_port}`;
+  // Same rule the daemon applies to itself in `addProjectLive`: never
+  // auto-relocate onto the alias a running daemon serves as its PRIMARY. This
+  // command persists BEFORE it hot-adds, so if it re-pointed that alias here
+  // the daemon would then refuse the add (the primary cannot be retired) and
+  // the moved repo would not be served at all.
+  const live = await connectLiveDaemon(base);
+  const blockedAliases = live.kind === "up" && live.primary !== null ? [live.primary] : [];
+  let outcome: RegisterOutcome;
   try {
-    entry = registerProject(root, alias);
+    outcome = registerProjectDetailed(root, alias, { blockedAliases });
   } catch (err) {
     process.stderr.write(`error: ${(err as Error).message}\n`);
     return 1;
   }
+  const entry = outcome.entry;
   process.stdout.write(`registered ${entry.alias} → ${entry.root}\n`);
+  for (const line of relocationNotes(outcome)) process.stdout.write(`${line}\n`);
 
   // If a daemon is already up, hot-add so the repo appears WITHOUT a restart.
-  const cfg = loadConfig(root).config;
-  const base = `http://${cfg.daemon_host}:${cfg.daemon_port}`;
   const hot = await hotAddToRunningDaemon(root, base, alias);
   switch (hot.kind) {
     case "added":
@@ -895,6 +917,52 @@ async function registerDaemonProject(args: ParsedArgs): Promise<number> {
       break;
   }
   return 0;
+}
+
+/**
+ * What a register did beyond the obvious, as lines to print: a moved repo that
+ * kept its alias, or one that looks moved but could not be proven so, with the
+ * exact command that finishes the job. Shared by `daemon register` and the
+ * daemon-start path so the two can never word it differently.
+ */
+export function relocationNotes(outcome: RegisterOutcome): string[] {
+  if (outcome.relocatedFrom !== undefined) {
+    return [
+      `recognized ${outcome.entry.root} as "${outcome.entry.alias}", moved from ${outcome.relocatedFrom}; ` +
+        "kept its alias (same .hayven/config.json writer_id)",
+    ];
+  }
+  const other = outcome.ambiguousWith;
+  if (other === undefined) return [];
+  const fix = `  hayven projects relocate ${other.alias} ${outcome.entry.root}`;
+  const why: Record<Exclude<AmbiguityReason, "alias-busy">, string> = {
+    "unknown-identity": "the identity on record is unknown",
+    "id-mismatch": "the identity on record does not match this repo's",
+    "several-matches": "several missing projects carry this repo's identity",
+    "parent-missing":
+      `the folder that held it is missing too (or it was a volume's root), which looks like an ` +
+      "unmounted drive rather than a move",
+  };
+  if (outcome.ambiguousReason === "alias-busy") {
+    // The running daemon serves "<alias>" as its PRIMARY from the old root and
+    // cannot drop it live. Relocate FIRST, then restart: the other order
+    // restarts into `<alias>-N` as the primary and needs a second restart.
+    return [
+      `note: this looks like "${other.alias}" (${other.root}), moved. The running daemon serves ` +
+        `"${other.alias}" as its primary project, so it was registered as "${outcome.entry.alias}" for now. ` +
+        "To keep the alias, run:",
+      fix,
+      "  hayven daemon restart",
+    ];
+  }
+  const reason =
+    outcome.ambiguousReason !== undefined ? why[outcome.ambiguousReason] : "the move could not be proven";
+  return [
+    `note: "${other.alias}" is registered at ${other.root}, which is missing. If this repo is that one, moved, run:`,
+    fix,
+    `(that folds "${outcome.entry.alias}" back into "${other.alias}"; it was not done automatically because ` +
+      `${reason}).`,
+  ];
 }
 
 /**
@@ -2059,9 +2127,15 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
   //
   // Refuses `$HOME` (see `assertRegistrableRoot`): starting here from the home
   // dir used to register the user's whole tree as one project and index it.
+  //
+  // DETAILED, so a moved repo that kept its alias (or one that could not be
+  // matched) is SAID out loud: this is the path that used to mint `<alias>-2`
+  // silently on the first start after a move.
   let primaryAlias: string;
   try {
-    primaryAlias = registerProject(primaryPaths.repoRoot).alias;
+    const registered = registerProjectDetailed(primaryPaths.repoRoot);
+    primaryAlias = registered.entry.alias;
+    for (const line of relocationNotes(registered)) process.stdout.write(`${line}\n`);
   } catch (err) {
     process.stderr.write(`error: ${(err as Error).message}\n`);
     return 1;
@@ -2166,6 +2240,15 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
     });
   }
 
+  // Opening each project above minted its `writer_id` if it had none; record
+  // those identities now so a repo moved while this daemon serves it is still
+  // recognized (see `recordProjectIdentities`). Hygiene: never fatal.
+  try {
+    recordProjectIdentities([...runtimes.values()].map((rt) => rt.deps.paths.repoRoot));
+  } catch (err) {
+    logger.warn("could not record project identities in the registry", { error: (err as Error).message });
+  }
+
   // The primary MUST have loaded (requireProject already proved its .hayven/
   // exists), but guard defensively so we never bind an app with no primary.
   if (!runtimes.has(primaryAlias)) {
@@ -2252,9 +2335,6 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
       const already = [...runtimes.values()].find((rt) => canonicalRoot(rt.deps.paths.repoRoot) === root);
       if (already) return { alias: already.alias, root, added: false };
 
-      if (runtimes.size >= MAX_LIVE_PROJECTS) {
-        throw new Error(`project cap reached (${MAX_LIVE_PROJECTS} served) — remove one before adding another`);
-      }
       const paths = hayvenPathsFor(root);
       if (!existsSync(paths.hayvenDir)) {
         throw new Error(`no .hayven/ directory at ${root} — run \`hayven init\` there first`);
@@ -2275,7 +2355,44 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
       //
       // Persist first (this is what derives the alias), then check it against
       // the LIVE map before opening anything.
-      const entry = registerProject(root, aliasHint);
+      //
+      // The PRIMARY's alias is BLOCKED from auto-relocation: its runtime owns
+      // the port and cannot be retired below, so re-pointing its alias at a new
+      // root would leave that alias served from the old root and refuse this
+      // add, i.e. every `claim`/`sync` from a moved primary repo would fail.
+      // Blocked, the move registers as `<alias>-N` and is served now; the
+      // `alias-busy` note tells the user how to fold it back.
+      // CAP, before anything is persisted, as it was before this check moved:
+      // the cap is the backstop against an unauthenticated local POST flood,
+      // and a refused add must not leave a registry row behind. The one
+      // exception is a daemon that holds a STALE runtime (a non-primary whose
+      // root is gone): retiring it below frees the slot, so let the add
+      // through to the post-retire check.
+      if (
+        runtimes.size >= MAX_LIVE_PROJECTS &&
+        ![...runtimes.values()].some(
+          (rt) => rt.alias !== primaryAlias && !isDirectory(rt.deps.paths.repoRoot),
+        )
+      ) {
+        throw new Error(`project cap reached (${MAX_LIVE_PROJECTS} served) — remove one before adding another`);
+      }
+      const registered = registerProjectDetailed(root, aliasHint, { blockedAliases: [primaryAlias] });
+      const entry = registered.entry;
+      // Nobody reads this route's caller output for a relocation (a `claim`
+      // from a moved repo hot-adds silently), so the log is where it is said.
+      if (registered.relocatedFrom !== undefined) {
+        logger.info("registered project relocated (kept its alias)", {
+          alias: entry.alias,
+          from: registered.relocatedFrom,
+          to: entry.root,
+        });
+      } else if (registered.ambiguousWith !== undefined) {
+        logger.info("registered project may be a moved repo; not auto-relocated", {
+          alias: entry.alias,
+          candidate: registered.ambiguousWith.alias,
+          fix: `hayven projects relocate ${registered.ambiguousWith.alias} ${entry.root}`,
+        });
+      }
       // ALIAS COLLISION. `deriveAlias` only guarantees uniqueness against the
       // REGISTRY on disk, and the live `runtimes` map drifts from it: `hayven
       // daemon unregister` removes a registry entry without touching a running
@@ -2296,6 +2413,44 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
       // disagrees would both let real collisions through and refuse legitimate
       // adds. The registry write above is idempotent by root, so a refusal here
       // leaves behind at worst a re-assertion of an entry that already existed.
+      //
+      // ONE exception: a STALE runtime. When a repo is moved while the daemon
+      // serves it, the registry's auto-relocation (`registerProjectDetailed`)
+      // re-points the alias at the new root, and the runtime still held under
+      // that alias names a root that no longer exists. Refusing here would make
+      // every `claim`/`sync` from the moved repo fail until a restart, which is
+      // worse than the `-2` behavior relocation replaced. Retiring it is safe
+      // ONLY when all three hold: it is not the primary (which owns the port),
+      // it is a different root, and its root is GONE. A present repo is never
+      // evicted to make room for another.
+      const heldNow = runtimes.get(entry.alias);
+      if (
+        heldNow !== undefined &&
+        heldNow.alias !== primaryAlias &&
+        !sameProjectRoot(heldNow.deps.paths.repoRoot, root) &&
+        !isDirectory(heldNow.deps.paths.repoRoot)
+      ) {
+        logger.info("retiring a stale runtime: its registration moved", {
+          alias: entry.alias,
+          from: heldNow.deps.paths.repoRoot,
+          to: root,
+        });
+        try {
+          await retireRuntime(heldNow);
+        } catch (err) {
+          // Ownership was already dropped (see step 4 there), so the alias is
+          // free; a leaked handle on a DELETED root is logged and survivable.
+          logger.warn("stale runtime shutdown failed; continuing", { error: (err as Error).message });
+        }
+      }
+      // The cap is checked AFTER the stale runtime above is retired, not
+      // before: a move REPLACES a runtime rather than adding one, and checking
+      // first would refuse it at exactly the cap. The cost is that a refused
+      // add has already been persisted, the same trade the collision check
+      // below makes; the next start loads it if there is room.
+      if (runtimes.size >= MAX_LIVE_PROJECTS) {
+        throw new Error(`project cap reached (${MAX_LIVE_PROJECTS} served) — remove one before adding another`);
+      }
       if (runtimes.has(entry.alias)) {
         const held = runtimes.get(entry.alias)!;
         throw new Error(
@@ -2306,12 +2461,60 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
       const cfg = loadConfig(root).config;
       const runtime = initProject(entry.alias, paths, cfg);
       runtimes.set(entry.alias, runtime);
+      try {
+        recordProjectIdentities([root]); // as at startup: the open may have minted it
+      } catch (err) {
+        logger.warn("could not record the project identity", { alias: entry.alias, error: (err as Error).message });
+      }
       servedProjects.set(entry.alias, runtime.deps);
       claimPidFile(paths.pidFile); // so `stop`/`status` work from THIS repo too
       logger.info("project added live", { alias: entry.alias, root });
       notifyProjectsChanged();
       return { alias: entry.alias, root, added: true };
     });
+
+  /**
+   * Stop serving one runtime: steps 1-4 below. NOT serialized itself: callers
+   * are already inside `serializeMutation` (wrapping it again would queue it
+   * behind the very mutation that is waiting for it, a self-deadlock).
+   */
+  const retireRuntime = async (runtime: ProjectRuntime): Promise<void> => {
+    // 1. Stop NEW requests from selecting it (drop from the ROUTING map only).
+    servedProjects.delete(runtime.alias);
+    // 2. Give a request that selected it just before step 1 a bounded window to
+    //    finish before its Db is closed.
+    await new Promise((r) => setTimeout(r, REMOVE_GRACE_MS));
+    // 3. Shut the runtime down (drains ingest, stops watcher/poller, closes Db).
+    let shutdownError: Error | null = null;
+    try {
+      await runtime.shutdown();
+    } catch (err) {
+      shutdownError = err as Error;
+    }
+    // 4. Drop ownership UNCONDITIONALLY, even when the shutdown failed.
+    //
+    // The old code returned early on a shutdown error, leaving the project in
+    // `runtimes` but already gone from `servedProjects`. That is the worst of
+    // both: every READ with that alias fell through to the PRIMARY project and
+    // answered from a DIFFERENT repo's index with no error at all, while
+    // `addProjectLive` (which matches on `runtimes` by canonical root) kept
+    // reporting "already served" forever, so the project could not be
+    // recovered without restarting the daemon. The comment there claimed this
+    // avoided "orphaning a live Db" — but it orphaned it from the ROUTING map,
+    // which is the half that produces silent wrong answers. A possibly-leaked
+    // Db until the next restart is strictly the lesser failure, and unlike the
+    // old behavior it is logged.
+    runtimes.delete(runtime.alias);
+    releasePidFile(runtime.deps.paths.pidFile);
+    notifyProjectsChanged();
+    if (shutdownError !== null) {
+      logger.error("project removed live but its shutdown FAILED — its Db/watcher may leak until restart", {
+        alias: runtime.alias,
+        error: shutdownError.message,
+      });
+      throw new Error(`failed to shut down ${runtime.alias}: ${shutdownError.message}`);
+    }
+  };
 
   const removeProjectLive = (aliasOrRoot: string): Promise<boolean> =>
     serializeMutation(async () => {
@@ -2322,41 +2525,7 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
       if (runtime.alias === primaryAlias) {
         throw new Error(`cannot remove the primary project (${primaryAlias}) — it owns the daemon's port`);
       }
-      // 1. Stop NEW requests from selecting it (drop from the ROUTING map only).
-      servedProjects.delete(runtime.alias);
-      // 2. Give a request that selected it just before step 1 a bounded window to
-      //    finish before its Db is closed.
-      await new Promise((r) => setTimeout(r, REMOVE_GRACE_MS));
-      // 3. Shut the runtime down (drains ingest, stops watcher/poller, closes Db).
-      let shutdownError: Error | null = null;
-      try {
-        await runtime.shutdown();
-      } catch (err) {
-        shutdownError = err as Error;
-      }
-      // 4. Drop ownership UNCONDITIONALLY, even when the shutdown failed.
-      //
-      // The old code returned early on a shutdown error, leaving the project in
-      // `runtimes` but already gone from `servedProjects`. That is the worst of
-      // both: every READ with that alias fell through to the PRIMARY project and
-      // answered from a DIFFERENT repo's index with no error at all, while
-      // `addProjectLive` (which matches on `runtimes` by canonical root) kept
-      // reporting "already served" forever, so the project could not be
-      // recovered without restarting the daemon. The comment there claimed this
-      // avoided "orphaning a live Db" — but it orphaned it from the ROUTING map,
-      // which is the half that produces silent wrong answers. A possibly-leaked
-      // Db until the next restart is strictly the lesser failure, and unlike the
-      // old behavior it is logged.
-      runtimes.delete(runtime.alias);
-      releasePidFile(runtime.deps.paths.pidFile);
-      notifyProjectsChanged();
-      if (shutdownError !== null) {
-        logger.error("project removed live but its shutdown FAILED — its Db/watcher may leak until restart", {
-          alias: runtime.alias,
-          error: shutdownError.message,
-        });
-        throw new Error(`failed to shut down ${runtime.alias}: ${shutdownError.message}`);
-      }
+      await retireRuntime(runtime);
       // NOTE: deliberately NOT `unregisterProject`. `DELETE /api/projects/:alias`
       // is documented as "stop serving it live", and an unauthenticated localhost
       // call permanently FORGETTING a registration is not something it should be

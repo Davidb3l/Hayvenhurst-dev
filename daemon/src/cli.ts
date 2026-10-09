@@ -30,6 +30,7 @@ import { runRefs } from "./cli/refs.ts";
 import { runModels } from "./cli/models.ts";
 import { runNeighbors } from "./cli/neighbors.ts";
 import { runPlanLanes } from "./cli/plan_lanes.ts";
+import { runProjects } from "./cli/projects.ts";
 import { runNode } from "./cli/node.ts";
 import { runQuery } from "./cli/query.ts";
 import { runReindex } from "./cli/reindex.ts";
@@ -106,6 +107,8 @@ export const COMMANDS: readonly Command[] = [
     help: "view                       Open the Astro viewer at http://localhost:7777" },
   { name: "daemon", group: "common", run: runDaemon,
     help: "daemon <start|stop|status> Daemon control" },
+  { name: "projects", group: "common", run: runProjects,
+    help: "projects [list [--json]|remove|rename|relocate|prune]  Manage registered projects (fix a moved repo: relocate); `hayven projects help` for details" },
   { name: "doctor", group: "common", run: runDoctor,
     help: "doctor [--json]            Check Bun, native binary, and config (--json: the SUITE_CONTRACTS §3 discovery envelope)" },
   { name: "config", group: "common", run: runConfig,

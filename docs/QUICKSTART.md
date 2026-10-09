@@ -123,6 +123,22 @@ hayven daemon status           # running / stale / stopped (exit 0 only when run
 hayven daemon stop             # SIGTERM the recorded pid
 ```
 
+### Managing registered projects
+
+Every repo the daemon serves is listed in `~/.hayven/projects.json`. Manage it with `hayven projects` instead of editing the file:
+
+```sh
+hayven projects                          # alias, status, index size, served?, root (--json for scripts)
+hayven projects relocate <alias> <root>  # you moved a repo: point its alias at the new location
+hayven projects rename <old> <new>       # change an alias
+hayven projects remove <alias|path>      # forget one (a bare name is an alias, never a path)
+hayven projects prune [--missing-for 7d] [--dry-run]   # forget every project whose folder is gone
+```
+
+Moving a repo usually needs no command at all. Each project's `.hayven/config.json` carries a `writer_id` that moves with it, so the next `hayven daemon start` (or `daemon register`) from the new location recognizes the repo and keeps its alias instead of registering `<alias>-2`. When it cannot prove the match (the old entry predates this, the ids differ, the old location's parent folder is gone too as on an unmounted drive, the repo lived on a mount location such as `/Volumes/...` or `/mnt/...`, or the old entry is the running daemon's primary), it registers the repo normally and prints the exact `hayven projects relocate` command. `hayven doctor` lists registered projects that were missing at the last daemon start.
+
+Every change backs up `projects.json` first (`projects.json.hayven-backup-YYYYMMDD-HHMMSS`, newest 10 kept; hand-made `.bak-*` copies are never touched). With a daemon running, it is updated live, except for the project the daemon was started from (its primary), which picks up the change on `hayven daemon restart`. `hayven projects help` documents every flag and JSON field.
+
 Daemon output goes to `~/.hayven/logs/daemon.out.log` (structured logs in `~/.hayven/logs/daemon.log`); check there if `start` reports the daemon did not become healthy.
 
 The host and port come from the project config (defaults `127.0.0.1:7777`). Inspect or change them:
