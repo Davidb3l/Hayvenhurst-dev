@@ -317,9 +317,10 @@ function freshestSeed(paths: HayvenPaths, exceptKey: string): string | null {
  * decision, one derivation, no duplicate state machine.
  *
  * Still a plain `bun:sqlite` read: no `Db` wrapper, so no migrate/pragma side
- * effects on a file we are only inspecting. Never throws.
+ * effects on a file we are only inspecting. Never throws. Exported so the
+ * worktree overlays apply the SAME seed rule (`worktree/overlay.ts`).
  */
-function hasSeedableContent(path: string): boolean {
+export function hasSeedableContent(path: string): boolean {
   if (!existsSync(path)) return false;
   let db: Database | null = null;
   try {
@@ -524,8 +525,12 @@ export function gitUntracked(repoRoot: string): string[] {
  *
  * Best-effort throughout: a cleanly-closed source is already a consistent single
  * `main`, so even if every step no-ops the copy is correct; seeding never throws.
+ *
+ * Exported for the per-worktree overlays (`worktree/overlay.ts`), which seed
+ * from the main project's read index the same way a new branch seeds from a
+ * sibling, and need exactly this snapshot guarantee for the same reason.
  */
-function copySqlite(from: string, to: string): void {
+export function copySqlite(from: string, to: string): void {
   // 1. Fold the source's committed WAL into its main file.
   checkpointWal(from);
 

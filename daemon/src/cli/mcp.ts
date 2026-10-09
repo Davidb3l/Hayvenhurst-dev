@@ -23,7 +23,7 @@
  */
 import type { ParsedArgs } from "../cli.ts";
 import { createDrainAwareWriter, createContextMcpServer, runStdioLoop } from "../mcp/context_server.ts";
-import { openProjectDb, requireProject } from "./_shared.ts";
+import { openProjectDb, requireProject, sourceRoot } from "./_shared.ts";
 
 export async function runMcp(_args: ParsedArgs): Promise<number> {
   let ctx;
@@ -35,7 +35,7 @@ export async function runMcp(_args: ParsedArgs): Promise<number> {
   }
 
   const db = openProjectDb(ctx, { readonly: true });
-  const server = createContextMcpServer(db, ctx.paths.repoRoot);
+  const server = createContextMcpServer(db, sourceRoot(ctx));
 
   // Close the read handle exactly once, on either a signal or stream end.
   let closed = false;
@@ -55,7 +55,7 @@ export async function runMcp(_args: ParsedArgs): Promise<number> {
 
   // Announce on stderr (stdout is the JSON-RPC channel and must stay clean).
   process.stderr.write(
-    `hayven-context MCP server ready (stdio) for ${ctx.paths.repoRoot}\n`,
+    `hayven-context MCP server ready (stdio) for ${sourceRoot(ctx)}\n`,
   );
 
   try {

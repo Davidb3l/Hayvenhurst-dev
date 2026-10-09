@@ -9,6 +9,8 @@
  * (name + group + help line + handler), not a separate import-list edit, a
  * `switch` case, AND a hand-maintained help block that can silently drift.
  */
+import { resolve } from "node:path";
+
 import { SchemaTooNewError } from "./db/migrations.ts";
 import { runAffectedTests } from "./cli/affected_tests.ts";
 import { runBranches } from "./cli/branches.ts";
@@ -39,6 +41,9 @@ import { runSummarize } from "./cli/summarize.ts";
 import { runSync } from "./cli/sync.ts";
 import { runTraces } from "./cli/traces.ts";
 import { runView } from "./cli/view.ts";
+import { runWorktree } from "./cli/worktree.ts";
+import { prepareOverlayForRead } from "./cli/_overlay.ts";
+import { setProjectCwdOverride } from "./cli/_shared.ts";
 import { VERSION } from "./version.ts";
 
 export { VERSION };
@@ -63,6 +68,13 @@ interface Command {
   /** Help line as rendered (the text after the 2-space indent), pre-aligned. */
   help: string;
   run: (args: ParsedArgs) => Promise<number>;
+  /**
+   * The command reads the code GRAPH. Inside a registered worktree (HAYV-13)
+   * `main` refreshes that worktree's overlay index before dispatching, so the
+   * read sees the worktree's current code. Leave unset for commands that do not
+   * read the graph or that read only project-level data from the main index.
+   */
+  readsGraph?: true;
 }
 
 /**
@@ -77,27 +89,27 @@ export const COMMANDS: readonly Command[] = [
     help: "init [--max-files N|off]   Initialize .hayven/ and run a first ingest; refuses a root over N indexable files (default ceiling on)" },
   { name: "ingest", group: "common", run: runIngest,
     help: "ingest [path] [--full]     Re-scan the codebase (incremental by default)" },
-  { name: "query", group: "common", run: runQuery,
+  { name: "query", group: "common", run: runQuery, readsGraph: true,
     help: "query <terms...> [--json]  Full-text search across the indexed graph" },
-  { name: "neighbors", group: "common", run: runNeighbors,
+  { name: "neighbors", group: "common", run: runNeighbors, readsGraph: true,
     help: "neighbors <id> [--depth N] Walk the graph around an entity" },
-  { name: "importers", group: "common", run: runImporters,
+  { name: "importers", group: "common", run: runImporters, readsGraph: true,
     help: "importers <module-id> [--json] EXHAUSTIVE list of every node that imports the module (edges, not ranked)" },
-  { name: "refs", group: "common", run: runRefs,
+  { name: "refs", group: "common", run: runRefs, readsGraph: true,
     help: "refs <symbol-id> [--json]  EXHAUSTIVE callers ∪ importers of a symbol (edges, not ranked)" },
-  { name: "impact", group: "common", run: runImpact,
+  { name: "impact", group: "common", run: runImpact, readsGraph: true,
     help: "impact <symbol-id> [--depth N] [--json] Transitive blast radius: change this → these N break" },
-  { name: "plan-lanes", group: "coordination", run: runPlanLanes,
+  { name: "plan-lanes", group: "coordination", run: runPlanLanes, readsGraph: true,
     help: "plan-lanes <files...> [--symbols] [--depth N] [--max-hub-degree N] [--json]  Partition a change-set into blast-radius-disjoint parallel lanes" },
-  { name: "affected-tests", group: "common", run: runAffectedTests,
+  { name: "affected-tests", group: "common", run: runAffectedTests, readsGraph: true,
     help: "affected-tests <symbol> [--changed a,b] [--trace-only] [--runner vitest] [--json] Minimal tests to run (static graph ∪ runtime traces)" },
-  { name: "context", group: "common", run: runContext,
+  { name: "context", group: "common", run: runContext, readsGraph: true,
     help: "context <symbol> [--escalate [--budget N]] [--json] Minimal precise slice pack (header + body + 1-hop callees)" },
-  { name: "fleet-context", group: "common", run: runFleetContext,
+  { name: "fleet-context", group: "common", run: runFleetContext, readsGraph: true,
     help: "fleet-context --lanes <file.json|-> Deduped shared+per-lane briefing for a fan-out of agents" },
-  { name: "mcp", group: "common", run: runMcp,
+  { name: "mcp", group: "common", run: runMcp, readsGraph: true,
     help: "mcp                        Serve the context packer over MCP (stdio JSON-RPC) — stateless, read-only" },
-  { name: "proxy", group: "common", run: runProxy,
+  { name: "proxy", group: "common", run: runProxy, readsGraph: true,
     help: "proxy [--provider ...] [--host H] [--port N] [--upstream URL] [--compact-history [--keep-recent N]] Transparent LLM-API proxy: graph slices + history compaction (binds 127.0.0.1)" },
   { name: "node", group: "common", run: runNode,
     help: "node body <id> [--body|--file] Update a node's markdown body (LWW CRDT write)" },
@@ -115,6 +127,8 @@ export const COMMANDS: readonly Command[] = [
     help: "config [key] [value]       Read/write configuration values" },
   { name: "reindex", group: "common", run: runReindex,
     help: "reindex                    Drop the SQLite index and rebuild from markdown" },
+  { name: "worktree", group: "common", run: runWorktree,
+    help: "worktree <add|remove|list|prune> [path] [--json]  Per-worktree overlay indexes: reads inside a registered git worktree see its own code" },
   { name: "branches", group: "common", run: runBranches,
     help: "branches [--json] [--prune] [--keep N]  List per-branch index caches (size/mtime/counts); --prune removes stale ones" },
   { name: "models", group: "common", run: runModels,
@@ -157,6 +171,7 @@ ${section("coordination")}
 Flags:
   -h, --help                 Show this help and exit
   -v, --version              Show version and exit
+  --root <path>              Resolve the project as if run from <path> (e.g. a registered worktree)
 
 See https://hayvenhurst.dev for more.`;
 }
@@ -216,7 +231,18 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 
   const command = BY_NAME.get(cmd);
   if (command) {
+    // Global `--root <path>`: project resolution starts there instead of the
+    // cwd. A bare `--root` (no value) is a usage error, not "the cwd". Set (or
+    // CLEARED) on every call, so an in-process caller of `main` never inherits
+    // a previous invocation's root.
+    const rootFlag = parsed.flags["root"];
+    if (rootFlag !== undefined && (typeof rootFlag !== "string" || rootFlag.length === 0)) {
+      console.error("error: --root needs a path");
+      return 2;
+    }
+    setProjectCwdOverride(typeof rootFlag === "string" ? resolve(rootFlag) : undefined);
     try {
+      if (command.readsGraph === true) await prepareOverlayForRead();
       return await command.run({ positionals: rest, flags: parsed.flags });
     } catch (err) {
       // A schema we are too old to read is a USER-actionable condition, not a

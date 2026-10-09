@@ -49,6 +49,7 @@ The CLI is the primary agent surface. It is hand-rolled (no argument-parsing lib
 | `hayven models <list\|pull <id>>` | shipped | Local model lifecycle (download + sha256-verify + install). |
 | `hayven traces <id>` | shipped | Reads per-entity runtime trace history (observed + resolved callers/callees, invocation counts). |
 | `hayven release <claim_id>` | shipped | Releases a claim via CLI (`DELETE /api/claims/:id` with a daemon-identity guard). |
+| `hayven worktree <add\|remove\|list\|prune> [path] [--json]` | shipped | Per-worktree overlay indexes, so graph reads inside a registered git worktree see that worktree's code. See "Fleet workers in git worktrees" below. |
 
 ### Claim exit codes
 
@@ -211,6 +212,31 @@ pytest tests/test_session.py::test_refresh tests/test_token.py   # from the pyte
 ```
 
 The selection fuses two signals: the **static** impact graph (reverse call+import walk) and the **runtime trace** map. A test tagged `trace` was *observed* exercising the code — ground truth that catches paths the static graph misses (e.g. a test that reaches a symbol through a re-export has no static edge to the real definition, so static-only selection would skip it). Cold start: with no traces yet the result is static-only and says so in `note` — run the suite once under the collector (`HAYVEN_TRACE=1`) to populate the trace signal, then re-select. `--trace-only` returns just the observed (highest-confidence) set.
+
+### Recipe: fleet workers in git worktrees (Sirius)
+
+A fleet worker usually edits inside its own `git worktree` (Sirius uses detached worktrees under `.sirius/worktrees/`, reset to a new base tip every iteration). Unregistered, a read from there resolves to the MAIN checkout's index, so the worker's brand-new files map to nothing and `affected-tests` selects no tests for them. Register the worktree once:
+
+```sh
+# From the main checkout (or from inside the worktree itself):
+hayven worktree add .sirius/worktrees/w1          # validates, seeds and builds the overlay
+cd .sirius/worktrees/w1
+hayven affected-tests --changed src/newmod.ts --json   # sees the worker's new file and its test
+
+# Or, from anywhere, without changing directory:
+hayven query brandNewThing --root /path/to/worktree
+
+hayven worktree list --json    # each overlay with freshness: fresh | stale | missing | broken | worktree-gone
+hayven worktree remove .sirius/worktrees/w1
+hayven worktree prune          # drop overlays whose worktree is gone (the daemon also does this on start)
+```
+
+How it behaves:
+
+- **Full copy, not a delta.** Each registered worktree gets `.hayven/worktrees/<id>/index.sqlite`, seeded from the main project's current read index and then amended with the worktree's diff (plus untracked and modified files). Over 2,000 changed files it re-ingests the worktree in full. Overlays live outside `.hayven/branches/`, so they never use one of the 8 per-branch cache slots.
+- **Refreshed lazily, before each read.** `query`, `refs`, `importers`, `impact`, `neighbors`, `context`, `affected-tests`, `plan-lanes`, `fleet-context`, `mcp` and `proxy` compare the worktree's HEAD, `git status` and dirty-file mtimes with the overlay's stamp, and re-parse only what changed. No explicit reindex is needed. `mcp` and `proxy` refresh once, at startup. A refresh that dies mid-way leaves the overlay marked broken (never fresh), and the next read rebuilds it.
+- **One project.** Claims, `node body`, `sync`, fleet memory (`remember`/`recall`), `traces` and `summarize` keep using the main project and its daemon: entity ids are repo-relative paths, so they are identical in every worktree. `hayven ingest` inside a registered worktree refreshes its overlay (`--full` rebuilds it); `hayven reindex` there is refused.
+- **Explicit and bounded.** Up to 16 overlays per project; the 17th is refused with a pointer to `hayven worktree prune`. Unregistered worktrees resolve exactly as before. The worktree must share the main checkout's git common dir, and the main checkout itself cannot be registered.
 
 ## Programmatic context packs (the builder API)
 

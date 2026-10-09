@@ -21,7 +21,7 @@ import {
 } from "../db/graph_walk.ts";
 import { previewImpact } from "../db/impact_preview.ts";
 import { tryLocateNativeBinary } from "../native/locate.ts";
-import { isJson, openProjectDb, requireProject } from "./_shared.ts";
+import { isJson, openProjectDb, readPaths, requireProject, sourceRoot } from "./_shared.ts";
 
 /**
  * Does `rawId` LOOK like a structured node id rather than a loose search term?
@@ -65,7 +65,7 @@ export async function runImpact(args: ParsedArgs): Promise<number> {
 
   const db = openProjectDb(ctx, { readonly: true });
   try {
-    warnIfStale(db, ctx.paths);
+    warnIfStale(db, readPaths(ctx));
     const resolved = resolveNodeId(db, rawId);
     if (!resolved) {
       process.stderr.write(
@@ -191,9 +191,9 @@ async function runImpactPreview(args: ParsedArgs, rawId: string): Promise<number
 
   const db = openProjectDb(ctx, { readonly: true });
   try {
-    warnIfStale(db, ctx.paths);
+    warnIfStale(db, readPaths(ctx));
     const preview = previewImpact(db, rawId, {
-      repoRoot: ctx.paths.repoRoot,
+      repoRoot: sourceRoot(ctx),
       binary,
       depth: maxDepth,
     });

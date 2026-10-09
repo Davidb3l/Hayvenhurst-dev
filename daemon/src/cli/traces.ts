@@ -70,7 +70,10 @@ export async function runTraces(args: ParsedArgs): Promise<number> {
     return 1;
   }
 
-  const db = openProjectDb(ctx, { readonly: true });
+  // Runtime traces are PROJECT-level: the daemon records them into the main
+  // index, so inside a registered worktree an overlay's seed-time copy would be
+  // stale. Read them from main (HAYV-13).
+  const db = openProjectDb(ctx, { readonly: true, mainIndex: true });
   try {
     if (!db.getNode(id)) {
       process.stderr.write(

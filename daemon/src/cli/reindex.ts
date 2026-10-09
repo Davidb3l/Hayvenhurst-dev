@@ -58,6 +58,18 @@ export async function runReindex(args: ParsedArgs, deps: ReindexDeps = {}): Prom
     return 1;
   }
 
+  // From a registered worktree (HAYV-13) the project resolves to the MAIN
+  // checkout, so carrying on would drop and rebuild the MAIN index — almost
+  // certainly not what someone working in the worktree meant. Refuse and name
+  // the command that rebuilds the worktree's own overlay.
+  if (ctx.overlay !== undefined) {
+    process.stderr.write(
+      `error: \`hayven reindex\` rebuilds the MAIN project's index, and this is the registered worktree ${ctx.overlay.worktreeRoot}.\n` +
+        "Run `hayven ingest --full` here to rebuild the worktree's overlay, or run reindex from the main checkout.\n",
+    );
+    return 1;
+  }
+
   // Target the CURRENT branch's index (or the legacy index outside a git repo) —
   // the same index the subsequent `--full` ingest will rebuild. seed:false: we
   // are about to clear it anyway, so seeding from a sibling would be wasted work.
