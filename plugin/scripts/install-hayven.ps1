@@ -48,9 +48,10 @@
     proves "that repo signed its own artifact". Do not set it to a repo you do
     not trust.
 
-    Ctrl-C stops the run. Every catch below that turns an error into a
-    fallback re-throws a pipeline stop first, so an interrupt can never be
-    mistaken for "that probe failed, try the next one" and carry on.
+    Ctrl-C stops the run: PowerShell does not route a pipeline stop through
+    script `catch` blocks, and the `finally` around the install removes the
+    temp dir. As a backstop, every catch that turns an error into a fallback
+    re-throws a stop/cancel exception first (see Assert-NotStopping).
 
     Idempotent + safe to re-run.
 
@@ -63,8 +64,9 @@
     HAYVEN_INSTALL_PREFIX > CLAUDE_PLUGIN_DATA > $env:USERPROFILE\.local.
 
 .PARAMETER Check
-    Print status only; never downloads. Exits 0 if `hayven` is on PATH or
-    already installed in the prefix, 3 if missing.
+    Print status only; never downloads and never changes anything (-AddToPath
+    is ignored with -Check). Exits 0 if `hayven` is on PATH or already
+    installed in the prefix, 3 if missing.
 
 .PARAMETER RequireSignature
     Abort unless the Sigstore signature actually verifies - i.e. make a
@@ -78,7 +80,8 @@
     command is printed instead and nothing is changed.
 
 .PARAMETER Force
-    Reinstall even when the requested version is already installed.
+    Reinstall even when the requested version is already installed (both
+    hayven.exe and hayven-native.exe report it).
 
 .PARAMETER DryRun
     Print what would be downloaded/installed and exit, without network I/O.
@@ -106,8 +109,9 @@
       CLAUDE_PLUGIN_DATA         plugin-managed data dir (default prefix when set)
 
     Windows PowerShell 5.1 compatible, pure ASCII (5.1 reads a BOM-less file
-    in the ANSI code page). Exit codes mirror install-hayven.sh:
-      0 ok / already installed, 1 error, 2 bad usage, 3 (-Check) not installed.
+    in the ANSI code page). Exit codes: 0 ok / already installed, 1 error
+    (PowerShell's own parameter-binding errors also exit 1 under -File),
+    3 (-Check) not installed.
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true)]
@@ -151,6 +155,10 @@ if ([string]::IsNullOrEmpty($Prefix)) {
     }
     $Prefix = Join-Path $homeDir '.local'
 }
+# A relative -Prefix would install fine and then write a RELATIVE directory into
+# the user Path (-AddToPath), which resolves against whatever directory each
+# future process starts in. Anchor it to the current location once, here.
+$Prefix = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Prefix)
 
 $BinDir     = Join-Path $Prefix 'bin'
 $BinName    = 'hayven.exe'
@@ -166,6 +174,14 @@ if ($env:HAYVEN_REQUIRE_SIGNATURE -eq '1') { $RequireSig = $true }
 $IsDryRun = [bool]$DryRun
 if ($env:HAYVEN_INSTALL_DRY_RUN -eq '1') { $IsDryRun = $true }
 if ($WhatIfPreference) { $IsDryRun = $true }
+# Having read it, switch -WhatIf OFF for the rest of the script. Left on, it
+# turns every Start-Process / Remove-Item inside Invoke-Native into a "What if:"
+# no-op too: the version probe would silently "fail" and temp files would leak.
+# The dry-run path above is what honors it.
+$WhatIfPreference = $false
+
+# -Check promises to change nothing, so it never edits PATH even with -AddToPath.
+$MayEditPath = [bool]$AddToPath -and -not [bool]$Check
 
 $CertIssuer = 'https://token.actions.githubusercontent.com'
 
@@ -183,12 +199,13 @@ function Stop-WithError {
     exit 1
 }
 
-# Ctrl-C (and a host stopping the script) surfaces as a PipelineStoppedException
-# or an OperationCanceledException. Several catches below deliberately turn an
-# error into a fallback ("API failed, try the redirect"; "this python can't
-# import sigstore, try the next one"). An interrupt must never be swallowed as
-# one of those: re-throw it so the run actually stops. Call first in any catch
-# that does not end the script itself.
+# Several catches below deliberately turn an error into a fallback ("API
+# failed, try the redirect"; "this python can't import sigstore, try the next
+# one"). PowerShell normally does not deliver Ctrl-C (a pipeline stop) to a
+# script `catch` at all, so this is a BACKSTOP, not the mechanism: if a stop or
+# a cancellation ever does arrive as a catchable exception (a .NET API wrapping
+# OperationCanceledException, a host that surfaces it differently), re-throw it
+# rather than treating it as "that probe failed, carry on".
 function Assert-NotStopping {
     param($ErrorRecord)
     $ex = $null
@@ -677,7 +694,7 @@ function Write-PathHint {
         return
     }
     Write-Log ''
-    if ($AddToPath) {
+    if ($MayEditPath) {
         if ($IsDryRun) {
             Write-Log ('DRY RUN: would add ' + $BinDir + ' to your user PATH')
         } else {
@@ -755,13 +772,29 @@ SIGNATURE VERIFICATION FAILED for $AssetName
         Refusing to install: this artifact was not produced by $Repo's release workflow.
 "@
 
+    # cosign older than 3.0 cannot read sigstore-python v3's `.sigstore.json`
+    # bundle at all, so its failure says nothing about the artifact. Treat an
+    # old cosign as NO usable cosign (fall through to `sigstore`, then to the
+    # no-verifier path) instead of reporting a tampered release. No weaker than
+    # not having cosign: an attacker cannot choose which cosign is installed
+    # locally, and -RequireSignature still makes the end of that road fatal.
+    $cosignOk = $false
     if ($null -ne (Get-NativeExePath 'cosign')) {
+        $cv = Invoke-Native -FilePath 'cosign' -ArgumentList @('version')
+        $major = $null
+        if ($cv.Output -match 'GitVersion:\s*v?(\d+)\.') { $major = [int]$Matches[1] }
+        if ($null -ne $major -and $major -lt 3) {
+            Write-Log ('install-hayven: note: cosign ' + $major + '.x cannot read this bundle format (needs cosign 3+); not using it.')
+        } else {
+            $cosignOk = $true
+        }
+    }
+
+    if ($cosignOk) {
         Write-Log 'install-hayven: verifying signature (cosign)'
         # Keep the verifier's own diagnostics: on a real identity mismatch
-        # cosign prints "expected X, got Y", and an OLD cosign (< 3.x) instead
-        # fails to parse sigstore-python v3's `.sigstore.json` bundle at all.
-        # Swallowing both makes a stale toolchain look identical to a tampered
-        # artifact.
+        # cosign prints "expected X, got Y". Swallowing it makes a toolchain
+        # problem look identical to a tampered artifact.
         $r = Invoke-Native -FilePath 'cosign' -ArgumentList @(
             'verify-blob',
             '--bundle', $Bundle,
@@ -772,10 +805,7 @@ SIGNATURE VERIFICATION FAILED for $AssetName
         if ($r.ExitCode -ne 0) {
             Stop-WithError ($sigFail + "
         verifier output:
-" + $r.Output + "
-
-        If your cosign predates v3.0, it cannot read this bundle format:
-        upgrade cosign (or install the ``sigstore`` python tool) and retry.")
+" + $r.Output)
         }
         Write-Log 'install-hayven: signature OK (cosign)'
         return
@@ -885,10 +915,15 @@ Write-Log ('install-hayven: asset=' + $Tarball)
 
 # Idempotence: re-running with the same version is a no-op, not a re-download.
 # Only the prefix copy counts: a different hayven.exe elsewhere on PATH says
-# nothing about whether THIS prefix is installed.
+# nothing about whether THIS prefix is installed. BOTH binaries must report the
+# version: an install interrupted between the two copies (Ctrl-C, or a running
+# hayven-native.exe locking its file) leaves a new hayven.exe beside an old
+# native binary, and checking hayven.exe alone would call that "nothing to do"
+# forever - exactly when the error message told the user to re-run.
 if (-not $Force) {
     $installed = Get-InstalledVersion $BinPath
-    if ($null -ne $installed -and $installed -eq $VersionNumber) {
+    $nativeInstalled = Get-InstalledVersion (Join-Path $BinDir $NativeName)
+    if ($null -ne $installed -and $installed -eq $VersionNumber -and $nativeInstalled -eq $VersionNumber) {
         Write-Log ('install-hayven: hayven ' + $installed + ' is already installed at ' + $BinPath + '; nothing to do (pass -Force to reinstall).')
         Write-PathHint
         exit 0

@@ -119,8 +119,9 @@ Two routes, the same download and the same checks:
 
   Flags mirror the `.sh`: `-Version`, `-Prefix`, `-Check`, `-RequireSignature`,
   plus `-AddToPath` (appends to your *user* `Path`, keeping its `REG_EXPAND_SZ`
-  type so `%VAR%` entries keep working) and `-Force`. Default prefix:
-  `%USERPROFILE%\.local\bin`. For signature checks install
+  type so `%VAR%` entries keep working) and `-Force`. Binaries land in
+  `<prefix>\bin`; the prefix is `CLAUDE_PLUGIN_DATA` when run by the plugin,
+  else `%USERPROFILE%\.local`. For signature checks install
   `winget install Sigstore.Cosign` (or `pip install sigstore`).
 
 WSL is not a Windows route: inside WSL the `.sh` installs a *Linux* `hayven` that

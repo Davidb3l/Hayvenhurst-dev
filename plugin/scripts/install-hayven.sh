@@ -111,7 +111,6 @@ if [ -z "$PREFIX" ]; then
   # printing a plausible-looking but wrong location at the user.
   PREFIX="/nonexistent-hayven-prefix"
 fi
-BIN_DIR="$PREFIX/bin"
 
 # Host-shape facts needed BEFORE the platform -> asset mapping runs: --check
 # returns long before detect_platform is called, but it still has to look for
@@ -127,6 +126,17 @@ case "$(uname -s)" in
   CYGWIN*) IS_WINDOWS=1; IS_CYGWIN=1; EXE=".exe" ;;
   MINGW*|MSYS*) IS_WINDOWS=1; EXE=".exe" ;;
 esac
+
+# A relative --prefix would install fine and then print PATH advice naming a
+# relative directory, which means nothing to a shell started anywhere else.
+# Anchor it to the cwd once, here. "C:..." / "C:\..." already name a drive on
+# Windows, so leave those alone.
+case "$PREFIX" in
+  /*) ;;
+  ?:*) [ "$IS_WINDOWS" = "1" ] || PREFIX="$(pwd)/$PREFIX" ;;
+  *) PREFIX="$(pwd)/$PREFIX" ;;
+esac
+BIN_DIR="$PREFIX/bin"
 
 # ---- platform detection -> release asset name -------------------------------
 # Mirrors the matrix in .github/workflows/release.yml:
@@ -154,13 +164,14 @@ detect_platform() {
   if [ "$os" = "linux" ] && [ "$arch" = "x64" ]; then
     PLATFORM="linux-x64-glibc"
   elif [ "$os" = "windows" ]; then
-    # windows-x64 is the ONLY Windows asset in release.yml's matrix. Fail here
-    # by name rather than letting the download 404 on an asset that was never
-    # built. (Windows-on-ARM usually reports x86_64 through the x64 emulation
-    # layer, in which case the x64 build is the correct answer anyway.)
-    [ "$arch" = "x64" ] || fail "no Windows release asset for CPU arch '$uname_m'.
-        The only Windows asset is hayvenhurst-<version>-windows-x64.tar.gz (x86_64).
-        Run this from an x64 Git Bash, or build hayven from source."
+    # windows-x64 is the ONLY Windows asset in release.yml's matrix. Windows on
+    # ARM runs x64 binaries under emulation, and a native arm64 Git for Windows
+    # reports aarch64 - so install the x64 build and say so, exactly as
+    # install-hayven.ps1 does. Two installers disagreeing about one machine
+    # (one installs, the other refuses) is worse than either answer.
+    if [ "$arch" = "arm64" ]; then
+      log "install-hayven: note: no windows-arm64 release exists; using the windows-x64 build (runs under Windows' x64 emulation)."
+    fi
     PLATFORM="windows-x64"
   else
     PLATFORM="${os}-${arch}"
@@ -283,15 +294,25 @@ resolve_latest_tag() {
 # lands a working hayven.exe that PowerShell, cmd, editors and Claude Code
 # cannot see. We PRINT the fix; we never mutate the user's PATH from here.
 print_path_hint() {
+  # On Windows $BIN_DIR may arrive in NATIVE form (CLAUDE_PLUGIN_DATA is a
+  # C:\... path on the plugin route; so is $RUNNER_TEMP). $PATH inside Git Bash
+  # holds POSIX forms (/c/Users/...), so compare and print the POSIX form, and
+  # hand PowerShell the Windows form. Without cygpath, use $BIN_DIR as given.
+  bin_posix="$BIN_DIR"
+  bin_win="$BIN_DIR"
+  if [ "$IS_WINDOWS" = "1" ] && have cygpath; then
+    bin_posix="$(cygpath -u "$BIN_DIR" 2>/dev/null || printf '%s' "$BIN_DIR")"
+    bin_win="$(cygpath -w "$BIN_DIR" 2>/dev/null || printf '%s' "$BIN_DIR")"
+  fi
   case ":$PATH:" in
-    *":$BIN_DIR:"*) return 0 ;; # already on PATH
+    *":$bin_posix:"*|*":$BIN_DIR:"*) return 0 ;; # already on PATH
   esac
   log ""
-  log "note: $BIN_DIR is not on your PATH."
+  log "note: $bin_posix is not on your PATH."
   if [ "$IS_WINDOWS" = "1" ]; then
     log ""
     log "  This shell only (Git Bash):"
-    log "      export PATH=\"$BIN_DIR:\$PATH\"   # add to ~/.bashrc to persist it here"
+    log "      export PATH=\"$bin_posix:\$PATH\"   # add to ~/.bashrc to persist it here"
     log ""
     log "  Permanently, for ALL of Windows (PowerShell, cmd, editors, Claude Code):"
     log "  run this ONCE in PowerShell, then close and reopen your shells:"
@@ -299,11 +320,14 @@ print_path_hint() {
     # Raw registry write, keeping Path's REG_EXPAND_SZ kind: the familiar
     # [Environment]::SetEnvironmentVariable one-liner flattens it to REG_SZ,
     # freezing every %VAR% entry. The dummy-variable delete broadcasts it.
-    log '      $d="$env:USERPROFILE\.local\bin"; $k=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("Environment"); $p=[string]$k.GetValue("Path","",[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames); $k.SetValue("Path",($p.TrimEnd(";")+";"+$d).TrimStart(";"),[Microsoft.Win32.RegistryValueKind]::ExpandString); $k.Close(); [Environment]::SetEnvironmentVariable("HAYVEN_PATH_BROADCAST",$null,"User")'
+    # The directory goes in a PowerShell single-quoted literal: double any '.
+    q_dir="$(printf '%s' "$bin_win" | sed "s/'/''/g")"
+    log "      \$d='$q_dir'; "'$k=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("Environment"); $p=[string]$k.GetValue("Path","",[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames); $k.SetValue("Path",($p.TrimEnd(";")+";"+$d).TrimStart(";"),[Microsoft.Win32.RegistryValueKind]::ExpandString); $k.Close(); [Environment]::SetEnvironmentVariable("HAYVEN_PATH_BROADCAST",$null,"User")'
     log ""
-    log "  That command appends the DEFAULT prefix (%USERPROFILE%\\.local\\bin)."
-    log "  You installed into: $BIN_DIR"
-    log "  If those differ, substitute the Windows form of the path above."
+    if [ "$bin_win" = "$BIN_DIR" ] && ! have cygpath; then
+      log "  (cygpath was not found, so that is the path as this shell spells it;"
+      log "  if it starts with /, substitute its Windows form, e.g. C:\\...)"
+    fi
     log "  (install-hayven.ps1 -AddToPath does this for you.)"
     log "  Already-running shells, editors and apps must be RESTARTED to see it."
   else
@@ -330,6 +354,16 @@ if [ "$MODE" = "check" ]; then
 fi
 
 # ---- signature verification --------------------------------------------------
+# On a Mac without the Command Line Tools, /usr/bin/python3 is a stub that pops
+# the "install developer tools" dialog instead of running anything - the macOS
+# twin of the Windows Store alias the .ps1 skips. Only probe it when the tools
+# are actually installed; any other python3 on PATH is a real interpreter.
+python3_safe_to_probe() {
+  [ "$(uname -s)" = "Darwin" ] || return 0
+  [ "$(command -v python3)" = "/usr/bin/python3" ] || return 0
+  xcode-select -p >/dev/null 2>&1
+}
+
 # Verify with whichever Sigstore verifier is on the box. Pin BOTH the signer
 # identity (this repo's release.yml, at this tag) and the OIDC issuer: an
 # unpinned verify only proves "somebody signed this", not "the release workflow
@@ -356,12 +390,28 @@ verify_signature() {
         expected issuer: $issuer
         Refusing to install: this artifact was not produced by $REPO's release workflow."
 
+  # cosign older than 3.0 cannot read sigstore-python v3's `.sigstore.json`
+  # bundle at all, so its failure says nothing about the artifact. Treat an old
+  # cosign as NO usable cosign (fall through to `sigstore`, then to the
+  # no-verifier path) instead of reporting a tampered release. That is no
+  # weaker than not having cosign: an attacker cannot choose which cosign is
+  # installed locally, and --require-signature still makes the end of that
+  # road fatal.
+  cosign_ok=0
   if have cosign; then
+    cosign_major="$(cosign version 2>/dev/null | sed -n 's/^GitVersion:[[:space:]]*v\{0,1\}\([0-9][0-9]*\)\..*/\1/p' | head -1)"
+    if [ -n "$cosign_major" ] && [ "$cosign_major" -lt 3 ]; then
+      log "install-hayven: note: cosign $cosign_major.x cannot read this bundle format (needs cosign 3+); not using it."
+    else
+      cosign_ok=1
+    fi
+  fi
+
+  if [ "$cosign_ok" = "1" ]; then
     log "install-hayven: verifying signature (cosign)"
     # Keep the verifier's own diagnostics: on a real identity mismatch cosign
-    # prints "expected X, got Y", and an OLD cosign (< 3.x) instead fails to
-    # parse sigstore-python v3's `.sigstore.json` bundle at all. Swallowing
-    # both makes a stale toolchain look identical to a tampered artifact.
+    # prints "expected X, got Y". Swallowing it makes a toolchain problem look
+    # identical to a tampered artifact.
     if ! verify_out="$(cosign verify-blob \
       --bundle "$bundle" \
       --certificate-identity "$identity" \
@@ -370,10 +420,7 @@ verify_signature() {
       fail "$sig_fail
 
         verifier output:
-$verify_out
-
-        If your cosign predates v3.0, it cannot read this bundle format:
-        upgrade cosign (or install the \`sigstore\` python tool) and retry."
+$verify_out"
     fi
     log "install-hayven: signature OK (cosign)"
     return 0
@@ -382,7 +429,7 @@ $verify_out
   sig_cmd=""
   if have sigstore; then
     sig_cmd="sigstore"
-  elif have python3 && python3 -c 'import sigstore' >/dev/null 2>&1; then
+  elif have python3 && python3_safe_to_probe && python3 -c 'import sigstore' >/dev/null 2>&1; then
     sig_cmd="python3 -m sigstore"
   fi
 
