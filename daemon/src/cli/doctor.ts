@@ -10,13 +10,15 @@
  * any diagnostic chatter goes to stderr.
  */
 import { existsSync } from "node:fs";
+import { isAbsolute } from "node:path";
 
 import { tryLocateNativeBinary } from "../native/locate.ts";
 import { locateCheckIgnoredBinary, probeCheckIgnored } from "../native/ignore.ts";
 import { Db } from "../db/queries.ts";
 import { ftsAvailable } from "../db/migrations.ts";
 import { resolveReadIndex } from "../db/branch_index.ts";
-import { detectRepoRoot, hayvenPathsFor } from "../util/paths.ts";
+import { detectRepoRoot, hayvenPathsFor, isDirectory } from "../util/paths.ts";
+import { readRegistryRaw, type ProjectEntry } from "../daemon/registry.ts";
 import { loadConfig } from "../config/load.ts";
 import { detectHardware, recommendTier3Model } from "../hardware/detect.ts";
 import { MODEL_REGISTRY, isModelPresent, modelPath } from "../models/registry.ts";
@@ -236,6 +238,8 @@ function collect(): DoctorReport {
     });
   }
 
+  checks.push(registryCheck());
+
   // Model strata — hardware detection + tier-3 model presence (§18.5).
   const hw = detectHardware();
   const rec = recommendTier3Model(hw);
@@ -319,6 +323,57 @@ function collect(): DoctorReport {
 }
 
 /**
+ * The `registry` row: registered projects whose root is missing, with the
+ * commands that fix them.
+ *
+ * WHY: a moved or deleted repo used to be invisible until something failed.
+ * The daemon skipped it at start, the next start from its new location minted
+ * `<alias>-2`, and the old row sat in `~/.hayven/projects.json` for a week.
+ * `doctor` is where people look when "hayven can't find my project", so the
+ * ghost rows, and the exact `hayven projects` command for each, belong here.
+ *
+ * A WARNING, never a failure: the row is `ok:true` and `gating:false`. A
+ * missing registration is a fact about one project the user may have deleted
+ * on purpose, not about whether hayven WORKS, and peers read an envelope
+ * `ok:false` as "hayven is absent" (SUITE_CONTRACTS §3.1). Never throws, for
+ * the same reason.
+ *
+ * Exported for tests.
+ */
+export function registryCheck(entries?: readonly ProjectEntry[]): DoctorCheck {
+  let rows: readonly ProjectEntry[];
+  try {
+    rows = entries ?? readRegistryRaw();
+  } catch (err) {
+    return { name: "registry", ok: true, detail: `could not read the registry: ${(err as Error).message}`, gating: false };
+  }
+  // Non-absolute hand-edited rows are not "missing" (they cannot be stat'd at
+  // all); `hayven projects` lists them as invalid.
+  const missing = rows.filter((e) => isAbsolute(e.root) && !isDirectory(e.root));
+  if (missing.length === 0) {
+    return {
+      name: "registry",
+      ok: true,
+      detail: `${rows.length} registered project(s), none missing`,
+      gating: false,
+    };
+  }
+  const listed = missing
+    .map((e) => `${e.alias} (${e.root}${e.missing_since ? `, missing since ${e.missing_since.slice(0, 10)}` : ""})`)
+    .join("; ");
+  const first = missing[0]!.alias;
+  return {
+    name: "registry",
+    ok: true,
+    detail:
+      `WARNING: ${missing.length} of ${rows.length} registered project(s) have a missing root: ${listed}. ` +
+      `Moved? \`hayven projects relocate ${first} <new-root>\`. ` +
+      `Gone? \`hayven projects remove ${first}\`, or \`hayven projects prune\` to drop every missing one.`,
+    gating: false,
+  };
+}
+
+/**
  * The SUITE_CONTRACTS §3 handshake envelope. Health lives in `ok`, never in the
  * exit code (§3.1: exit 0 + `ok:false` = present-but-unhealthy; a non-zero exit
  * means absent). `report` is free-form, additive detail.
@@ -374,6 +429,9 @@ function renderHuman(report: DoctorReport): string {
   } else {
     lines.push(`- SQLite FTS5 trigram: ${fts.ok ? "OK" : "UNAVAILABLE (need SQLite >= 3.34)"}`);
   }
+
+  const registry = byName("registry");
+  lines.push(`- Project registry: ${registry.detail}`);
 
   lines.push("");
   lines.push("## Model strata (§18)");
