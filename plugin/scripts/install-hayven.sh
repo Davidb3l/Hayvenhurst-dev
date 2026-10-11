@@ -347,9 +347,15 @@ if [ "$MODE" = "check" ] && [ "$PREFIX_EXPLICIT" = "1" ]; then
   # Answer from the prefix alone. A hayven elsewhere on PATH is reported, never
   # mistaken for this one (it used to win outright, so --check --prefix <empty>
   # exited 0; found on a real Windows 11 box).
+  # Compare DIRECTORIES as the filesystem resolves them, not strings: a
+  # trailing slash, a relative prefix, /tmp vs /private/tmp, or Git Bash's
+  # /c/... (from `command -v`) vs C:\... (a native --prefix) all name one place.
   elsewhere=""
-  if have hayven && [ "$(command -v hayven)" != "$BIN_DIR/hayven$EXE" ] && [ "$(command -v hayven)" != "$BIN_DIR/hayven" ]; then
-    elsewhere="$(command -v hayven)"
+  if have hayven; then
+    found="$(command -v hayven)"
+    found_dir="$(cd "$(dirname "$found")" 2>/dev/null && pwd -P || printf '%s' "$found")"
+    bin_dir_real="$(cd "$BIN_DIR" 2>/dev/null && pwd -P || printf '%s' "$BIN_DIR")"
+    [ "$found_dir" = "$bin_dir_real" ] || elsewhere="$found"
   fi
   if [ -x "$BIN_DIR/hayven$EXE" ]; then
     log "hayven: installed at $BIN_DIR/hayven$EXE"

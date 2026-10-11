@@ -211,6 +211,35 @@ function Stop-WithError {
     exit 1
 }
 
+# A deliberate, successful end of the install section (see RunSettled above).
+function Exit-Settled {
+    param([int]$Code = 0)
+    $script:RunSettled = $true
+    exit $Code
+}
+
+# True when this script is the host's `-File` target (`powershell -File
+# install-hayven.ps1`, `pwsh -f ...`), i.e. it owns the process. False when
+# another script runs it in-process with `&` (Sirius's install-sothis.ps1) or
+# a user runs `.\install-hayven.ps1` at an interactive prompt: there the
+# process is the user's SHELL, and ending it on Ctrl-C would close their
+# window and lose their session.
+function Test-RunAsFileTarget {
+    try {
+        $argv = [Environment]::GetCommandLineArgs()
+        $self = [System.IO.Path]::GetFullPath($PSCommandPath)
+        for ($i = 0; $i -lt ($argv.Length - 1); $i++) {
+            if ($argv[$i] -match '^[-/](f|fi|fil|file)$') {
+                $target = [System.IO.Path]::GetFullPath($argv[$i + 1])
+                return [string]::Equals($target, $self, [System.StringComparison]::OrdinalIgnoreCase)
+            }
+        }
+    } catch {
+        Assert-NotStopping $_
+    }
+    return $false
+}
+
 # Several catches below deliberately turn an error into a fallback ("API
 # failed, try the redirect"; "this python can't import sigstore, try the next
 # one"). PowerShell normally does not deliver Ctrl-C (a pipeline stop) to a
@@ -416,6 +445,9 @@ function Get-RemoteFile {
     } finally {
         if ($null -ne $task -and -not $task.IsCompleted) {
             try { $wc.CancelAsync() } catch { }
+            # CancelAsync returns before WebClient lets go of the partial file;
+            # give it a moment so the caller's temp-dir cleanup can delete it.
+            try { [void]$task.Wait(3000) } catch { }
         }
         $wc.Dispose()
     }
@@ -977,6 +1009,11 @@ function Install-StagedDir {
 
 # ---- install ----------------------------------------------------------------
 
+# The whole install section runs inside one try, so an interrupt ANYWHERE in it
+# (resolving "latest" on a slow network, probing the installed version, the
+# download) is reported as one, never as exit 0. Every deliberate end sets
+# RunSettled first: Stop-WithError, Exit-Settled.
+try {
 $Platform = Get-Platform
 $Tag = Resolve-LatestTag
 if ($Tag -notmatch '^[vV]') { $Tag = 'v' + $Tag }   # accept "0.0.7" as "v0.0.7"
@@ -1014,7 +1051,7 @@ if (-not $Force) {
         (Test-Path -LiteralPath (Join-Path $BinDir $NativeName))) {
         Write-Log ('install-hayven: hayven ' + $installed + ' is already installed at ' + $BinPath + '; nothing to do (pass -Force to reinstall).')
         Write-PathHint
-        exit 0
+        Exit-Settled 0
     }
 }
 
@@ -1025,7 +1062,7 @@ if ($IsDryRun) {
     Write-Log ('DRY RUN: would verify:   ' + $BundleUrl)
     Write-Log ('DRY RUN: would install into: ' + $BinDir)
     Write-PathHint
-    exit 0
+    Exit-Settled 0
 }
 
 # tar.exe (bsdtar) ships in Windows 10 1803+ / Windows 11. Prefer the System32
@@ -1141,25 +1178,8 @@ try {
     Install-StagedDir -From (Join-Path $stage 'skill') -To (Join-Path $BinDir 'skill')
     # Only now is the install complete; see the idempotence check above.
     Set-Content -LiteralPath $MarkerPath -Value $VersionNumber -Encoding ascii
-    $script:RunSettled = $true
-} catch {
-    # An unexpected terminating error (Ctrl-C never lands here: PowerShell does
-    # not route a pipeline stop through `catch`). Settle the run so the finally
-    # below reports it as a failure, not as an interrupt.
-    Stop-WithError ('unexpected error: ' + $_.Exception.Message)
 } finally {
     Remove-Item -LiteralPath $Tmp -Recurse -Force -ErrorAction SilentlyContinue
-    if (-not $script:RunSettled) {
-        # Reached only when the run was INTERRUPTED (Ctrl-C): every deliberate
-        # end sets RunSettled first. A stopped script otherwise exits 0, so a
-        # cancelled install looked like a success to any caller (found on a real
-        # Windows 11 box). 130 = 128 + SIGINT, what install-hayven.sh exits with.
-        # [Environment]::Exit because `exit` cannot override the stop here; when
-        # this script was dot-invoked in-process (install-sothis.ps1), that ends
-        # the caller too, which is what the user's Ctrl-C asked for.
-        Write-Log 'install-hayven: interrupted; nothing was installed.'
-        [Environment]::Exit(130)
-    }
 }
 
 Write-Log ''
@@ -1170,4 +1190,31 @@ Write-Log 'Next steps:'
 Write-Log '  hayven init          # set up .hayven\ and do the first ingestion'
 Write-Log '  hayven daemon start  # serves the code graph on :7777'
 Write-SuiteHint
-exit 0
+Exit-Settled 0
+} catch {
+    # An unexpected terminating error. Ctrl-C normally never lands here
+    # (PowerShell does not route a pipeline stop through `catch`); if one ever
+    # does arrive as a catchable error, Assert-NotStopping re-throws it so the
+    # finally below reports an interrupt rather than a failure.
+    Assert-NotStopping $_
+    Stop-WithError ('unexpected error: ' + $_.Exception.Message)
+} finally {
+    if (-not $script:RunSettled) {
+        # Reached only when the run was INTERRUPTED: every deliberate end sets
+        # RunSettled first. A stopped script otherwise reports exit 0, so a
+        # cancelled install looked like a success to any caller (found on a real
+        # Windows 11 box). 130 = 128 + SIGINT, what install-hayven.sh exits with.
+        # The completion marker is removed before any copy and written only after
+        # all of them, so a re-run always finishes a partial install.
+        Write-Log 'install-hayven: interrupted. The install is not marked complete; re-run to finish it.'
+        if (Test-RunAsFileTarget) {
+            # We own the process (`-File`), and `exit` cannot override a stop
+            # from here, so end it with the right code.
+            [Environment]::Exit(130)
+        }
+        # In-process (`&` from another script, or `.\install-hayven.ps1` at a
+        # prompt): never kill the user's shell. Record the code and let the stop
+        # propagate; it already stops the caller's pipeline too.
+        $global:LASTEXITCODE = 130
+    }
+}

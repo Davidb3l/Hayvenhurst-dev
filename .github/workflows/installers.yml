@@ -205,7 +205,12 @@ jobs:
           # winget-named cosign only (no plain `cosign` on PATH) still verifies.
           wdir="$RUNNER_TEMP/wingetcosign-sh"; mkdir -p "$wdir"
           cp "$(command -v cosign)" "$wdir/cosign-windows-amd64.exe"
-          nocos="$(printf '%s' "$PATH" | tr ':' '\n' | while IFS= read -r d; do [ -n "$d" ] && [ ! -e "$d/cosign.exe" ] && [ ! -e "$d/cosign" ] && printf '%s:' "$d"; done)"
+          # Every PATH entry except those holding a plain cosign. The trailing
+          # newline lets `read` see the last entry, and `if` (not an && chain)
+          # keeps the loop's exit status 0 under `set -e`.
+          nocos="$(printf '%s\n' "$PATH" | tr ':' '\n' | while IFS= read -r d; do
+            if [ -n "$d" ] && [ ! -e "$d/cosign.exe" ] && [ ! -e "$d/cosign" ]; then printf '%s:' "$d"; fi
+          done)"
           PATH="$wdir:$nocos" sh plugin/scripts/install-hayven.sh --prefix "$RUNNER_TEMP/gb-winget" --version v0.0.7 --require-signature 2>&1 | tee "$RUNNER_TEMP/gbw.log"
           grep -q 'signature OK (cosign)' "$RUNNER_TEMP/gbw.log"
           # On PATH (POSIX form): no "not on your PATH" note.
