@@ -139,6 +139,12 @@ if ([string]::IsNullOrEmpty($Repo)) { $Repo = 'Davidb3l/Hayvenhurst-dev' }
 $Tag = $Version
 if ([string]::IsNullOrEmpty($Tag)) { $Tag = $env:HAYVEN_RELEASE_TAG }
 
+# An EXPLICIT prefix (-Prefix or HAYVEN_INSTALL_PREFIX) changes what -Check
+# answers: "is hayven installed THERE", not "is hayven available anywhere".
+# CLAUDE_PLUGIN_DATA does not count: the plugin's session hook wants the
+# anywhere answer.
+$PrefixExplicit = (-not [string]::IsNullOrEmpty($Prefix)) -or (-not [string]::IsNullOrEmpty($env:HAYVEN_INSTALL_PREFIX))
+
 # Default install prefix: ${CLAUDE_PLUGIN_DATA} when invoked by the plugin
 # (persists across plugin updates), else ~\.local. We install binaries into
 # <prefix>\bin.
@@ -193,8 +199,14 @@ function Write-Log {
     [Console]::Error.WriteLine($Message)
 }
 
+# Set by every deliberate end of the run (success or Stop-WithError). The main
+# try/finally reads it: a finally that runs with it still false means the run
+# was INTERRUPTED (Ctrl-C), and must not exit 0.
+$script:RunSettled = $false
+
 function Stop-WithError {
     param([string]$Message)
+    $script:RunSettled = $true
     Write-Log ('install-hayven: error: ' + $Message)
     exit 1
 }
@@ -381,13 +393,32 @@ function Enable-Tls12 {
 
 $UserAgent = 'install-hayven.ps1 (+https://github.com/Davidb3l/Hayvenhurst-dev)'
 
+# Download in the BACKGROUND and wait in short sleeps. PowerShell only acts on
+# Ctrl-C between statements (and inside Start-Sleep), never inside a blocking
+# .NET call: with Invoke-WebRequest -OutFile a Ctrl-C pressed at 0 bytes was
+# honored only after the whole tarball had arrived (found on a real Windows
+# 11 box). Polling the task keeps the run interruptible within ~200 ms; the
+# finally cancels the transfer, and the caller's temp dir takes the partial file.
 function Get-RemoteFile {
     param(
         [Parameter(Mandatory = $true)][string]$Uri,
         [Parameter(Mandatory = $true)][string]$OutFile
     )
     Enable-Tls12
-    Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing -UserAgent $UserAgent -ErrorAction Stop | Out-Null
+    $wc = New-Object System.Net.WebClient
+    $wc.Headers.Add('User-Agent', $UserAgent)
+    $task = $null
+    try {
+        $task = $wc.DownloadFileTaskAsync([Uri]$Uri, $OutFile)
+        while (-not $task.IsCompleted) { Start-Sleep -Milliseconds 200 }
+        if ($task.IsFaulted) { throw $task.Exception.GetBaseException() }
+        if ($task.IsCanceled) { throw (New-Object System.OperationCanceledException) }
+    } finally {
+        if ($null -ne $task -and -not $task.IsCompleted) {
+            try { $wc.CancelAsync() } catch { }
+        }
+        $wc.Dispose()
+    }
 }
 
 function Get-RemoteString {
@@ -681,7 +712,7 @@ function Add-BinDirToUserPath {
     } else {
         $env:PATH = $env:PATH.TrimEnd(';') + ';' + $BinDir
     }
-    Write-Log ('install-hayven: added ' + $BinDir + ' to your user PATH.')
+    Write-Log ('install-hayven: added ' + $BinDir + ' to your user PATH (kept its REG_EXPAND_SZ type, so %VAR% entries still expand).')
 }
 
 function Write-PathHint {
@@ -703,7 +734,8 @@ function Write-PathHint {
     } else {
         Write-Log ('note: ' + $BinDir + ' is not on your PATH. Add it with:')
         Write-Log ('      ' + $PathAddCommand)
-        Write-Log '      (or re-run this installer with -AddToPath)'
+        Write-Log '      (it appends to your user Path and keeps its type; the last statement only'
+        Write-Log '      tells running programs that the Path changed. Or re-run this installer with -AddToPath.)'
     }
     Write-Log 'note: PATH changes only reach NEW processes - restart your shell'
     Write-Log '      (and Claude Code / the Claude desktop app) to pick it up.'
@@ -722,6 +754,38 @@ function Get-InstalledVersion {
 }
 
 # ---- -Check: status only, never downloads -----------------------------------
+
+if ($Check -and $PrefixExplicit) {
+    # "Is hayven installed in THIS prefix": answer from the prefix alone. A
+    # hayven elsewhere on PATH is reported, never mistaken for this one (it
+    # used to win outright, so -Check -Prefix <empty dir> exited 0).
+    $onPath = Get-HayvenOnPath
+    $elsewhere = ''
+    if ($null -ne $onPath -and -not [string]::Equals([System.IO.Path]::GetFullPath($onPath), [System.IO.Path]::GetFullPath($BinPath), [System.StringComparison]::OrdinalIgnoreCase)) {
+        $elsewhere = $onPath
+    }
+    if (Test-Path -LiteralPath $BinPath) {
+        $v = Get-InstalledVersion $BinPath
+        $vtxt = ''
+        if ($null -ne $v) { $vtxt = 'version ' + $v + ', ' }
+        if (Test-DirOnProcessPath $BinDir) {
+            Write-Log ('hayven: installed at ' + $BinPath + ' (' + $vtxt + 'on PATH)')
+        } else {
+            Write-Log ('hayven: installed at ' + $BinPath + ' (' + $vtxt + 'not on PATH)')
+        }
+        if ($elsewhere -ne '') { Write-Log ('note: a different hayven comes first on PATH: ' + $elsewhere) }
+        Write-PathHint
+        if (Test-SuiteRepo) { Write-SuiteHint }
+        exit 0
+    }
+    if ($elsewhere -ne '') {
+        Write-Log ('hayven: not installed in ' + $BinDir + ' (another hayven is on PATH: ' + $elsewhere + ')')
+    } else {
+        Write-Log ('hayven: not installed in ' + $BinDir + '. Run /hayvenhurst:install-binary (or plugin\scripts\install-hayven.ps1) to install it.')
+    }
+    if (Test-SuiteRepo) { Write-SuiteHint }
+    exit 3
+}
 
 if ($Check) {
     $onPath = Get-HayvenOnPath
@@ -752,6 +816,19 @@ if ($Check) {
 }
 
 # ---- signature verification --------------------------------------------------
+# cosign under every name it ships as. `winget install Sigstore.Cosign` puts it
+# on PATH as `cosign-windows-amd64` (the release asset's name), NOT `cosign`, so
+# looking for `cosign` alone failed every -RequireSignature install on a stock
+# Windows box and then told the user to run the same winget command again
+# (found on a real Windows 11 box). Returns a launchable path, or $null.
+function Find-Cosign {
+    foreach ($name in @('cosign', 'cosign-windows-amd64', 'cosign-windows-arm64')) {
+        $p = Get-NativeExePath $name
+        if ($null -ne $p) { return $p }
+    }
+    return $null
+}
+
 # Verify with whichever Sigstore verifier is on the box. Pin BOTH the signer
 # identity (this repo's release.yml, at this tag) and the OIDC issuer: an
 # unpinned verify only proves "somebody signed this", not "the release workflow
@@ -779,8 +856,9 @@ SIGNATURE VERIFICATION FAILED for $AssetName
     # not having cosign: an attacker cannot choose which cosign is installed
     # locally, and -RequireSignature still makes the end of that road fatal.
     $cosignOk = $false
-    if ($null -ne (Get-NativeExePath 'cosign')) {
-        $cv = Invoke-Native -FilePath 'cosign' -ArgumentList @('version')
+    $cosign = Find-Cosign
+    if ($null -ne $cosign) {
+        $cv = Invoke-Native -FilePath $cosign -ArgumentList @('version')
         $major = $null
         if ($cv.Output -match 'GitVersion:\s*v?(\d+)\.') { $major = [int]$Matches[1] }
         if ($null -ne $major -and $major -lt 3) {
@@ -795,7 +873,7 @@ SIGNATURE VERIFICATION FAILED for $AssetName
         # Keep the verifier's own diagnostics: on a real identity mismatch
         # cosign prints "expected X, got Y". Swallowing it makes a toolchain
         # problem look identical to a tampered artifact.
-        $r = Invoke-Native -FilePath 'cosign' -ArgumentList @(
+        $r = Invoke-Native -FilePath $cosign -ArgumentList @(
             'verify-blob',
             '--bundle', $Bundle,
             '--certificate-identity', $identity,
@@ -1063,8 +1141,25 @@ try {
     Install-StagedDir -From (Join-Path $stage 'skill') -To (Join-Path $BinDir 'skill')
     # Only now is the install complete; see the idempotence check above.
     Set-Content -LiteralPath $MarkerPath -Value $VersionNumber -Encoding ascii
+    $script:RunSettled = $true
+} catch {
+    # An unexpected terminating error (Ctrl-C never lands here: PowerShell does
+    # not route a pipeline stop through `catch`). Settle the run so the finally
+    # below reports it as a failure, not as an interrupt.
+    Stop-WithError ('unexpected error: ' + $_.Exception.Message)
 } finally {
     Remove-Item -LiteralPath $Tmp -Recurse -Force -ErrorAction SilentlyContinue
+    if (-not $script:RunSettled) {
+        # Reached only when the run was INTERRUPTED (Ctrl-C): every deliberate
+        # end sets RunSettled first. A stopped script otherwise exits 0, so a
+        # cancelled install looked like a success to any caller (found on a real
+        # Windows 11 box). 130 = 128 + SIGINT, what install-hayven.sh exits with.
+        # [Environment]::Exit because `exit` cannot override the stop here; when
+        # this script was dot-invoked in-process (install-sothis.ps1), that ends
+        # the caller too, which is what the user's Ctrl-C asked for.
+        Write-Log 'install-hayven: interrupted; nothing was installed.'
+        [Environment]::Exit(130)
+    }
 }
 
 Write-Log ''
