@@ -13,7 +13,7 @@
 import type { ParsedArgs } from "../cli.ts";
 import { fleetContext, type FleetLane } from "../db/fleet_context.ts";
 import { warnIfStale } from "../db/freshness.ts";
-import { isJson, openProjectDb, requireProject } from "./_shared.ts";
+import { isJson, openProjectDb, readPaths, requireProject, sourceRoot } from "./_shared.ts";
 
 /** Read + validate the lanes JSON (from `--lanes <path>` or stdin via `-`). */
 async function readLanes(spec: string): Promise<FleetLane[] | string> {
@@ -84,8 +84,8 @@ export async function runFleetContext(args: ParsedArgs): Promise<number> {
 
   const db = openProjectDb(ctx, { readonly: true });
   try {
-    warnIfStale(db, ctx.paths);
-    const result = fleetContext(db, ctx.paths.repoRoot, lanes, { sharedMinLanes, exemplars });
+    warnIfStale(db, readPaths(ctx));
+    const result = fleetContext(db, sourceRoot(ctx), lanes, { sharedMinLanes, exemplars });
 
     if (isJson(args.flags)) {
       process.stdout.write(JSON.stringify(result, null, 2) + "\n");

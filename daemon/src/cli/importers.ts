@@ -8,7 +8,7 @@
 import type { ParsedArgs } from "../cli.ts";
 import { warnIfStale } from "../db/freshness.ts";
 import { importersOf, resolveNodeId } from "../db/graph_walk.ts";
-import { isJson, openProjectDb, requireProject } from "./_shared.ts";
+import { isJson, openProjectDb, readPaths, requireProject } from "./_shared.ts";
 
 /** A `/`-containing input is a structured node id (the id scheme is slash-
  *  separated); a bare term is a loose search query. Mirrors impact/refs. */
@@ -31,7 +31,7 @@ export async function runImporters(args: ParsedArgs): Promise<number> {
   }
   const db = openProjectDb(ctx, { readonly: true });
   try {
-    warnIfStale(db, ctx.paths);
+    warnIfStale(db, readPaths(ctx));
     const resolved = resolveNodeId(db, rawId);
     if (!resolved) {
       process.stderr.write(

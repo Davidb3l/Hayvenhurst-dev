@@ -29,7 +29,7 @@ import {
 import { resolveTaskToSymbols } from "../db/task_resolve.ts";
 import { buildEscalatingContext, selectRungForBudget } from "../db/context_escalation.ts";
 import { warnIfStale } from "../db/freshness.ts";
-import { isJson, openProjectDb, requireProject } from "./_shared.ts";
+import { isJson, openProjectDb, readPaths, requireProject, sourceRoot } from "./_shared.ts";
 
 /** Map a file path to a Markdown code-fence language hint (best-effort). */
 function fenceLang(file: string): string {
@@ -145,8 +145,8 @@ async function runEscalateMode(args: ParsedArgs): Promise<number> {
 
   const db = openProjectDb(ctx, { readonly: true });
   try {
-    warnIfStale(db, ctx.paths);
-    const result = buildEscalatingContext(db, ctx.paths.repoRoot, rawId, {
+    warnIfStale(db, readPaths(ctx));
+    const result = buildEscalatingContext(db, sourceRoot(ctx), rawId, {
       maxNeighbors:
         maxNeighbors !== undefined && !Number.isNaN(maxNeighbors)
           ? maxNeighbors
@@ -238,8 +238,8 @@ async function runSymbolMode(args: ParsedArgs): Promise<number> {
 
   const db = openProjectDb(ctx, { readonly: true });
   try {
-    warnIfStale(db, ctx.paths);
-    const pack = buildContextPack(db, ctx.paths.repoRoot, rawId, {
+    warnIfStale(db, readPaths(ctx));
+    const pack = buildContextPack(db, sourceRoot(ctx), rawId, {
       neighbors,
       maxNeighbors:
         maxNeighbors !== undefined && !Number.isNaN(maxNeighbors)
@@ -305,7 +305,7 @@ async function runTaskMode(args: ParsedArgs): Promise<number> {
 
   const db = openProjectDb(ctx, { readonly: true });
   try {
-    warnIfStale(db, ctx.paths);
+    warnIfStale(db, readPaths(ctx));
 
     const resolved = resolveTaskToSymbols(db, taskText, limit);
     if (resolved.length === 0) {
@@ -327,7 +327,7 @@ async function runTaskMode(args: ParsedArgs): Promise<number> {
     // (for --json fidelity); the markdown path renders a cross-pack-deduped view.
     const packs: ContextPack[] = [];
     for (const id of resolved) {
-      const pack = buildContextPack(db, ctx.paths.repoRoot, id, packOpts);
+      const pack = buildContextPack(db, sourceRoot(ctx), id, packOpts);
       if (pack) packs.push(pack);
     }
 

@@ -28,7 +28,7 @@ import type { ParsedArgs } from "../cli.ts";
 import { isLoopbackHost } from "./daemon.ts";
 import { createProxyHandler } from "../proxy/server.ts";
 import { providerById, type ProviderId } from "../proxy/providers.ts";
-import { openProjectDb, requireProject } from "./_shared.ts";
+import { openProjectDb, requireProject, sourceRoot } from "./_shared.ts";
 
 const DEFAULT_PORT = 7788;
 const DEFAULT_PROVIDER: ProviderId = "anthropic";
@@ -162,7 +162,7 @@ export async function runProxy(args: ParsedArgs): Promise<number> {
     : undefined;
 
   const db = openProjectDb(ctx, { readonly: true });
-  const handler = createProxyHandler({ db, repoRoot: ctx.paths.repoRoot, upstream, provider, compact });
+  const handler = createProxyHandler({ db, repoRoot: sourceRoot(ctx), upstream, provider, compact });
 
   let server: ReturnType<typeof Bun.serve>;
   try {
@@ -207,7 +207,7 @@ export async function runProxy(args: ParsedArgs): Promise<number> {
   const exposed = bind.exposed || !isLoopbackHost(reported);
   process.stderr.write(
     `hayven context proxy [${provider.label}] on ${url} → ${upstream}\n` +
-      `  serving ${ctx.paths.repoRoot}\n` +
+      `  serving ${sourceRoot(ctx)}\n` +
       (compact
         ? `  history compaction ON (keep last ${compact.keepRecentMessages ?? 8} messages full)\n`
         : "") +

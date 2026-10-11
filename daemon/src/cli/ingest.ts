@@ -13,6 +13,7 @@ import { existsSync, mkdirSync } from "node:fs";
 
 import { gitDiffSince, gitUntracked, resolveWriteIndex } from "../db/branch_index.ts";
 import { isSourcePath } from "../db/freshness.ts";
+import { nextIngestDirty, writeIngestDirty } from "../db/ingest_dirty.ts";
 import { Db } from "../db/queries.ts";
 import {
   readGitHead,
@@ -24,7 +25,8 @@ import { locateNativeBinary, NativeBinaryNotFound } from "../native/locate.ts";
 import { startParse } from "../native/process.ts";
 import { rootLogger } from "../util/log.ts";
 import type { ParsedArgs } from "../cli.ts";
-import { isJson, requireProject } from "./_shared.ts";
+import { refreshOverlay } from "../worktree/overlay.ts";
+import { isJson, requireProject, type ProjectContext, type ProjectOverlay } from "./_shared.ts";
 
 export async function runIngest(args: ParsedArgs): Promise<number> {
   const logger = rootLogger().child("ingest");
@@ -38,6 +40,12 @@ export async function runIngest(args: ParsedArgs): Promise<number> {
     process.stderr.write((err as Error).message + "\n");
     return 1;
   }
+
+  // Inside a registered worktree (HAYV-13) "the index" is that worktree's
+  // OVERLAY, not the main project's: re-ingest it (incrementally unless
+  // `--full`) and stop. Falling through would rebuild the MAIN index from a
+  // worktree shell, which is what this command did before overlays existed.
+  if (ctx.overlay !== undefined) return ingestOverlay(args, ctx, ctx.overlay);
 
   const { paths, config } = ctx;
 
@@ -223,6 +231,7 @@ export async function runIngest(args: ParsedArgs): Promise<number> {
   if (incrementalFiles !== null && incrementalFiles.length === 0) {
     const now = Date.now();
     const head = readGitHead(paths.repoRoot);
+    const dirtyRecord = nextIngestDirty(db, paths.repoRoot, false);
     // Nothing was re-parsed, so nothing is half-written — but we DID stamp the
     // in-progress marker before the per-file purge above, and returning without
     // clearing it would leave the index flagged BROKEN forever. Record success
@@ -230,6 +239,7 @@ export async function runIngest(args: ParsedArgs): Promise<number> {
     db.transaction(() => {
       db.setStat("last_ingest_at", String(now));
       if (head) db.setStat("last_ingest_git_head", head);
+      writeIngestDirty(db, dirtyRecord);
       // NOT authoritative: this run re-parsed nothing, so its live `counts()` is
       // not its own output and must never LOWER the watermark — a concurrent
       // process holding the graph cleared would otherwise have us commit 0 and
@@ -388,4 +398,40 @@ export async function runIngest(args: ParsedArgs): Promise<number> {
   } finally {
     db.close();
   }
+}
+
+/** `hayven ingest [--full]` from inside a registered worktree: refresh its overlay. */
+async function ingestOverlay(args: ParsedArgs, ctx: ProjectContext, overlay: ProjectOverlay): Promise<number> {
+  if (args.positionals[0] !== undefined) {
+    process.stderr.write(
+      "error: a path-scoped ingest is not supported inside a registered worktree. Run " +
+        "`hayven ingest` (incremental) or `hayven ingest --full` to refresh the worktree's overlay.\n",
+    );
+    return 2;
+  }
+  const full = args.flags["full"] === true || args.flags["full"] === "true";
+  let result;
+  try {
+    result = await refreshOverlay(
+      { paths: ctx.paths, config: ctx.config, entry: overlay.entry },
+      { full, force: true },
+    );
+  } catch (err) {
+    process.stderr.write(
+      `ingest failed: ${(err as Error).message}\n` +
+        "WARNING: the worktree overlay is marked broken; the next read from this worktree rebuilds it.\n",
+    );
+    return 1;
+  }
+  if (isJson(args.flags)) {
+    process.stdout.write(
+      JSON.stringify({ worktree: overlay.worktreeRoot, overlay: overlay.entry.id, ...result, graphNodes: result.nodes }, null, 2) + "\n",
+    );
+  } else {
+    process.stdout.write(
+      `Worktree overlay refreshed (${result.action}${result.seeded ? ", seeded from the main index" : ""}) for ${overlay.worktreeRoot}\n` +
+        `  nodes: ${result.nodes} in graph\n`,
+    );
+  }
+  return 0;
 }

@@ -20,7 +20,7 @@
 import type { ParsedArgs } from "../cli.ts";
 import { planLanes } from "../db/lane_planner.ts";
 import { warnIfStale } from "../db/freshness.ts";
-import { isJson, openProjectDb, requireProject } from "./_shared.ts";
+import { isJson, openProjectDb, readPaths, requireProject } from "./_shared.ts";
 
 export async function runPlanLanes(args: ParsedArgs): Promise<number> {
   // `--symbols` is a boolean flag, but the shared parser greedily treats the
@@ -57,7 +57,7 @@ export async function runPlanLanes(args: ParsedArgs): Promise<number> {
 
   const db = openProjectDb(ctx, { readonly: true });
   try {
-    warnIfStale(db, ctx.paths);
+    warnIfStale(db, readPaths(ctx));
     const plan = planLanes(
       db,
       asSymbols ? { symbols: positionals } : { files: positionals },

@@ -154,7 +154,7 @@ export async function runSummarize(args: ParsedArgs): Promise<number> {
   // Read-only DB handle: we read node rows + neighbors here, and either PUT
   // through the daemon (which owns its own DB) or upsert through a short-lived
   // writable handle on the offline path.
-  const db = openProjectDb(ctx, { readonly: true });
+  const db = openProjectDb(ctx, { readonly: true, mainIndex: true });
   let ids: string[];
   let remainingAtStart = 0;
   try {
@@ -496,7 +496,10 @@ export async function summarizeOfflineAsync(
   onProgress?: (done: number) => void,
 ): Promise<SummarizedNode[]> {
   const out: SummarizedNode[] = [];
-  const db = openProjectDb(ctx, { readonly: false });
+  // Summaries are written through the MAIN project's CRDT op-log and node
+  // markdown, so they read and write the main index even from a registered
+  // worktree (HAYV-13); mixing an overlay graph into that write is incoherent.
+  const db = openProjectDb(ctx, { readonly: false, mainIndex: true });
   const crdt = new CrdtState({
     crdtRoot: ctx.paths.crdtDir,
     configFile: ctx.paths.configFile,

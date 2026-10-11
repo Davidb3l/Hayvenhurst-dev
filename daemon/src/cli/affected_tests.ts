@@ -31,7 +31,7 @@ import {
 } from "../db/affected_tests.ts";
 import { warnIfStale } from "../db/freshness.ts";
 import { prioritize, type PrioritizableTest } from "../db/test_prioritization.ts";
-import { isJson, openProjectDb, requireProject } from "./_shared.ts";
+import { isJson, openProjectDb, readPaths, requireProject } from "./_shared.ts";
 
 /**
  * Config carrying an OPTIONAL `test.patterns` list. The integrator adds the
@@ -205,7 +205,7 @@ export async function runAffectedTests(args: ParsedArgs): Promise<number> {
 
   const db = openProjectDb(ctx, { readonly: true });
   try {
-    warnIfStale(db, ctx.paths);
+    warnIfStale(db, readPaths(ctx));
 
     // `--changed` wins when both are given (the file-oriented entry point).
     const result: AffectedTestsResult = hasChanged

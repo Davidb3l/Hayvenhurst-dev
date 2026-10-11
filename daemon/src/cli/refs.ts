@@ -9,7 +9,7 @@
 import type { ParsedArgs } from "../cli.ts";
 import { warnIfStale } from "../db/freshness.ts";
 import { refsSummary, resolveNodeId, sitesOf } from "../db/graph_walk.ts";
-import { isJson, openProjectDb, requireProject } from "./_shared.ts";
+import { isJson, openProjectDb, readPaths, requireProject } from "./_shared.ts";
 
 /**
  * Does `rawId` LOOK like a structured node id rather than a loose search term?
@@ -38,7 +38,7 @@ export async function runRefs(args: ParsedArgs): Promise<number> {
   }
   const db = openProjectDb(ctx, { readonly: true });
   try {
-    warnIfStale(db, ctx.paths);
+    warnIfStale(db, readPaths(ctx));
     const resolved = resolveNodeId(db, rawId);
     if (!resolved) {
       process.stderr.write(

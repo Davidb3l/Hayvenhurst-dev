@@ -19,6 +19,7 @@ import { IngestSpill, type Db } from "../db/queries.ts";
 import { describeFailure, type ParseRun } from "../native/process.ts";
 import type { NativeRecord } from "../native/protocol.ts";
 import type { Logger } from "../util/log.ts";
+import { nextIngestDirty, writeIngestDirty } from "../db/ingest_dirty.ts";
 
 /**
  * BARREL RE-EXPORTS. Edge resolution moved to `edgeResolver.ts` and the shared
@@ -830,6 +831,11 @@ async function drainIntoIndex(opts: IngestOptions, spill: IngestSpill): Promise<
   // transaction so a slow git never holds a write lock.
   const finishedAt = Date.now();
   const gitHead = readGitHead(opts.repoRoot ?? process.cwd());
+  // The dirty files this index was built from, beside the HEAD it was built
+  // against (see `db/ingest_dirty.ts`): HEAD alone cannot say that the index
+  // holds uncommitted edits, and a worktree overlay seeded from it would serve
+  // them. Same rules as the HEAD read: git outside the transaction, never fatal.
+  const dirtyRecord = nextIngestDirty(db, opts.repoRoot ?? process.cwd(), opts.fullRebuild === true);
 
   // ONE transaction: record success AND clear the in-progress marker together.
   // These must not be separable — a crash between them would either leave a
@@ -838,6 +844,7 @@ async function drainIntoIndex(opts: IngestOptions, spill: IngestSpill): Promise<
   db.transaction(() => {
     db.setStat("last_ingest_at", String(finishedAt));
     if (gitHead) db.setStat("last_ingest_git_head", gitHead);
+    writeIngestDirty(db, dirtyRecord);
     // `last_ingest_nodes` records how many nodes the GRAPH held at the moment
     // this ingest succeeded — the live row count, NOT the native `done`
     // record's count. `checkIndexIntegrity` compares this against the current
