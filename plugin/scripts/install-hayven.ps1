@@ -228,18 +228,25 @@ function Test-RunAsFileTarget {
     try {
         $argv = [Environment]::GetCommandLineArgs()
         $self = [System.IO.Path]::GetFullPath($PSCommandPath)
+        # Pass 1: an explicit -File (any accepted spelling) decides.
         for ($i = 1; $i -lt $argv.Length; $i++) {
-            $a = [string]$argv[$i]
-            if ($a -match '^(-|--|/)(f|fi|fil|file)$') {
+            if ([string]$argv[$i] -match '^(-|--|/)(f|fi|fil|file)$') {
                 if ($i + 1 -ge $argv.Length) { return $false }
                 $target = [System.IO.Path]::GetFullPath([string]$argv[$i + 1])
                 return [string]::Equals($target, $self, [System.StringComparison]::OrdinalIgnoreCase)
             }
-            # pwsh's default parameter IS -File: `pwsh .\install-hayven.ps1`
-            # passes the script path as the first non-switch argument.
-            if (-not $a.StartsWith('-') -and -not $a.StartsWith('/')) {
-                $target = [System.IO.Path]::GetFullPath($a)
-                return [string]::Equals($target, $self, [System.StringComparison]::OrdinalIgnoreCase)
+        }
+        # Pass 2: pwsh's default parameter IS -File, so `pwsh .\install-hayven.ps1`
+        # passes the script path bare. Accept any argument that resolves to this
+        # script. Not "the first non-switch argument": that would be the VALUE
+        # of a switch such as `-ExecutionPolicy Bypass`.
+        for ($i = 1; $i -lt $argv.Length; $i++) {
+            $a = [string]$argv[$i]
+            if ($a.StartsWith('-')) { continue }
+            try {
+                if ([string]::Equals([System.IO.Path]::GetFullPath($a), $self, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+            } catch {
+                Assert-NotStopping $_
             }
         }
     } catch {
