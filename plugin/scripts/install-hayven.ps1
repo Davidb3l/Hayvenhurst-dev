@@ -228,9 +228,17 @@ function Test-RunAsFileTarget {
     try {
         $argv = [Environment]::GetCommandLineArgs()
         $self = [System.IO.Path]::GetFullPath($PSCommandPath)
-        for ($i = 0; $i -lt ($argv.Length - 1); $i++) {
-            if ($argv[$i] -match '^[-/](f|fi|fil|file)$') {
-                $target = [System.IO.Path]::GetFullPath($argv[$i + 1])
+        for ($i = 1; $i -lt $argv.Length; $i++) {
+            $a = [string]$argv[$i]
+            if ($a -match '^(-|--|/)(f|fi|fil|file)$') {
+                if ($i + 1 -ge $argv.Length) { return $false }
+                $target = [System.IO.Path]::GetFullPath([string]$argv[$i + 1])
+                return [string]::Equals($target, $self, [System.StringComparison]::OrdinalIgnoreCase)
+            }
+            # pwsh's default parameter IS -File: `pwsh .\install-hayven.ps1`
+            # passes the script path as the first non-switch argument.
+            if (-not $a.StartsWith('-') -and -not $a.StartsWith('/')) {
+                $target = [System.IO.Path]::GetFullPath($a)
                 return [string]::Equals($target, $self, [System.StringComparison]::OrdinalIgnoreCase)
             }
         }
@@ -1013,6 +1021,11 @@ function Install-StagedDir {
 # (resolving "latest" on a slow network, probing the installed version, the
 # download) is reported as one, never as exit 0. Every deliberate end sets
 # RunSettled first: Stop-WithError, Exit-Settled.
+#
+# Whether we own the process is decided HERE, not in the finally: while a
+# pipeline is stopping, invoking PowerShell functions may itself throw, so the
+# interrupt path below sticks to plain .NET calls.
+$script:OwnsProcess = Test-RunAsFileTarget
 try {
 $Platform = Get-Platform
 $Tag = Resolve-LatestTag
@@ -1178,6 +1191,9 @@ try {
     Install-StagedDir -From (Join-Path $stage 'skill') -To (Join-Path $BinDir 'skill')
     # Only now is the install complete; see the idempotence check above.
     Set-Content -LiteralPath $MarkerPath -Value $VersionNumber -Encoding ascii
+    # Installed AND marked complete: an interrupt during the closing messages
+    # below must not be reported as an unfinished install.
+    $script:RunSettled = $true
 } finally {
     Remove-Item -LiteralPath $Tmp -Recurse -Force -ErrorAction SilentlyContinue
 }
@@ -1206,8 +1222,8 @@ Exit-Settled 0
         # Windows 11 box). 130 = 128 + SIGINT, what install-hayven.sh exits with.
         # The completion marker is removed before any copy and written only after
         # all of them, so a re-run always finishes a partial install.
-        Write-Log 'install-hayven: interrupted. The install is not marked complete; re-run to finish it.'
-        if (Test-RunAsFileTarget) {
+        [Console]::Error.WriteLine('install-hayven: interrupted. The install is not marked complete; re-run to finish it.')
+        if ($script:OwnsProcess) {
             # We own the process (`-File`), and `exit` cannot override a stop
             # from here, so end it with the right code.
             [Environment]::Exit(130)
