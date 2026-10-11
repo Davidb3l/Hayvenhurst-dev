@@ -228,23 +228,27 @@ function Test-RunAsFileTarget {
     try {
         $argv = [Environment]::GetCommandLineArgs()
         $self = [System.IO.Path]::GetFullPath($PSCommandPath)
-        # Pass 1: an explicit -File (any accepted spelling) decides.
+        # A shell kept open with -NoExit is the user's interactive session even
+        # though it was launched on a script: never end it.
+        foreach ($a in $argv) { if ([string]$a -match '^(-|/)(noe|noex|noexi|noexit)$') { return $false } }
+        # ONE ordered pass. The host's own file argument always comes before
+        # the script's arguments, so the first file-ish token decides. (Two
+        # passes misread the script's `-f` - short for -Force - as the host's
+        # -File in `pwsh .\install-hayven.ps1 -f`.)
         for ($i = 1; $i -lt $argv.Length; $i++) {
-            if ([string]$argv[$i] -match '^(-|--|/)(f|fi|fil|file)$') {
+            $a = [string]$argv[$i]
+            if ($a -match '^(-|--|/)(f|fi|fil|file)$') {
                 if ($i + 1 -ge $argv.Length) { return $false }
                 $target = [System.IO.Path]::GetFullPath([string]$argv[$i + 1])
                 return [string]::Equals($target, $self, [System.StringComparison]::OrdinalIgnoreCase)
             }
-        }
-        # Pass 2: pwsh's default parameter IS -File, so `pwsh .\install-hayven.ps1`
-        # passes the script path bare. Accept any argument that resolves to this
-        # script. Not "the first non-switch argument": that would be the VALUE
-        # of a switch such as `-ExecutionPolicy Bypass`.
-        for ($i = 1; $i -lt $argv.Length; $i++) {
-            $a = [string]$argv[$i]
             if ($a.StartsWith('-')) { continue }
+            # A bare token: pwsh's implicit -File. It is ours, another script
+            # (so not ours), or a switch VALUE such as `Bypass` (skip it).
             try {
-                if ([string]::Equals([System.IO.Path]::GetFullPath($a), $self, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+                $full = [System.IO.Path]::GetFullPath($a)
+                if ([string]::Equals($full, $self, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+                if ($full.EndsWith('.ps1', [System.StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $full)) { return $false }
             } catch {
                 Assert-NotStopping $_
             }
