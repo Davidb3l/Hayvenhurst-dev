@@ -76,6 +76,11 @@ HOME_DIR="${HOME:-}"
 # <prefix>/bin.
 DEFAULT_PREFIX="${HAYVEN_INSTALL_PREFIX:-${CLAUDE_PLUGIN_DATA:-${HOME_DIR:+$HOME_DIR/.local}}}"
 PREFIX="$DEFAULT_PREFIX"
+# An EXPLICIT prefix (--prefix or HAYVEN_INSTALL_PREFIX) makes --check answer
+# "is hayven installed THERE", not "is hayven available anywhere". The plugin's
+# SessionStart hook passes neither, so it keeps the anywhere answer.
+PREFIX_EXPLICIT=0
+[ -n "${HAYVEN_INSTALL_PREFIX:-}" ] && PREFIX_EXPLICIT=1
 MODE="install"
 # Make a missing verifier fatal. A BAD signature is fatal regardless.
 REQUIRE_SIG="${HAYVEN_REQUIRE_SIGNATURE:-0}"
@@ -89,7 +94,7 @@ while [ $# -gt 0 ]; do
       TAG="$2"; shift ;;
     --prefix)
       [ -n "${2:-}" ] || { echo "install-hayven: --prefix needs a directory" >&2; exit 2; }
-      PREFIX="$2"; shift ;;
+      PREFIX="$2"; PREFIX_EXPLICIT=1; shift ;;
     --help|-h)
       sed -n '2,62p' "$0"
       exit 0
@@ -328,7 +333,9 @@ print_path_hint() {
       log "  (cygpath was not found, so that is the path as this shell spells it;"
       log "  if it starts with /, substitute its Windows form, e.g. C:\\...)"
     fi
-    log "  (install-hayven.ps1 -AddToPath does this for you.)"
+    log "  (It appends to your user Path and keeps its type; the last statement only"
+    log "  tells running programs that the Path changed. install-hayven.ps1 -AddToPath"
+    log "  does this for you.)"
     log "  Already-running shells, editors and apps must be RESTARTED to see it."
   else
     log "      export PATH=\"$BIN_DIR:\$PATH\"   # add to ~/.zshrc or ~/.bashrc"
@@ -336,6 +343,36 @@ print_path_hint() {
 }
 
 # ---- --check: status only, never downloads ---------------------------------
+if [ "$MODE" = "check" ] && [ "$PREFIX_EXPLICIT" = "1" ]; then
+  # Answer from the prefix alone. A hayven elsewhere on PATH is reported, never
+  # mistaken for this one (it used to win outright, so --check --prefix <empty>
+  # exited 0; found on a real Windows 11 box).
+  # Compare DIRECTORIES as the filesystem resolves them, not strings: a
+  # trailing slash, a relative prefix, /tmp vs /private/tmp, or Git Bash's
+  # /c/... (from `command -v`) vs C:\... (a native --prefix) all name one place.
+  elsewhere=""
+  if have hayven; then
+    found="$(command -v hayven)"
+    found_dir="$(cd "$(dirname "$found")" 2>/dev/null && pwd -P || printf '%s' "$found")"
+    bin_dir_real="$(cd "$BIN_DIR" 2>/dev/null && pwd -P || printf '%s' "$BIN_DIR")"
+    [ "$found_dir" = "$bin_dir_real" ] || elsewhere="$found"
+  fi
+  if [ -x "$BIN_DIR/hayven$EXE" ]; then
+    log "hayven: installed at $BIN_DIR/hayven$EXE"
+    [ -z "$elsewhere" ] || log "note: a different hayven comes first on PATH: $elsewhere"
+    print_path_hint
+    if suite_repo; then suite_hint; fi
+    exit 0
+  fi
+  if [ -n "$elsewhere" ]; then
+    log "hayven: not installed in $BIN_DIR (another hayven is on PATH: $elsewhere)"
+  else
+    log "hayven: not installed in $BIN_DIR. Run /hayvenhurst:install-binary (or plugin/scripts/install-hayven.sh) to install it."
+  fi
+  if suite_repo; then suite_hint; fi
+  exit 3
+fi
+
 if [ "$MODE" = "check" ]; then
   if have hayven; then
     log "hayven: already on PATH ($(command -v hayven))"
@@ -398,9 +435,17 @@ verify_signature() {
   # weaker than not having cosign: an attacker cannot choose which cosign is
   # installed locally, and --require-signature still makes the end of that
   # road fatal.
+  # cosign under every name it ships as: `winget install Sigstore.Cosign` puts
+  # it on PATH as `cosign-windows-amd64` (the release asset's name), not
+  # `cosign`, so Git Bash users who followed our own hint had no verifier
+  # (found on a real Windows 11 box).
+  cosign_cmd=""
+  for c in cosign cosign-windows-amd64 cosign-windows-arm64; do
+    if have "$c"; then cosign_cmd="$c"; break; fi
+  done
   cosign_ok=0
-  if have cosign; then
-    cosign_major="$(cosign version 2>/dev/null | sed -n 's/^GitVersion:[[:space:]]*v\{0,1\}\([0-9][0-9]*\)\..*/\1/p' | head -1)"
+  if [ -n "$cosign_cmd" ]; then
+    cosign_major="$("$cosign_cmd" version 2>/dev/null | sed -n 's/^GitVersion:[[:space:]]*v\{0,1\}\([0-9][0-9]*\)\..*/\1/p' | head -1)"
     if [ -n "$cosign_major" ] && [ "$cosign_major" -lt 3 ]; then
       log "install-hayven: note: found cosign $cosign_major.x; this installer verifies with cosign 3+ (older cosign reads this bundle format only with extra flags). Not using it."
     else
@@ -413,7 +458,7 @@ verify_signature() {
     # Keep the verifier's own diagnostics: on a real identity mismatch cosign
     # prints "expected X, got Y". Swallowing it makes a toolchain problem look
     # identical to a tampered artifact.
-    if ! verify_out="$(cosign verify-blob \
+    if ! verify_out="$("$cosign_cmd" verify-blob \
       --bundle "$bundle" \
       --certificate-identity "$identity" \
       --certificate-oidc-issuer "$issuer" \
@@ -576,6 +621,10 @@ install_one() { # install_one <file name>
   fi
   log "install-hayven: installed $BIN_DIR/$name"
 }
+# Same completion marker install-hayven.ps1 keys its idempotence on: removed
+# before the copies, written only after both binaries (and the dirs below) are
+# in place, so a .ps1 run on a prefix this script filled can say "nothing to do".
+rm -f "$BIN_DIR/.hayven-installed-version"
 install_one "hayven$EXE"
 install_one "hayven-native$EXE"
 
@@ -592,6 +641,8 @@ if [ -d "$STAGE/skill" ]; then
   mkdir -p "$BIN_DIR/skill"
   cp -R "$STAGE/skill/." "$BIN_DIR/skill/"
 fi
+
+printf '%s\n' "$VERSION" > "$BIN_DIR/.hayven-installed-version" 2>/dev/null || true
 
 log ""
 log "install-hayven: done. hayven $VERSION installed for $PLATFORM."

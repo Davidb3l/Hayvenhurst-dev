@@ -92,6 +92,13 @@ jobs:
           if ($r.Code -ne 0) { throw "re-run exited $($r.Code)" }
           if ($r.Text -notmatch 'nothing to do') { throw 're-run was not a no-op' }
 
+          # -Check with an EXPLICIT prefix answers for that prefix only. This
+          # process's PATH now holds ps51\bin (the -AddToPath above), so before
+          # the fix an empty prefix still exited 0 ("already on PATH").
+          $r = Invoke-Installer @('-Prefix', (Join-Path $env:RUNNER_TEMP 'empty51'), '-Check')
+          if ($r.Code -ne 3) { throw "-Check -Prefix <empty> with hayven on PATH exited $($r.Code), want 3" }
+          if ($r.Text -notmatch 'another hayven is on PATH') { throw '-Check did not name the other hayven' }
+
           # -Force reinstalls, and with cosign present the signature is verified.
           $r = Invoke-Installer @('-Prefix', $pfx, '-Force', '-RequireSignature')
           if ($r.Code -ne 0) { throw "-Force exited $($r.Code)" }
@@ -148,6 +155,17 @@ jobs:
           $r = Invoke-Installer @('-Prefix', $p6, '-Version', 'v0.0.6')
           if ($r.Code -ne 0 -or $r.Text -notmatch 'nothing to do') { throw 'pinned v0.0.6 re-run was not a no-op' }
 
+          # winget installs cosign as `cosign-windows-amd64`, not `cosign`. With
+          # ONLY that name on PATH the signature must still verify.
+          $real = (Get-Command cosign -CommandType Application | Select-Object -First 1).Path
+          $alias = Join-Path $env:RUNNER_TEMP 'wingetcosign'
+          New-Item -ItemType Directory -Path $alias -Force | Out-Null
+          Copy-Item -LiteralPath $real -Destination (Join-Path $alias 'cosign-windows-amd64.exe')
+          $noCosign = ($env:PATH -split ';' | Where-Object { $_ -and -not (Test-Path -LiteralPath (Join-Path $_ 'cosign.exe')) }) -join ';'
+          $r = Invoke-Installer @('-Prefix', (Join-Path $env:RUNNER_TEMP 'winget'), '-Version', 'v0.0.7', '-RequireSignature') @{ PATH = ($alias + ';' + $noCosign) }
+          if ($r.Code -ne 0) { throw "winget-named cosign install exited $($r.Code)" }
+          if ($r.Text -notmatch 'signature OK \(cosign\)') { throw 'winget-named cosign was not used' }
+
           # A release that predates signing has no bundle: must fail closed.
           $old = Join-Path $env:RUNNER_TEMP 'old'
           $r = Invoke-Installer @('-Prefix', $old, '-Version', 'v0.0.5')
@@ -182,6 +200,19 @@ jobs:
             echo "PATH hint printed a native path to bash"; exit 1
           fi
           sh plugin/scripts/install-hayven.sh --prefix "$pfx" --check
+          # The .sh writes the same completion marker as the .ps1.
+          test "$(cat "$bin/.hayven-installed-version")" = "0.0.7"
+          # winget-named cosign only (no plain `cosign` on PATH) still verifies.
+          wdir="$RUNNER_TEMP/wingetcosign-sh"; mkdir -p "$wdir"
+          cp "$(command -v cosign)" "$wdir/cosign-windows-amd64.exe"
+          # Every PATH entry except those holding a plain cosign. The trailing
+          # newline lets `read` see the last entry, and `if` (not an && chain)
+          # keeps the loop's exit status 0 under `set -e`.
+          nocos="$(printf '%s\n' "$PATH" | tr ':' '\n' | while IFS= read -r d; do
+            if [ -n "$d" ] && [ ! -e "$d/cosign.exe" ] && [ ! -e "$d/cosign" ]; then printf '%s:' "$d"; fi
+          done)"
+          PATH="$wdir:$nocos" sh plugin/scripts/install-hayven.sh --prefix "$RUNNER_TEMP/gb-winget" --version v0.0.7 --require-signature 2>&1 | tee "$RUNNER_TEMP/gbw.log"
+          grep -q 'signature OK (cosign)' "$RUNNER_TEMP/gbw.log"
           # On PATH (POSIX form): no "not on your PATH" note.
           PATH="$bin:$PATH" sh plugin/scripts/install-hayven.sh --prefix "$pfx" --version v0.0.7 2>&1 | tee "$RUNNER_TEMP/gb2.log"
           if grep -q 'is not on your PATH' "$RUNNER_TEMP/gb2.log"; then
