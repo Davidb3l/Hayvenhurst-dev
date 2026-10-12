@@ -993,9 +993,46 @@ SIGNATURE VERIFICATION FAILED for $AssetName
     Write-Log 'install-hayven: WARNING: then re-run with -RequireSignature.'
 }
 
+# Say WHICH processes are running from $Path and how to stop each one. The
+# daemon is not the only holder: every open Claude Code session that uses hayven
+# runs its own `hayven mcp` server from the same hayven.exe, and
+# `hayven daemon stop` does not touch those, so the old one-line advice left
+# the user stuck re-running a failing install (found on a real Windows 11 box).
+# Best-effort: on any failure it falls back to naming both kinds of holder.
+function Get-LockHolderAdvice {
+    param([string]$Path)
+    $generic = 'Stop the daemon (hayven daemon stop) and close or restart any Claude Code (or other agent) session using hayven - its `hayven mcp` server runs from this file - then re-run.'
+    try {
+        $leaf = Split-Path -Leaf $Path
+        $holders = @(Get-CimInstance -ClassName Win32_Process -Filter ("Name = '" + $leaf.Replace("'", "''") + "'") -ErrorAction Stop |
+            Where-Object { [string]::Equals([string]$_.ExecutablePath, $Path, [System.StringComparison]::OrdinalIgnoreCase) })
+        if ($holders.Count -eq 0) { return $generic }
+        $lines = @('Running from that file:')
+        foreach ($h in $holders) {
+            $cmd = [string]$h.CommandLine
+            if ($cmd -match '\bmcp\b') {
+                $how = 'a `hayven mcp` server of an open Claude Code (or other agent) session: close or restart that session'
+            } elseif ($cmd -match '\bdaemon\b' -or $cmd -match '\bwatch\b') {
+                $how = 'the daemon (or one of its watchers): run `hayven daemon stop`'
+            } else {
+                $how = 'run `Stop-Process -Id ' + $h.ProcessId + '` if it is safe to end'
+            }
+            if ($cmd.Length -gt 100) { $cmd = $cmd.Substring(0, 97) + '...' }
+            $lines += ('          pid ' + $h.ProcessId + '  ' + $cmd)
+            $lines += ('            -> ' + $how)
+        }
+        $lines += '        Then re-run this installer.'
+        return ($lines -join "`n")
+    } catch {
+        Assert-NotStopping $_
+        return $generic
+    }
+}
+
 # Copy one staged file into BinDir. Atomic-ish: write then move into place. A
-# running hayven.exe (the daemon) holds a lock on the destination, so say which
-# process to stop rather than leaving a half-written binary.
+# running hayven.exe (the daemon, or a `hayven mcp` server) holds a lock on the
+# destination, so say which process to stop rather than leaving a half-written
+# binary.
 function Install-StagedFile {
     param([string]$Stage, [string]$Name)
     $src = Join-Path $Stage $Name
@@ -1008,8 +1045,10 @@ function Install-StagedFile {
     } catch {
         Remove-Item -LiteralPath $tmpDst -Force -ErrorAction SilentlyContinue
         Assert-NotStopping $_
-        Stop-WithError ('could not replace ' + $dst + ' - is hayven running? Stop it (hayven daemon stop) and re-run.
-        ' + $_.Exception.Message)
+        $reason = $_.Exception.Message.Trim()
+        Stop-WithError ('could not replace ' + $dst + ' - it is in use.
+        ' + (Get-LockHolderAdvice $dst) + '
+        (' + $reason + ')')
     }
     Write-Log ('install-hayven: installed ' + $dst)
 }
