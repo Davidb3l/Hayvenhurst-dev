@@ -19,6 +19,7 @@ import { join } from "node:path";
 
 import { daemonStartLockFile } from "../src/daemon/lifecycle.ts";
 import { registryFile } from "../src/daemon/registry.ts";
+import { sweepDaemons } from "./_helpers.ts";
 
 const CLI = join(import.meta.dir, "..", "src", "cli.ts");
 
@@ -48,31 +49,6 @@ async function assertPortUnanswered(port: number): Promise<void> {
     return;
   }
   throw new Error(`test precondition failed: something is already answering on port ${port}`);
-}
-
-function daemonPidsFor(port: number): number[] {
-  const r = Bun.spawnSync({ cmd: ["ps", "ax", "-o", "pid=,command="], stdout: "pipe", stderr: "ignore" });
-  return r.stdout
-    .toString()
-    .split("\n")
-    .filter((l) => l.includes("daemon start --foreground") && l.includes(`--port ${port}`))
-    .map((l) => Number(l.trim().split(/\s+/)[0]))
-    .filter((n) => Number.isInteger(n) && n > 0);
-}
-
-async function sweepDaemons(port: number): Promise<void> {
-  for (let round = 0; round < 20; round++) {
-    const pids = daemonPidsFor(port);
-    if (pids.length === 0) return;
-    for (const pid of pids) {
-      try {
-        process.kill(pid, "SIGKILL");
-      } catch {
-        /* already gone */
-      }
-    }
-    await new Promise((r) => setTimeout(r, 100));
-  }
 }
 
 describe("HAYV-7: a stale start lock does not wedge `daemon start`", () => {

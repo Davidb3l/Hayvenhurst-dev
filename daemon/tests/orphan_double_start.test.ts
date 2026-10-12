@@ -21,6 +21,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { registryFile } from "../src/daemon/registry.ts";
+import { daemonPidsFor, sweepDaemons } from "./_helpers.ts";
 
 const CLI = join(import.meta.dir, "..", "src", "cli.ts");
 
@@ -60,38 +61,6 @@ function childEnv(home: string, port: number): Record<string, string> {
     HAYVEN_HOST: "127.0.0.1",
     HAYVEN_LOG_LEVEL: "warn",
   };
-}
-
-/**
- * Every live pid whose command line marks it as a foreground daemon bound to
- * `port`. The `--port <port>` argument is forwarded verbatim to the detached
- * child, so it uniquely fingerprints THIS test's daemons - an ephemeral port
- * appears in no other process on the machine.
- */
-function daemonPidsFor(port: number): number[] {
-  const r = Bun.spawnSync({ cmd: ["ps", "ax", "-o", "pid=,command="], stdout: "pipe", stderr: "ignore" });
-  return r.stdout
-    .toString()
-    .split("\n")
-    .filter((l) => l.includes("daemon start --foreground") && l.includes(`--port ${port}`))
-    .map((l) => Number(l.trim().split(/\s+/)[0]))
-    .filter((n) => Number.isInteger(n) && n > 0);
-}
-
-/** SIGKILL every daemon this test's port fingerprints, and wait them out. */
-async function sweepDaemons(port: number): Promise<void> {
-  for (let round = 0; round < 20; round++) {
-    const pids = daemonPidsFor(port);
-    if (pids.length === 0) return;
-    for (const pid of pids) {
-      try {
-        process.kill(pid, "SIGKILL");
-      } catch {
-        /* already gone */
-      }
-    }
-    await new Promise((r) => setTimeout(r, 100));
-  }
 }
 
 async function runCli(
