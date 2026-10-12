@@ -1227,7 +1227,9 @@ async function startDetachedDaemon(args: ParsedArgs): Promise<number> {
     // now. Wait - bounded - for its daemon to come up, then join it via the
     // ordinary already-running path and exit 0. If the lock evaporates instead
     // (the winner failed before spawning), take it and proceed ourselves.
-    const deadline = Date.now() + startLockWaitMs();
+    // Read once: the override is validated (and warned about) per call.
+    const lockWaitMs = startLockWaitMs();
+    const deadline = Date.now() + lockWaitMs;
     for (;;) {
       const seen = await probeDaemon(base);
       if (seen.kind === "hayven") {
@@ -1255,7 +1257,7 @@ async function startDetachedDaemon(args: ParsedArgs): Promise<number> {
         const holder = readStartLockPid(lockPath);
         process.stderr.write(
           `error: another \`hayven daemon start\`${holder !== null ? ` (pid ${holder})` : ""} has held the ` +
-            `start lock for over ${Math.round(startLockWaitMs() / 1000)}s and no daemon has appeared at ${base}.\n` +
+            `start lock for over ${Math.round(lockWaitMs / 1000)}s and no daemon has appeared at ${base}.\n` +
             `If that process is gone, remove the lock and retry: ${lockPath}\n`,
         );
         return 1;
@@ -1298,8 +1300,9 @@ function startLockWaitMs(): number {
   const raw = process.env["HAYVEN_START_LOCK_WAIT_MS"];
   if (raw === undefined || raw.trim().length === 0) return START_LOCK_WAIT_MS;
   const n = Number(raw);
-  if (!Number.isFinite(n) || n <= 0) return START_LOCK_WAIT_MS;
+  // Floor BEFORE the bound check: "0.5" passes `n <= 0` but is a 0 ms wait.
   const waitMs = Math.floor(n);
+  if (!Number.isFinite(waitMs) || waitMs < 1) return START_LOCK_WAIT_MS;
   if (waitMs < DETACH_COLD_START_TIMEOUT_MS) {
     process.stderr.write(
       `warning: HAYVEN_START_LOCK_WAIT_MS=${waitMs} is below the ${DETACH_COLD_START_TIMEOUT_MS} ms ` +

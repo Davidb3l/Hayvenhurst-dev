@@ -993,6 +993,33 @@ SIGNATURE VERIFICATION FAILED for $AssetName
     Write-Log 'install-hayven: WARNING: then re-run with -RequireSignature.'
 }
 
+# Classify on the SUBCOMMAND, never on a substring of the whole command line:
+# that line starts with the executable's path and a watcher's ends with
+# `--root <repo>`, so a prefix like C:\tools\mcp\ or a repo named
+# github-mcp-server would label the daemon a Claude Code session and send the
+# user to close sessions while the daemon keeps the file locked.
+function Get-Subcommand {
+    param([string]$CommandLine, [string]$ExePath)
+    $rest = $CommandLine.TrimStart()
+    if ($rest.StartsWith('"')) {
+        $close = $rest.IndexOf('"', 1)
+        $rest = if ($close -lt 0) { '' } else { $rest.Substring($close + 1) }
+    } elseif ($rest.StartsWith($ExePath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        # An unquoted path, possibly with spaces in it.
+        $rest = $rest.Substring($ExePath.Length)
+    } else {
+        $rest = $rest -replace '^\S+', ''   # a bare name such as `hayven`
+    }
+    $tokens = @($rest -split '\s+' | Where-Object { $_ -ne '' })
+    for ($i = 0; $i -lt $tokens.Count; $i++) {
+        $t = $tokens[$i]
+        if ($t -eq '--root') { $i++; continue }   # the one global option with a value
+        if ($t.StartsWith('-')) { continue }
+        return $t.Trim('"').ToLowerInvariant()
+    }
+    return ''
+}
+
 # Say WHICH processes are running from $Path and how to stop each one. The
 # daemon is not the only holder: every open Claude Code session that uses hayven
 # runs its own `hayven mcp` server from the same hayven.exe, and
@@ -1010,9 +1037,10 @@ function Get-LockHolderAdvice {
         $lines = @('Running from that file:')
         foreach ($h in $holders) {
             $cmd = [string]$h.CommandLine
-            if ($cmd -match '\bmcp\b') {
+            $sub = Get-Subcommand $cmd $Path
+            if ($sub -eq 'mcp') {
                 $how = 'a `hayven mcp` server of an open Claude Code (or other agent) session: close or restart that session'
-            } elseif ($cmd -match '\bdaemon\b' -or $cmd -match '\bwatch\b') {
+            } elseif ($sub -eq 'daemon' -or $sub -eq 'watch') {
                 $how = 'the daemon (or one of its watchers): run `hayven daemon stop`'
             } else {
                 $how = 'run `Stop-Process -Id ' + $h.ProcessId + '` if it is safe to end'
