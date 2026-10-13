@@ -3,7 +3,13 @@
  *
  * Search order (first hit wins):
  *   1. `$HAYVEN_NATIVE_BIN` env var.
- *   2. Sibling of `process.argv[1]` (same directory as the `hayven` CLI binary).
+ *   2. Sibling of the `hayven` CLI binary. In a `bun build --compile` exe
+ *      `process.argv[1]` is a VIRTUAL path (`B:\~BUN\root\hayven.exe`, or
+ *      `/$bunfs/root/hayven` on POSIX) whose directory does not exist on disk,
+ *      so the real executable's directory (`dirname(process.execPath)`) is
+ *      searched FIRST there. In source mode (`bun src/cli.ts`) `argv[1]` is the
+ *      script and `execPath` is the `bun` runtime: argv[1]'s dir first, then
+ *      execPath's.
  *   3. `<repo>/native/target/release/hayven-native`
  *   4. `<repo>/native/target/debug/hayven-native`
  *   5. `hayven-native` on `$PATH`.
@@ -34,10 +40,22 @@ export interface LocateOptions {
   repoRoot?: string;
   /** Override of `process.argv[1]`, for testing. */
   argv1?: string;
+  /** Override of `process.execPath`, for testing. */
+  execPath?: string;
   /** Override of `process.env.PATH`, for testing. */
   pathEnv?: string;
   /** Override of `process.env.HAYVEN_NATIVE_BIN`, for testing. */
   envOverride?: string;
+}
+
+/**
+ * True when `script` (a `process.argv[1]`) is the virtual entrypoint of a
+ * `bun build --compile` executable. Mirrors the detection in
+ * `daemon/detach.ts buildDetachedCommand`.
+ */
+export function isCompiledEntrypoint(script: string | undefined): boolean {
+  if (!script) return false;
+  return script.startsWith("/$bunfs") || script.includes("$bunfs") || script.includes("~BUN");
 }
 
 function isExecutableFile(path: string): boolean {
@@ -58,8 +76,15 @@ export function locateNativeBinary(opts: LocateOptions = {}): string {
   if (env && env.length > 0) candidates.push(resolve(env));
 
   const argv1 = opts.argv1 ?? process.argv[1];
-  if (argv1) {
-    candidates.push(join(dirname(resolve(argv1)), BINARY_NAME));
+  const execPath = opts.execPath ?? process.execPath;
+  const argvCandidate = argv1 ? join(dirname(resolve(argv1)), BINARY_NAME) : null;
+  const execCandidate = execPath ? join(dirname(resolve(execPath)), BINARY_NAME) : null;
+  // Compiled exe: argv[1] is virtual, so the real exe dir is the sibling.
+  const ordered = isCompiledEntrypoint(argv1)
+    ? [execCandidate, argvCandidate]
+    : [argvCandidate, execCandidate];
+  for (const c of ordered) {
+    if (c !== null && !candidates.includes(c)) candidates.push(c);
   }
 
   if (opts.repoRoot) {

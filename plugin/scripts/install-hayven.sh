@@ -221,15 +221,16 @@ suite_hint() {
   have amt    || s_missing="$s_missing Ametrite"
   have sirius || s_missing="$s_missing Sirius"
   # Prefix match: catryna installs as `catryna@<marketplace>` and there are two
-  # legitimate marketplaces (its own `catryna-wikinelli`, and the Sothis bundle
-  # `sirius-forester`). Pinning one key nags bundle users forever.
+  # legitimate marketplaces (its own `catryna-wikinelli`, and the Sothis suite
+  # marketplace `sothis`; the legacy bundle name `sirius-forester` also still
+  # matches). Pinning one key nags bundle users forever.
   grep -qs '"catryna@' "${HOME_DIR:-/nonexistent}/.claude/plugins/installed_plugins.json" \
     || s_missing="$s_missing Catryna"
   if [ -z "$s_missing" ]; then return 0; fi
   log ""
   log "fleet suite: missing:$s_missing. Hayvenhurst is the suite's code graph; for full fleet control install the whole suite:"
-  case "$s_missing" in *Sirius*)   log "  Sirius Forester (fleet foreman): /plugin marketplace add Davidb3l/Sirius-Forester, /plugin install sirius@sirius-forester, then /sirius:install-binary" ;; esac
-  case "$s_missing" in *Catryna*)  log "  Catryna Wikinelli (code wiki): /plugin marketplace add Davidb3l/Catryna-Wikinelli, then /plugin install catryna@catryna-wikinelli (Sothis bundle users: /plugin install catryna@sirius-forester)" ;; esac
+  case "$s_missing" in *Sirius*)   log "  Sirius Forester (fleet foreman): /plugin marketplace add Davidb3l/Sothis, /plugin install sirius@sothis, then /sirius:install-binary (the legacy sirius@sirius-forester marketplace still works)" ;; esac
+  case "$s_missing" in *Catryna*)  log "  Catryna Wikinelli (code wiki): /plugin marketplace add Davidb3l/Sothis, then /plugin install catryna@sothis (standalone: Davidb3l/Catryna-Wikinelli + catryna@catryna-wikinelli; legacy catryna@sirius-forester still works)" ;; esac
   case "$s_missing" in *Ametrite*) log "  Ametrite (task board): ask Claude to \"ametrite this repo\" (the skill bootstraps the amt CLI)" ;; esac
 }
 

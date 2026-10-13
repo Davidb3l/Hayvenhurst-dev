@@ -1,5 +1,6 @@
 {
   "name": "hayvenhurst",
+  "description": "Hayvenhurst: a persistent, trace-augmented code graph for AI coding agents. Installs the hayvenhurst Agent Skill and slash commands that steer Claude Code toward the local hayven CLI instead of grep. Also part of the Sothis suite marketplace (hayvenhurst@sothis).",
   "owner": {
     "name": "Hayvenhurst",
     "email": "dev@hayvenhurst.dev"

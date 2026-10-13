@@ -19,7 +19,7 @@ import { homedir } from "node:os";
 import { loadConfig } from "../config/load.ts";
 import { DETACH_HEALTH_TIMEOUT_MS, DETACH_PROBE_TIMEOUT_MS } from "../daemon/detach.ts";
 import { sameProjectRoot, type ProjectEntry } from "../daemon/registry.ts";
-import { canonicalRoot, detectRepoRoot } from "../util/paths.ts";
+import { detectRepoRoot, sameRoot } from "../util/paths.ts";
 import { hotAddToRunningDaemon, probeDaemonGlobalHome, type HotAddResult } from "./_shared.ts";
 
 /**
@@ -39,7 +39,7 @@ export function homeIsSandboxed(
 ): boolean {
   const envValue = env["HAYVEN_HOME"];
   if (envValue === undefined || envValue.trim().length === 0) return false;
-  return canonicalRoot(envValue.trim()) !== canonicalRoot(realHome);
+  return !sameRoot(envValue.trim(), realHome);
 }
 
 /** One project a live daemon reports serving (`GET /api/projects`). */

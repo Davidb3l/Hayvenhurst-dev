@@ -117,7 +117,7 @@ describe("doctor --json envelope (SUITE_CONTRACTS §3)", () => {
     expect(env["capabilities"]).not.toContain("resolve");
   });
 
-  it("emits {name, ok, detail} check rows with stable snake_case names", () => {
+  it("emits {name, ok, detail, gating} check rows with stable snake_case names", () => {
     const env = doctorEnvelope(reportFixture());
     const checks = env["checks"] as Array<Record<string, unknown>>;
     expect(checks.length).toBe(4);
@@ -126,8 +126,10 @@ describe("doctor --json envelope (SUITE_CONTRACTS §3)", () => {
       expect(typeof c["ok"]).toBe("boolean");
       expect(typeof c["detail"]).toBe("string");
       expect(c["name"]).toMatch(/^[a-z0-9]+(_[a-z0-9]+)*$/);
-      // The internal `gating` flag stays internal — the wire rows are §3-exact.
-      expect("gating" in c).toBe(false);
+      // `gating` rides the wire (matching the sirius doctor contract) so a
+      // suite consumer can tell an advisory row from a broken-install row
+      // without hardcoding check names (HD-7).
+      expect(typeof c["gating"]).toBe("boolean");
     }
     expect(checks.map((c) => c["name"])).toEqual([
       "bun_version",
@@ -135,6 +137,8 @@ describe("doctor --json envelope (SUITE_CONTRACTS §3)", () => {
       "sqlite_fts5_trigram",
       "tier3_model",
     ]);
+    // The advisory/gating split survives serialization verbatim.
+    expect(checks.map((c) => c["gating"])).toEqual([true, true, true, false]);
   });
 
   it("reports failure in `ok`, not by hiding the envelope (§3.1 present-but-unhealthy)", () => {
@@ -199,16 +203,24 @@ describe("doctor --json stdout discipline", () => {
     const checks = env["checks"] as Array<Record<string, unknown>>;
     const tier3 = checks.find((c) => c["name"] === "tier3_model");
     expect(tier3).toBeDefined();
+    // The advisory marker itself is on the wire (HD-7): a consumer reads it
+    // instead of hardcoding "tier3_model".
+    expect(tier3?.["gating"]).toBe(false);
     // Guard the guard: if a model ever IS present here, this test would be
     // vacuous — assert the coupling only in the state that can disprove it.
-    if (tier3?.["ok"] === false) {
+    // (Skip when some UNRELATED gating row genuinely fails on this machine —
+    // e.g. a stale installed hayven-native — which legitimately makes ok:false
+    // regardless of tier3_model; the fold assertion below still bites there.)
+    const gatingFailure = checks.some((c) => c["gating"] === true && c["ok"] === false);
+    if (tier3?.["ok"] === false && !gatingFailure) {
       expect(env["ok"]).toBe(true);
     }
-    // Gating rows and the envelope must always agree.
-    for (const name of ["bun_version", "hayven_native", "sqlite_fts5_trigram"]) {
-      const row = checks.find((c) => c["name"] === name);
-      if (row?.["ok"] === false) expect(env["ok"]).toBe(false);
+    // The wire invariant a suite consumer relies on: every row carries a
+    // boolean `gating`, and `ok` is exactly the fold over the gating rows.
+    for (const row of checks) {
+      expect(typeof row["gating"]).toBe("boolean");
     }
+    expect(env["ok"]).toBe(checks.every((c) => !c["gating"] || c["ok"]));
   });
 
   it("emits an ok:false envelope (exit 0) when doctor cannot even run its checks", async () => {
@@ -225,6 +237,12 @@ describe("doctor --json stdout discipline", () => {
     expect(env["tool"]).toBe("hayven");
     expect(env["ok"]).toBe(false);
     expect(env["version"]).toBe(VERSION);
+    // Even the could-not-run row carries the wire `gating` flag, and it gates —
+    // the fields must agree with the envelope's ok:false.
+    const ran = (env["checks"] as Array<Record<string, unknown>>).find(
+      (c) => c["name"] === "doctor_ran",
+    );
+    expect(ran?.["gating"]).toBe(true);
   });
 
   it("stays parseable and exits 0 when a check fails (present-but-unhealthy)", async () => {

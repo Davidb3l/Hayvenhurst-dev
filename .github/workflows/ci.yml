@@ -65,6 +65,27 @@ jobs:
         env:
           HAYVEN_NATIVE_BIN: ${{ github.workspace }}/native/target/release/hayven-native
 
+  plugin:
+    name: Claude Code plugin manifests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # `claude plugin validate` is the same check Claude Code runs when it loads
+      # the plugin. It caught SKILL.md frontmatter that YAML could not parse
+      # (all metadata silently dropped at runtime). Static, needs no auth. The
+      # version is pinned so a CLI release cannot redden an unrelated PR; bump
+      # it deliberately.
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code@2.1.296
+
+      - name: Validate plugin
+        run: claude plugin validate plugin/
+
+      - name: Validate marketplace
+        run: claude plugin validate .
+
   viewer:
     name: Viewer (Astro / Preact)
     runs-on: ubuntu-latest

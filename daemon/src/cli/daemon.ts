@@ -71,6 +71,7 @@ import {
 } from "../daemon/detach.ts";
 import {
   canonicalRoot,
+  sameRoot,
   globalHayvenDir,
   globalLogsDir,
   hayvenPathsFor,
@@ -91,7 +92,7 @@ import {
 } from "../daemon/registry.ts";
 import { parseMaxFiles, refuseIfOverCeiling } from "./init.ts";
 import { pruneWorktreeOverlays } from "../worktree/registry.ts";
-import { hotAddToRunningDaemon, requireProject } from "./_shared.ts";
+import { hotAddToRunningDaemon, requireProject, staleDaemonNote } from "./_shared.ts";
 import { connectLiveDaemon } from "./projects_live.ts";
 import { VERSION } from "../version.ts";
 
@@ -805,7 +806,12 @@ const DAEMON_USAGE = `hayven daemon <subcommand>
                            instead of "stopped". Exit codes: 0 running;
                            1 not running (stopped/stale pidfile); 3 an orphan
                            hayven daemon is answering on the address.
-  restart                  Alias for stop + start.
+  restart                  Stop the running daemon (if any), wait - bounded - for
+                           its address to go quiet, then start it again. Takes
+                           stop's and start's flags (--port/--host). Exits with
+                           stop's code if it could not stop, 1 if the address
+                           never went quiet (no second daemon is started over
+                           a live one), else start's code.
   logs                     Tail the daemon logs.
   register [<path>]        Register a project so the daemon serves it. Defaults
                            to the cwd project. --alias <x> names it. Refuses a
@@ -820,13 +826,15 @@ To rename, relocate (after moving a repo), prune or inspect registrations
 (status, index size, what the running daemon serves), see \`hayven projects help\`.
 `;
 
-export async function runDaemon(args: ParsedArgs): Promise<number> {
+export async function runDaemon(args: ParsedArgs, deps: { restart?: RestartDeps } = {}): Promise<number> {
   const sub = args.positionals[0] ?? "status";
   switch (sub) {
     case "start":
       return startDaemon(args);
     case "stop":
       return stopDaemon(args);
+    case "restart":
+      return restartDaemon(args, deps.restart);
     case "status":
       return statusDaemon(args);
     case "register":
@@ -908,7 +916,16 @@ async function registerDaemonProject(args: ParsedArgs): Promise<number> {
   const hot = await hotAddToRunningDaemon(root, base, alias);
   switch (hot.kind) {
     case "added":
-      process.stdout.write(`added live to the running daemon (no restart needed)\n`);
+      {
+        const stale = staleDaemonNote(hot.daemonVersion);
+        // "no restart needed" is only true when the daemon is this CLI's build.
+        process.stdout.write(
+          stale === null
+            ? `added live to the running daemon (no restart needed)\n`
+            : `added live to the running daemon (v${hot.daemonVersion})\n`,
+        );
+        if (stale !== null) process.stderr.write(`${stale}\n`);
+      }
       break;
     case "exists":
       process.stdout.write(`already served by the running daemon\n`);
@@ -1490,8 +1507,8 @@ async function startDetachedUnderLock(
   // probe instead of printing a false "started".
   const ours = canonicalRoot(ctx.paths.repoRoot);
   const servesUs =
-    (health.projects ?? []).some((p) => canonicalRoot(p.root) === ours) ||
-    (typeof health.root === "string" && canonicalRoot(health.root) === ours);
+    (health.projects ?? []).some((p) => sameRoot(p.root, ours)) ||
+    (typeof health.root === "string" && sameRoot(health.root, ours));
   if (!servesUs) {
     return ensureServedByRunningDaemon(base, health, ctx.paths.repoRoot);
   }
@@ -1561,7 +1578,7 @@ async function ensureServedByRunningDaemon(
   repoRoot: string,
 ): Promise<number> {
   const ours = canonicalRoot(repoRoot);
-  const served = (health.projects ?? []).find((p) => canonicalRoot(p.root) === ours);
+  const served = (health.projects ?? []).find((p) => sameRoot(p.root, ours));
   if (served) {
     process.stdout.write(
       `daemon already running at ${base}/ — serving this project as '${served.alias}'.\n` + renderServing(health),
@@ -1569,7 +1586,7 @@ async function ensureServedByRunningDaemon(
     return 0;
   }
   // Legacy/single-project daemon whose primary root IS this repo.
-  if (typeof health.root === "string" && canonicalRoot(health.root) === ours) {
+  if (typeof health.root === "string" && sameRoot(health.root, ours)) {
     process.stdout.write(`daemon already running at ${base}/ — serving this project.\n`);
     return 0;
   }
@@ -2481,7 +2498,7 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
       const root = canonicalRoot(rootArg);
       // Idempotent by CANONICAL (symlink-resolved) root: if we already serve this
       // repo, return it untouched — never double-open the same index.
-      const already = [...runtimes.values()].find((rt) => canonicalRoot(rt.deps.paths.repoRoot) === root);
+      const already = [...runtimes.values()].find((rt) => sameRoot(rt.deps.paths.repoRoot, root));
       if (already) return { alias: already.alias, root, added: false };
 
       const paths = hayvenPathsFor(root);
@@ -2669,7 +2686,7 @@ async function startForegroundDaemon(args: ParsedArgs): Promise<number> {
     serializeMutation(async () => {
       const abs = canonicalRoot(aliasOrRoot);
       let runtime = runtimes.get(aliasOrRoot);
-      if (!runtime) runtime = [...runtimes.values()].find((rt) => canonicalRoot(rt.deps.paths.repoRoot) === abs);
+      if (!runtime) runtime = [...runtimes.values()].find((rt) => sameRoot(rt.deps.paths.repoRoot, abs));
       if (!runtime) return false;
       if (runtime.alias === primaryAlias) {
         throw new Error(`cannot remove the primary project (${primaryAlias}) — it owns the daemon's port`);
@@ -3122,6 +3139,71 @@ async function stopDaemon(args: ParsedArgs): Promise<number> {
       "check `hayven daemon status` before restarting.\n",
   );
   return 1;
+}
+
+/** How long `restart` waits for the old daemon's address to stop answering. */
+export const RESTART_QUIET_WAIT_MS = 10_000;
+
+/** Injection seams for `restart`, so the sequencing is testable without a real daemon. */
+export interface RestartDeps {
+  stop?: (args: ParsedArgs) => Promise<number>;
+  start?: (args: ParsedArgs) => Promise<number>;
+  /** True once nothing answers at the daemon address. */
+  addressQuiet?: (args: ParsedArgs) => Promise<boolean>;
+  waitMs?: number;
+  pollMs?: number;
+}
+
+/**
+ * `hayven daemon restart` = stop, wait until the address is free, start.
+ *
+ * `stopDaemon` already waits for the pid to exit, but a restart that raced the
+ * listening socket's teardown could probe the DYING daemon in `start`, report
+ * "already running", and leave nothing running. So we additionally wait -
+ * bounded - for the port to stop answering, and refuse to start over a daemon
+ * that never went quiet (a second daemon on a taken port is the failure the
+ * start-lock work exists to prevent). Restarting a daemon that is not running
+ * simply starts it.
+ */
+async function restartDaemon(args: ParsedArgs, deps: RestartDeps = {}): Promise<number> {
+  const stop = deps.stop ?? stopDaemon;
+  const start = deps.start ?? startDaemon;
+  const addressQuiet =
+    deps.addressQuiet ??
+    (async (a: ParsedArgs): Promise<boolean> => {
+      let ctx;
+      try {
+        ctx = requireProject();
+      } catch {
+        return true; // nothing to probe; start will report the real problem
+      }
+      const bind = resolveBindAddress(a, ctx.config);
+      if ("exitCode" in bind) return true;
+      return (await probeForOrphan(bind.config)) === null;
+    });
+
+  const stopCode = await stop(args);
+  if (stopCode !== 0) {
+    process.stderr.write("error: restart aborted - the running daemon could not be stopped.\n");
+    return stopCode;
+  }
+
+  const waitMs = deps.waitMs ?? RESTART_QUIET_WAIT_MS;
+  const pollMs = deps.pollMs ?? 100;
+  const deadline = Date.now() + waitMs;
+  while (!(await addressQuiet(args))) {
+    if (Date.now() >= deadline) {
+      process.stderr.write(
+        `error: restart aborted - the daemon address is still answering ${Math.round(waitMs / 1000)}s after stop. ` +
+          "Not starting a second daemon over it; check `hayven daemon status`.\n",
+      );
+      return 1;
+    }
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
+
+  process.stdout.write("starting daemon...\n");
+  return start(args);
 }
 
 /**

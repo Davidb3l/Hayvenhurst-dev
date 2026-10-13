@@ -12,7 +12,7 @@ import { Elysia } from "elysia";
 import type { HayvenConfig } from "../config/defaults.ts";
 import type { CrdtState } from "../crdt/state.ts";
 import type { Db } from "../db/queries.ts";
-import { canonicalRoot, hayvenHomeDir, type HayvenPaths } from "../util/paths.ts";
+import { hayvenHomeDir, sameRoot, type HayvenPaths } from "../util/paths.ts";
 import type { Logger } from "../util/log.ts";
 import { affectedTestsRoutes } from "./routes/affected_tests.ts";
 import { claimsRoutes } from "./routes/claims.ts";
@@ -851,7 +851,7 @@ export function buildMultiProjectApp(multi: MultiProjectDeps) {
         claimedRoot !== null &&
         claimedRoot.length > 0 &&
         claimedRoot.length <= 4096 &&
-        canonicalRoot(claimedRoot) === canonicalRoot(primaryRoot);
+        sameRoot(claimedRoot, primaryRoot);
       if (!claimOk) {
         multi.logger.warn("request: REFUSED un-addressed MUTATION", {
           primary: multi.primary,

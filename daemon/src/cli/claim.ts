@@ -6,6 +6,8 @@
  *
  * Status mapping:
  *   201 → registered.
+ *   200 → idempotent re-claim: this agent already holds this claim id. Success
+ *         (exit 0, "already held"); the daemon returns the live claim.
  *   409 → scope overlaps an active claim (hard conflict) OR id already exists.
  *   202 → adjacent active claim(s) flagged a potential conflict; coordinate or
  *         re-run with `--force` to register anyway (the verdict is recorded for
@@ -21,6 +23,35 @@ import {
 import { assertDaemonServesProject, projectHeader, reportIdentity, requireProject } from "./_shared.ts";
 import { isJson } from "./_shared.ts";
 import type { ParsedArgs } from "../cli.ts";
+
+/**
+ * Stable, machine-readable result word for `--json` (`outcome`), derived from
+ * the HTTP status. Consumers (the foreman) should prefer `outcome` / `httpStatus`
+ * over the legacy `status` key, which the daemon payload's own `status` field
+ * (`"active"`, `"potential-conflict"`) overwrites.
+ *
+ *   201 granted             - claim registered
+ *   200 held                - idempotent re-claim; this agent already holds it
+ *   202 potential-conflict  - adjacent claim flagged a conflict; NOT registered
+ *   409 conflict            - hard overlap / id collision; NOT registered
+ *   else error
+ */
+export type ClaimOutcome = "granted" | "held" | "potential-conflict" | "conflict" | "error";
+
+export function claimOutcome(httpStatus: number): ClaimOutcome {
+  switch (httpStatus) {
+    case 201:
+      return "granted";
+    case 200:
+      return "held";
+    case 202:
+      return "potential-conflict";
+    case 409:
+      return "conflict";
+    default:
+      return "error";
+  }
+}
 
 interface ConflictVerdict {
   conflict: boolean;
@@ -111,8 +142,30 @@ export async function runClaim(args: ParsedArgs): Promise<number> {
 
   const payload = (await res.json().catch(() => ({}))) as Record<string, unknown>;
   if (isJson(args.flags)) {
-    process.stdout.write(JSON.stringify({ status: res.status, ...payload }, null, 2) + "\n");
-    return res.status === 201 ? 0 : res.status === 202 ? 3 : 1;
+    // Every pre-existing key is kept EXACTLY as before (including the payload's
+    // own `status` overwriting the HTTP one); `httpStatus` and `outcome` are
+    // additive, appended last so the payload can never shadow them.
+    process.stdout.write(
+      JSON.stringify(
+        { status: res.status, ...payload, httpStatus: res.status, outcome: claimOutcome(res.status) },
+        null,
+        2,
+      ) + "\n",
+    );
+    return res.status === 201 || res.status === 200 ? 0 : res.status === 202 ? 3 : 1;
+  }
+
+  if (res.status === 200) {
+    // Idempotent re-claim: the same agent already holds this claim id, so a
+    // retry is a no-op success, not an error.
+    const id = String(payload["id"] ?? body.id);
+    const held = payload["scope"];
+    const heldScope = Array.isArray(held) ? (held as unknown[]).map(String) : scope;
+    process.stdout.write(
+      `# Claim already held\n\n- id:    \`${id}\`\n- scope: ${heldScope.map((s) => `\`${s}\``).join(", ")}\n\n` +
+        "This agent already holds this claim (idempotent re-claim); nothing changed.\n",
+    );
+    return 0;
   }
 
   if (res.status === 201) {
