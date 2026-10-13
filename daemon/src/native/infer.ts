@@ -83,6 +83,8 @@ const bunInferSpawn: InferSpawnFn = (opts) =>
     stdin: opts.stdin,
     stdout: opts.stdout,
     stderr: opts.stderr,
+    // No visible console window on Windows (the daemon parent has no console).
+    windowsHide: true,
   }) as unknown as InferChildLike;
 
 /** Read an entire `ReadableStream<Uint8Array>` to a UTF-8 string. */

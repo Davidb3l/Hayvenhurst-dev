@@ -200,8 +200,10 @@ jobs:
             echo "PATH hint printed a native path to bash"; exit 1
           fi
           sh plugin/scripts/install-hayven.sh --prefix "$pfx" --check
-          # The .sh writes the same completion marker as the .ps1.
-          test "$(cat "$bin/.hayven-installed-version")" = "0.0.7"
+          # The .sh writes the same completion marker as the .ps1. Compare with
+          # what the binary reports: this install is the LATEST release, so a
+          # hard-coded version broke the job on every release after it.
+          test "$(tr -d '\r' < "$bin/.hayven-installed-version")" = "$("$bin/hayven.exe" --version | tr -d '\r')"
           # winget-named cosign only (no plain `cosign` on PATH) still verifies.
           wdir="$RUNNER_TEMP/wingetcosign-sh"; mkdir -p "$wdir"
           cp "$(command -v cosign)" "$wdir/cosign-windows-amd64.exe"

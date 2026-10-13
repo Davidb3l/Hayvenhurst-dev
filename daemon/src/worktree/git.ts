@@ -86,6 +86,9 @@ export function git(cwd: string, args: string[], timeoutMs: number = GIT_TIMEOUT
       encoding: "utf8",
       timeout: timeoutMs,
       maxBuffer: 64 * 1024 * 1024,
+      // Run from the console-less daemon (the dirty record, worktree prune), so
+      // it must not open a visible console window on Windows. No-op on POSIX.
+      windowsHide: true,
     });
     if (res.status !== 0 || typeof res.stdout !== "string") return null;
     return res.stdout;
@@ -114,6 +117,7 @@ export function gitProbe(cwd: string, args: string[]): GitProbe {
       encoding: "utf8",
       timeout: GIT_TIMEOUT_MS,
       maxBuffer: 64 * 1024 * 1024,
+      windowsHide: true,
     });
     if (res.error !== undefined) return { kind: "error", message: res.error.message };
     if (res.status === null) return { kind: "error", message: `git killed by ${res.signal ?? "a signal"}` };
@@ -169,6 +173,7 @@ export function isAncestor(cwd: string, ancestor: string, descendant: string): b
     const res = spawnSync("git", ["-C", cwd, "merge-base", "--is-ancestor", ancestor, descendant], {
       env: gitEnv(),
       timeout: GIT_TIMEOUT_MS,
+      windowsHide: true,
     });
     return res.status === 0;
   } catch {

@@ -57,6 +57,7 @@ type SpawnFn = (opts: {
   stdin?: "ignore" | "pipe" | "inherit";
   stdout?: "ignore" | "pipe" | "inherit";
   stderr?: "ignore" | "pipe" | "inherit";
+  windowsHide?: boolean;
 }) => SpawnLike;
 
 export interface WatchEvent {
@@ -498,6 +499,11 @@ export function startWatch(opts: StartWatchOptions): WatchSupervisor {
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
+      // The daemon runs console-less on Windows, so without this every watcher
+      // child allocates a brand-new VISIBLE console window — one per project,
+      // re-flashed on every restart (the field report: "it pops up 5 windows").
+      // No-op on POSIX.
+      windowsHide: true,
     });
     currentChild = child;
     // A fresh child gets a fresh silence budget; otherwise the stall detector

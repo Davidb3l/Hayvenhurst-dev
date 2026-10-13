@@ -236,8 +236,30 @@ export async function probeDaemon(
   return { kind: "hayven", health: body };
 }
 
-/** How long the parent waits for the detached child to come up healthy. */
+/**
+ * How long a live daemon gets to answer ONE request (health probe ceilings in
+ * `cli/_shared.ts`). NOT the cold-start budget — see
+ * {@link DETACH_COLD_START_TIMEOUT_MS} for why the two must be different
+ * numbers.
+ */
 export const DETACH_HEALTH_TIMEOUT_MS = 10_000;
+/**
+ * How long the detach parent waits for its freshly-spawned child to bind and
+ * answer `/api/health`.
+ *
+ * This used to be {@link DETACH_HEALTH_TIMEOUT_MS} (10 s), which is a fine
+ * ceiling for a daemon that is ALREADY up but is shorter than a real cold
+ * start: on the Windows field machine a daemon serving 4 registered projects
+ * took ~30 s from spawn to first bind (project Dbs + CRDT hydration + watchers
+ * before `listen`). The parent then printed "did not become healthy within
+ * 10s" — false — and, worse, RELEASED THE START LOCK while its child was still
+ * legitimately starting, so the next session's `daemon start` probed an unbound
+ * port and spawned a duplicate. The wait is cheap to hold (200 ms polls, exits
+ * the moment the child answers) and {@link waitForDaemon}'s `stillStarting`
+ * hook bails out early when the child dies, so the only way to spend the whole
+ * budget is a child that is alive and genuinely still loading.
+ */
+export const DETACH_COLD_START_TIMEOUT_MS = 60_000;
 /** Poll interval while waiting for the child's health endpoint. */
 export const DETACH_HEALTH_INTERVAL_MS = 200;
 
@@ -263,6 +285,15 @@ export async function waitForDaemon(
     probeTimeoutMs?: number;
     fetchImpl?: typeof fetch;
     sleep?: (ms: number) => Promise<void>;
+    /**
+     * "Is the process we are waiting on still alive?" Checked after every
+     * failed probe; once it returns false the wait ends with `null` instead of
+     * burning the remaining budget polling a port whose only prospective binder
+     * is already dead. The probe that ran just before the check still counts,
+     * so a child that died AFTER binding (its port stolen by a concurrent
+     * winner — the TOCTOU case) is still discovered via the health answer.
+     */
+    stillStarting?: () => boolean;
   } = {},
 ): Promise<HayvenHealth | null> {
   const timeoutMs = opts.timeoutMs ?? DETACH_HEALTH_TIMEOUT_MS;
@@ -283,6 +314,8 @@ export async function waitForDaemon(
     first = false;
     const probe = await probeDaemon(base, fetchImpl, budget);
     if (probe.kind === "hayven") return probe.health;
+    // The child died and the port did not answer: nothing left to wait for.
+    if (opts.stillStarting !== undefined && !opts.stillStarting()) return null;
     const left = deadline - Date.now();
     if (left <= 0) return null;
     await sleep(Math.min(intervalMs, left));

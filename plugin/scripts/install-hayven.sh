@@ -614,10 +614,13 @@ install_one() { # install_one <file name>
   # onto the file's ACL.
   chmod +x "$tmp_dst"
   # A running hayven.exe holds a lock on its file on Windows, so the rename
-  # fails there. Say which process to stop rather than leaving a stray temp.
+  # fails there. Say which processes to stop rather than leaving a stray temp.
+  # The daemon is not the only holder: every open Claude Code session that uses
+  # hayven runs its own `hayven mcp` from the same file, and `hayven daemon
+  # stop` does not end those.
   if ! mv -f "$tmp_dst" "$BIN_DIR/$name"; then
     rm -f "$tmp_dst"
-    fail "could not replace $BIN_DIR/$name - is hayven running? Stop it (hayven daemon stop) and re-run."
+    fail "could not replace $BIN_DIR/$name - it is in use. Stop the daemon (hayven daemon stop) and close or restart any Claude Code (or other agent) session using hayven - its \`hayven mcp\` server runs from this file - then re-run."
   fi
   log "install-hayven: installed $BIN_DIR/$name"
 }
