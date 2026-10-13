@@ -1,5 +1,5 @@
 /** Daemon + CLI version. Kept in its own module to avoid circular imports. */
-export const VERSION = "0.0.8";
+export const VERSION = "0.0.9";
 
 /**
  * Major version of `hayven-native` the daemon expects to talk to.
