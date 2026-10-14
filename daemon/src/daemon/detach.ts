@@ -67,15 +67,22 @@ export function looksLikeHayvenHealth(body: unknown): body is HayvenHealth {
  * depends on. `/api/health` has always shipped a `version`, but nothing ever
  * compared it, so a new CLI against an old resident daemon proceeded and then
  * took a JSON 404 on a route the old daemon does not serve — see the one-symptom
- * patch at `cli/sync.ts:195` ("old daemon without a `projects` list"). We set
- * the floor at 0.0.6 because that is the release where `/api/health` began
- * reporting the multi-project `projects` list the current CLI assumes.
+ * patch at `cli/sync.ts:195` ("old daemon without a `projects` list"). The floor
+ * was 0.0.6 (the release where `/api/health` began reporting the multi-project
+ * `projects` list). It is 0.0.8 because 0.0.8's CLI relies on daemon-side
+ * behavior a 0.0.7 daemon lacks, and the CLI degrades SILENTLY (absent field =
+ * "cannot verify") rather than failing: `/api/health` `pid` and `global_home`
+ * (orphan-safe `stop`, the cross-home registration guard), the `client_home`
+ * refusal on `POST /api/projects`, registry `id` (writer_id) identity used by
+ * relocation, and the Host-header allowlist + WebSocket origin gate that close
+ * DNS-rebinding exfiltration. Against an older resident daemon those guards are
+ * simply absent, so refuse and say "restart the daemon" instead.
  *
  * Note this is deliberately a 0.x-aware floor rather than semver "same major":
  * on a 0.0.x line every release is a potential breaking change, so a
  * major-only comparison would make the handshake vacuous.
  */
-export const MIN_COMPATIBLE_DAEMON_VERSION = "0.0.6";
+export const MIN_COMPATIBLE_DAEMON_VERSION = "0.0.8";
 
 /** Parse `MAJOR.MINOR.PATCH` (ignoring any `-rc1`-style suffix). */
 function parseVersion(v: string): [number, number, number] | null {

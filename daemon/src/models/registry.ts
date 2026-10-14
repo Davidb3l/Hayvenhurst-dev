@@ -83,7 +83,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
-import { canonicalRoot, globalHayvenDir } from "../util/paths.ts";
+import { globalHayvenDir, sameRoot } from "../util/paths.ts";
 
 /** The canonical filename of a model's primary weights inside its model dir. */
 export const GGUF_FILENAME = "model.gguf";
@@ -325,7 +325,7 @@ export function modelSearchHomes(projectHayvenDir?: string | null): {
     projectHayvenDir !== undefined &&
     projectHayvenDir !== null &&
     projectHayvenDir.length > 0 &&
-    canonicalRoot(projectHayvenDir) !== canonicalRoot(global)
+    !sameRoot(projectHayvenDir, global)
   ) {
     homes.push({ scope: "project", hayvenDir: projectHayvenDir });
   }

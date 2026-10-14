@@ -5,10 +5,11 @@ import { existsSync } from "node:fs";
 
 import { loadConfig } from "../config/load.ts";
 import { DETACH_HEALTH_TIMEOUT_MS, DETACH_PROBE_TIMEOUT_MS } from "../daemon/detach.ts";
+import { VERSION } from "../version.ts";
 import { isRegistrableRoot } from "../daemon/registry.ts";
 import { resolveReadIndex } from "../db/branch_index.ts";
 import { Db } from "../db/queries.ts";
-import { canonicalRoot, detectRepoRoot, hayvenHomeDir, hayvenPathsFor, type HayvenPaths } from "../util/paths.ts";
+import { canonicalRoot, detectRepoRoot, hayvenHomeDir, hayvenPathsFor, sameRoot, type HayvenPaths } from "../util/paths.ts";
 import { rootLogger } from "../util/log.ts";
 import { findRegisteredOverlay, overlaySqlitePath, type WorktreeEntry } from "../worktree/registry.ts";
 
@@ -185,8 +186,8 @@ export function isJson(flags: Record<string, string | boolean>): boolean {
 
 /** Outcome of a best-effort live hot-add against a running daemon. */
 export type HotAddResult =
-  | { kind: "added"; alias: string }
-  | { kind: "exists"; alias: string }
+  | { kind: "added"; alias: string; daemonVersion?: string }
+  | { kind: "exists"; alias: string; daemonVersion?: string }
   | { kind: "no-daemon" }
   | { kind: "error"; message: string }
   /**
@@ -293,7 +294,7 @@ export function compareGlobalHomes(reported: unknown): DaemonHomeCheck {
   if (ours === undefined) return { kind: "unknown" };
   const oursCanon = canonicalRoot(ours);
   const theirsCanon = canonicalRoot(reported);
-  return oursCanon === theirsCanon
+  return sameRoot(oursCanon, theirsCanon)
     ? { kind: "match", home: oursCanon }
     : { kind: "mismatch", ours: oursCanon, theirs: theirsCanon };
 }
@@ -309,15 +310,43 @@ export function compareGlobalHomes(reported: unknown): DaemonHomeCheck {
  * hot-add POST, so it must not double the worst case against a wedged daemon.
  */
 export async function probeDaemonGlobalHome(base: string): Promise<DaemonHomeCheck> {
+  return (await probeDaemonHealthInfo(base)).homes;
+}
+
+/**
+ * The same single `/api/health` call as {@link probeDaemonGlobalHome}, also
+ * surfacing the daemon's reported `version` (when it sent a string one) so a
+ * caller can tell a resident daemon of a different build from this CLI.
+ */
+export async function probeDaemonHealthInfo(
+  base: string,
+): Promise<{ homes: DaemonHomeCheck; version?: string }> {
   const signal = AbortSignal.timeout(DETACH_PROBE_TIMEOUT_MS);
   try {
     const res = await fetch(`${base}/api/health`, { signal });
-    if (!res.ok) return { kind: "unknown" };
+    if (!res.ok) return { homes: { kind: "unknown" } };
     const body = (await res.json()) as Record<string, unknown>;
-    return compareGlobalHomes(body[HEALTH_GLOBAL_HOME_FIELD]);
+    const version = typeof body["version"] === "string" ? body["version"] : undefined;
+    const homes = compareGlobalHomes(body[HEALTH_GLOBAL_HOME_FIELD]);
+    return version === undefined ? { homes } : { homes, version };
   } catch {
-    return { kind: "unknown" };
+    return { homes: { kind: "unknown" } };
   }
+}
+
+/**
+ * A one-line warning when the running daemon is a different build from this
+ * CLI, else `null`. Used to keep "added live to the running daemon (no restart
+ * needed)" honest: the project IS served live, but a stale daemon does not have
+ * this CLI's new routes, guards or fixes until it is restarted. `undefined`
+ * (an unreadable or absent version) is "cannot tell", not a mismatch.
+ */
+export function staleDaemonNote(daemonVersion: string | undefined, cliVersion: string = VERSION): string | null {
+  if (daemonVersion === undefined || daemonVersion === cliVersion) return null;
+  return (
+    `note: the running daemon is v${daemonVersion} but this CLI is v${cliVersion}. ` +
+    "It serves the project, but it lacks this CLI's newer behavior until restarted: run `hayven daemon restart`."
+  );
 }
 
 /**
@@ -353,7 +382,9 @@ export async function hotAddToRunningDaemon(root: string, base: string, alias?: 
   // `~/.hayven/projects.json`. `unknown` (unreachable, unhealthy, or a daemon
   // predating the field) deliberately falls through and posts, so upgrading the
   // CLI does not break registration against a daemon that is already running.
-  const homes = await probeDaemonGlobalHome(base);
+  const health = await probeDaemonHealthInfo(base);
+  const homes = health.homes;
+  const daemonVersion = health.version;
   if (homes.kind === "mismatch") {
     return {
       kind: "foreign-home",
@@ -410,7 +441,12 @@ export async function hotAddToRunningDaemon(root: string, base: string, alias?: 
   if (res.status === 404) return { kind: "no-daemon" }; // old daemon w/o the route
   const body = (await res.json().catch(() => ({}))) as { added?: boolean; alias?: string; error?: string };
   if (!res.ok) return { kind: "error", message: body.error ?? `daemon returned ${res.status}` };
-  return { kind: body.added ? "added" : "exists", alias: body.alias ?? alias ?? "" };
+  const resolved = body.alias ?? alias ?? "";
+  return {
+    kind: body.added ? "added" : "exists",
+    alias: resolved,
+    ...(daemonVersion !== undefined ? { daemonVersion } : {}),
+  };
 }
 
 export type DaemonIdentityResult =
@@ -513,7 +549,7 @@ export async function assertDaemonServesProject(
   // 1. Multi-project daemon already serving us → address requests by alias.
   if (projects) {
     const served = projects.find(
-      (p) => typeof p.root === "string" && canonicalRoot(p.root) === ours,
+      (p) => typeof p.root === "string" && sameRoot(p.root, ours),
     );
     if (served && typeof served.alias === "string" && served.alias.length > 0) {
       return { ok: true, alias: served.alias };
@@ -521,7 +557,7 @@ export async function assertDaemonServesProject(
   }
 
   // 2. Single-project (or primary) match → un-addressed requests route to us.
-  if (remoteRoot !== undefined && canonicalRoot(remoteRoot) === ours) {
+  if (remoteRoot !== undefined && sameRoot(remoteRoot, ours)) {
     return { ok: true };
   }
 

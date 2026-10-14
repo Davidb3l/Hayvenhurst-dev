@@ -32,7 +32,7 @@ import {
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
-import { canonicalRoot, globalHayvenDir, hayvenHomeDir, isDirectory } from "../util/paths.ts";
+import { canonicalRoot, globalHayvenDir, hayvenHomeDir, isDirectory, rootKey, sameRoot } from "../util/paths.ts";
 
 export interface ProjectEntry {
   /** Short, URL-safe handle used in `?project=<alias>` and the viewer switcher. */
@@ -557,7 +557,7 @@ export function readRegistryRaw(): ProjectEntry[] {
     // `cli/daemon.ts` then starts one runtime per alias — two watchers, two
     // ingest pipelines and two `Db` handles on a single `.hayven/index.sqlite`
     // WAL, which is corruption (see `canonicalRoot` in util/paths.ts).
-    const key = isAbsolute(root) ? canonicalRoot(root) : `unresolvable:${root}`;
+    const key = isAbsolute(root) ? rootKey(root) : `unresolvable:${root}`;
     if (seen.has(key)) continue; // duplicate row for one repo: keep the first
     seen.add(key);
     const unique = out.some((e) => e.alias === alias) ? deriveAlias(root, alias, out) : alias;
@@ -615,7 +615,8 @@ export function readRegistry(): ProjectEntry[] {
  * handles on one `.hayven/index.sqlite` WAL.
  */
 export function sameProjectRoot(a: string, b: string): boolean {
-  return canonicalRoot(a) === canonicalRoot(b);
+  // Case-insensitive on win32 (see `rootKey`): `c:/x/repo` and `C:\X\Repo` are one repo.
+  return sameRoot(a, b);
 }
 
 /** Non-throwing form of `assertRegistrableRoot`. */
@@ -767,7 +768,7 @@ export function assertRegistrableRoot(root: string, opts: { homeDir?: string } =
 /** True when two paths name the same directory, comparing symlink-resolved forms. */
 function sameDir(a: string, b: string): boolean {
   if (resolve(a) === resolve(b)) return true;
-  return canonicalRoot(a) === canonicalRoot(b);
+  return sameRoot(a, b);
 }
 
 /**
@@ -1064,7 +1065,7 @@ export function registerProjectDetailed(
     // from a filtered list would silently delete whatever the filter hid.
     const entries = readRegistryRaw();
     const isSameRepo = (e: ProjectEntry): boolean =>
-      isAbsolute(e.root) && canonicalRoot(e.root) === abs;
+      isAbsolute(e.root) && sameRoot(e.root, abs);
     const existing = entries.find(isSameRepo);
     if (existing) {
       // BACKFILL/REFRESH the identity of an already-registered root. Same
@@ -1155,7 +1156,7 @@ export function recordProjectIdentities(
   const found = new Map<string, string>();
   for (const root of roots) {
     const id = readProjectIdentity(root);
-    if (id !== undefined) found.set(canonicalRoot(root), id);
+    if (id !== undefined) found.set(rootKey(root), id);
   }
   if (found.size === 0 && previous.size === 0) return 0;
   return withRegistryLock(() => {
@@ -1163,7 +1164,7 @@ export function recordProjectIdentities(
     let changed = 0;
     const next = entries.map((e) => {
       if (!isAbsolute(e.root)) return e;
-      const key = canonicalRoot(e.root);
+      const key = rootKey(e.root);
       const id = found.get(key) ?? (e.id === undefined ? previous.get(key) : undefined);
       if (id === undefined || id === e.id) return e;
       changed++;
@@ -1404,7 +1405,7 @@ export function relocateProject(
   const oldRootPresent =
     before !== undefined &&
     isAbsolute(before.root) &&
-    canonicalRoot(before.root) !== abs &&
+    !sameRoot(before.root, abs) &&
     isDirectory(before.root);
   return withRegistryLock(() => {
     const entries = readRegistryRaw();
@@ -1425,7 +1426,7 @@ export function relocateProject(
           "If you re-ran `hayven init` there or are sure it is the same repo, re-run with --force.",
       );
     }
-    const isAtTarget = (e: ProjectEntry): boolean => isAbsolute(e.root) && canonicalRoot(e.root) === abs;
+    const isAtTarget = (e: ProjectEntry): boolean => isAbsolute(e.root) && sameRoot(e.root, abs);
     const replaced = entries.find((e) => e !== previous && isAtTarget(e));
     if (
       replaced?.id !== undefined &&
@@ -1582,7 +1583,7 @@ export function unregisterProjectDetailed(
     const matches = (e: ProjectEntry): boolean =>
       target.kind === "alias"
         ? e.alias === target.alias
-        : isAbsolute(e.root) && canonicalRoot(e.root) === target.root;
+        : isAbsolute(e.root) && sameRoot(e.root, target.root);
     const next = entries.filter((e) => !matches(e));
     if (next.length === entries.length) {
       return {
@@ -1641,7 +1642,7 @@ export function unregisterProject(aliasOrRoot: string): boolean {
 export function snapshotProjectIdentities(): Map<string, string> {
   const out = new Map<string, string>();
   for (const e of readRegistryRaw()) {
-    if (e.id !== undefined && isAbsolute(e.root)) out.set(canonicalRoot(e.root), e.id);
+    if (e.id !== undefined && isAbsolute(e.root)) out.set(rootKey(e.root), e.id);
   }
   return out;
 }

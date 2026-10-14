@@ -554,7 +554,8 @@ function Write-SuiteHint {
     if (-not (Test-HaveCommand 'sirius')) { $missing += 'Sirius' }
     # Prefix match: catryna installs as `catryna@<marketplace>` and there are
     # two legitimate marketplaces (its own `catryna-wikinelli`, and the Sothis
-    # bundle `sirius-forester`). Pinning one key nags the other's users forever.
+    # suite marketplace `sothis`; the legacy bundle name `sirius-forester` also
+    # still matches). Pinning one key nags the other's users forever.
     if (-not (Test-FileContains (Join-Path $ClaudePluginsDir 'installed_plugins.json') '"catryna@')) {
         $missing += 'Catryna'
     }
@@ -562,8 +563,8 @@ function Write-SuiteHint {
 
     Write-Log ''
     Write-Log ('fleet suite: missing: ' + ($missing -join ' ') + '. Hayvenhurst is the suite''s code graph; for full fleet control install the whole suite:')
-    if ($missing -contains 'Sirius')   { Write-Log '  Sirius Forester (fleet foreman): /plugin marketplace add Davidb3l/Sirius-Forester, /plugin install sirius@sirius-forester, then /sirius:install-binary' }
-    if ($missing -contains 'Catryna')  { Write-Log '  Catryna Wikinelli (code wiki): /plugin marketplace add Davidb3l/Catryna-Wikinelli, then /plugin install catryna@catryna-wikinelli (Sothis bundle users: /plugin install catryna@sirius-forester)' }
+    if ($missing -contains 'Sirius')   { Write-Log '  Sirius Forester (fleet foreman): /plugin marketplace add Davidb3l/Sothis, /plugin install sirius@sothis, then /sirius:install-binary (the legacy sirius@sirius-forester marketplace still works)' }
+    if ($missing -contains 'Catryna')  { Write-Log '  Catryna Wikinelli (code wiki): /plugin marketplace add Davidb3l/Sothis, then /plugin install catryna@sothis (standalone: Davidb3l/Catryna-Wikinelli + catryna@catryna-wikinelli; legacy catryna@sirius-forester still works)' }
     if ($missing -contains 'Ametrite') { Write-Log '  Ametrite (task board): ask Claude to "ametrite this repo" (the skill bootstraps the amt CLI)' }
 }
 

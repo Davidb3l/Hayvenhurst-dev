@@ -32,7 +32,7 @@ import {
   rmSync,
   statSync,
 } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 
 import { Database } from "bun:sqlite";
 
@@ -107,7 +107,9 @@ function resolveHeadFile(repoRoot: string): string | null {
       const m = /^gitdir:\s*(.+)$/.exec(content);
       if (m && m[1] !== undefined) {
         const gitDir = m[1].trim();
-        const abs = gitDir.startsWith("/") ? gitDir : join(repoRoot, gitDir);
+        // `isAbsolute`, not `startsWith("/")`: git writes `gitdir: C:/.../.git/worktrees/x`
+        // on Windows, which is absolute but does not start with a slash.
+        const abs = isAbsolute(gitDir) ? gitDir : join(repoRoot, gitDir);
         return join(abs, "HEAD");
       }
     } catch {

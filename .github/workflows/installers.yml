@@ -134,10 +134,10 @@ jobs:
           if ($r.Code -ne 3) { throw "-Check (missing) exited $($r.Code), want 3" }
 
           # Pinned with a bare version.
-          $r = Invoke-Installer @('-Prefix', $pfx, '-Version', '0.0.7', '-RequireSignature')
+          $r = Invoke-Installer @('-Prefix', $pfx, '-Version', '0.0.8', '-RequireSignature')
           if ($r.Code -ne 0) { throw "install exited $($r.Code)" }
           $v = & (Join-Path $pfx 'bin/hayven.exe') --version
-          if ("$v" -notmatch '0\.0\.7') { throw "wrong version: $v" }
+          if ("$v" -notmatch '0\.0\.8') { throw "wrong version: $v" }
 
           # -Check on the installed-but-not-on-PATH prefix: exit 0, says so,
           # and -AddToPath is ignored (no registry change).
@@ -162,7 +162,7 @@ jobs:
           New-Item -ItemType Directory -Path $alias -Force | Out-Null
           Copy-Item -LiteralPath $real -Destination (Join-Path $alias 'cosign-windows-amd64.exe')
           $noCosign = ($env:PATH -split ';' | Where-Object { $_ -and -not (Test-Path -LiteralPath (Join-Path $_ 'cosign.exe')) }) -join ';'
-          $r = Invoke-Installer @('-Prefix', (Join-Path $env:RUNNER_TEMP 'winget'), '-Version', 'v0.0.7', '-RequireSignature') @{ PATH = ($alias + ';' + $noCosign) }
+          $r = Invoke-Installer @('-Prefix', (Join-Path $env:RUNNER_TEMP 'winget'), '-Version', 'v0.0.8', '-RequireSignature') @{ PATH = ($alias + ';' + $noCosign) }
           if ($r.Code -ne 0) { throw "winget-named cosign install exited $($r.Code)" }
           if ($r.Text -notmatch 'signature OK \(cosign\)') { throw 'winget-named cosign was not used' }
 
@@ -178,7 +178,7 @@ jobs:
           New-Item -ItemType Directory -Path $fake -Force | Out-Null
           Set-Content -LiteralPath (Join-Path $fake 'cosign.cmd') -Value "@echo off`r`necho fake cosign: verification failed 1>&2`r`nexit /b 1" -Encoding ascii
           $bad = Join-Path $env:RUNNER_TEMP 'bad'
-          $r = Invoke-Installer @('-Prefix', $bad, '-Version', 'v0.0.7') @{ PATH = ($fake + ';' + $env:PATH) }
+          $r = Invoke-Installer @('-Prefix', $bad, '-Version', 'v0.0.8') @{ PATH = ($fake + ';' + $env:PATH) }
           if ($r.Code -ne 1) { throw "rejected signature exited $($r.Code), want 1" }
           if ($r.Text -notmatch 'SIGNATURE VERIFICATION FAILED') { throw 'no signature failure message' }
           if (Test-Path -LiteralPath (Join-Path $bad 'bin\hayven.exe')) { throw 'installed despite a failed signature' }
@@ -213,10 +213,10 @@ jobs:
           nocos="$(printf '%s\n' "$PATH" | tr ':' '\n' | while IFS= read -r d; do
             if [ -n "$d" ] && [ ! -e "$d/cosign.exe" ] && [ ! -e "$d/cosign" ]; then printf '%s:' "$d"; fi
           done)"
-          PATH="$wdir:$nocos" sh plugin/scripts/install-hayven.sh --prefix "$RUNNER_TEMP/gb-winget" --version v0.0.7 --require-signature 2>&1 | tee "$RUNNER_TEMP/gbw.log"
+          PATH="$wdir:$nocos" sh plugin/scripts/install-hayven.sh --prefix "$RUNNER_TEMP/gb-winget" --version v0.0.8 --require-signature 2>&1 | tee "$RUNNER_TEMP/gbw.log"
           grep -q 'signature OK (cosign)' "$RUNNER_TEMP/gbw.log"
           # On PATH (POSIX form): no "not on your PATH" note.
-          PATH="$bin:$PATH" sh plugin/scripts/install-hayven.sh --prefix "$pfx" --version v0.0.7 2>&1 | tee "$RUNNER_TEMP/gb2.log"
+          PATH="$bin:$PATH" sh plugin/scripts/install-hayven.sh --prefix "$pfx" --version v0.0.8 2>&1 | tee "$RUNNER_TEMP/gb2.log"
           if grep -q 'is not on your PATH' "$RUNNER_TEMP/gb2.log"; then
             echo "PATH hint printed although the dir is on PATH"; exit 1
           fi

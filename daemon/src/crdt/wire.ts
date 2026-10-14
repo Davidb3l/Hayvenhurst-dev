@@ -363,6 +363,30 @@ function cdylibFileName(): string | null {
   }
 }
 
+/**
+ * Describe a failed `spawnSync` for an error message. When the process never ran
+ * (ENOENT, EACCES, a blocked exe, a timeout) `status` is `null` and `stderr` is
+ * `null`, so the old message read "failed (null): <no stderr>" and hid the one
+ * thing that mattered, `res.error`. Include the spawn error and any signal.
+ */
+export function describeSpawnFailure(res: {
+  status: number | null;
+  signal?: NodeJS.Signals | null;
+  error?: Error | undefined;
+  stderr?: Buffer | Uint8Array | string | null;
+}): string {
+  const stderr =
+    res.stderr === null || res.stderr === undefined
+      ? ""
+      : Buffer.from(res.stderr as Uint8Array).toString("utf8").trim();
+  const parts: string[] = [];
+  if (res.error !== undefined) parts.push(`spawn error: ${res.error.message}`);
+  if (res.signal) parts.push(`killed by ${res.signal}`);
+  return `(${res.status === null ? "did not exit normally" : `exit ${res.status}`}${
+    parts.length > 0 ? `; ${parts.join("; ")}` : ""
+  }): ${stderr.length > 0 ? stderr : "<no stderr>"}`;
+}
+
 function openSubprocessBridge(binaryPath?: string): WireBridge {
   const bin = binaryPath ?? defaultBinaryPath();
   // §16.4: the serialize subcommand emits its `version` record on STDERR
@@ -382,8 +406,7 @@ function openSubprocessBridge(binaryPath?: string): WireBridge {
       // which is what we want for the raw binary envelope.
       const res = spawnSync(bin, ["serialize", "encode"], { input, windowsHide: true });
       if (res.status !== 0) {
-        const err = res.stderr ? Buffer.from(res.stderr).toString("utf8") : "<no stderr>";
-        throw new Error(`hayven-native serialize encode failed (${res.status}): ${err}`);
+        throw new Error(`hayven-native serialize encode failed ${describeSpawnFailure(res)}`);
       }
       checkVersionOnce(res.stderr);
       return new Uint8Array(res.stdout);
@@ -394,8 +417,7 @@ function openSubprocessBridge(binaryPath?: string): WireBridge {
         windowsHide: true,
       });
       if (res.status !== 0) {
-        const err = res.stderr ? Buffer.from(res.stderr).toString("utf8") : "<no stderr>";
-        throw new Error(`hayven-native serialize decode failed (${res.status}): ${err}`);
+        throw new Error(`hayven-native serialize decode failed ${describeSpawnFailure(res)}`);
       }
       checkVersionOnce(res.stderr);
       return JSON.parse(Buffer.from(res.stdout).toString("utf8")) as WireOp[];
@@ -414,8 +436,7 @@ function openSubprocessBridge(binaryPath?: string): WireBridge {
         windowsHide: true,
       });
       if (res.status !== 0) {
-        const err = res.stderr ? Buffer.from(res.stderr).toString("utf8") : "<no stderr>";
-        throw new Error(`hayven-native serialize decode-segment failed (${res.status}): ${err}`);
+        throw new Error(`hayven-native serialize decode-segment failed ${describeSpawnFailure(res)}`);
       }
       checkVersionOnce(res.stderr);
       return JSON.parse(Buffer.from(res.stdout).toString("utf8")) as WireOp[];

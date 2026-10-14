@@ -16,7 +16,7 @@
  */
 import { Elysia } from "elysia";
 
-import { canonicalRoot, hayvenHomeDir } from "../../util/paths.ts";
+import { canonicalRoot, hayvenHomeDir, sameRoot } from "../../util/paths.ts";
 import type { ServerDependencies } from "../server.ts";
 
 /** Pull a string field off an untyped JSON body without throwing. */
@@ -57,7 +57,7 @@ function foreignHomeRefusal(clientHome: string | undefined): string | null {
   }
   const oursCanon = canonicalRoot(ours);
   const theirsCanon = canonicalRoot(clientHome);
-  if (oursCanon === theirsCanon) return null;
+  if (sameRoot(oursCanon, theirsCanon)) return null;
   return (
     "refusing to register across a global-home boundary: this daemon keeps its project registry " +
     `under ${oursCanon}, but the caller declared ${theirsCanon}. The registration would land in a ` +

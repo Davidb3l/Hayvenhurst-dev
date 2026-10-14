@@ -116,6 +116,8 @@ The first-party plugin ships an Agent Skill so Claude Code reaches for `hayven` 
 /hayvenhurst:install-binary
 ```
 
+Running the whole [Sothis](https://github.com/Davidb3l/Sothis) suite? Install Hayvenhurst through the suite marketplace instead (`/plugin marketplace add Davidb3l/Sothis`, then `/plugin install hayvenhurst@sothis`; `sirius@sothis` and `catryna@sothis` come from the same marketplace, and the `sothis` CLI does all of it for you). The standalone `hayvenhurst@hayvenhurst` route above stays valid; pick one, not both.
+
 Other agents can use the [MCP server, HTTP API, or CLI directly](docs/INTEGRATION.md).
 
 ## Performance

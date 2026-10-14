@@ -26,11 +26,13 @@
  * rebuild committed. That is why the handle stays open across `runIngest` (it
  * holds no transaction while doing so, so it does not block the writer).
  */
+import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 
 import type { ParsedArgs } from "../cli.ts";
 import { requireProject } from "./_shared.ts";
 import { runIngest } from "./ingest.ts";
+import { locateNativeBinary, NativeBinaryNotFound } from "../native/locate.ts";
 import { resolveWriteIndex } from "../db/branch_index.ts";
 import { Db } from "../db/queries.ts";
 import { REINDEX_PRESERVED_TABLES, dropDerived } from "../db/migrations.ts";
@@ -46,10 +48,48 @@ export interface ReindexDeps {
   ingest?: (args: ParsedArgs) => Promise<number>;
   /** Project root to resolve from, instead of `process.cwd()`. */
   cwd?: string;
+  /**
+   * Stand in for the pre-destruction native check (SOT-19b). Return `null` when
+   * the companion is usable, otherwise the error message to print. Defaults to
+   * the real locate + `--version` probe — except when `ingest` is stubbed, in
+   * which case the native binary is never run and the default is a no-op.
+   */
+  preflightNative?: (repoRoot: string) => string | null;
+}
+
+/**
+ * SOT-19b: prove the native companion can be located AND executed BEFORE
+ * anything is dropped. `reindex` is destructive (it clears the derived graph
+ * and marks the index broken); the follow-on ingest used to be the first thing
+ * to look for `hayven-native`, so a missing/unrunnable binary left an empty,
+ * marked-broken index. Returns an error message, or `null` when usable.
+ */
+export function preflightNativeBinary(repoRoot: string): string | null {
+  let binary: string;
+  try {
+    binary = locateNativeBinary({ repoRoot });
+  } catch (err) {
+    if (err instanceof NativeBinaryNotFound) return err.message;
+    return (err as Error).message;
+  }
+  const res = spawnSync(binary, ["--version"], {
+    encoding: "utf8",
+    timeout: 15_000,
+    windowsHide: true,
+  });
+  if (res.error !== undefined) {
+    return `the native companion at ${binary} could not be run: ${res.error.message}`;
+  }
+  if (res.status !== 0) {
+    return `the native companion at ${binary} failed its \`--version\` probe (exit ${String(res.status)}).`;
+  }
+  return null;
 }
 
 export async function runReindex(args: ParsedArgs, deps: ReindexDeps = {}): Promise<number> {
   const ingest = deps.ingest ?? runIngest;
+  const preflight =
+    deps.preflightNative ?? (deps.ingest !== undefined ? () => null : preflightNativeBinary);
   let ctx;
   try {
     ctx = requireProject(deps.cwd);
@@ -79,6 +119,18 @@ export async function runReindex(args: ParsedArgs, deps: ReindexDeps = {}): Prom
   if (!existsSync(sqlitePath)) {
     process.stdout.write("No existing index. Running full ingest...\n");
     return ingest({ positionals: [], flags: { ...args.flags, full: true } });
+  }
+
+  // SOT-19b: the native binary must be usable BEFORE we mark-and-drop. Nothing
+  // below this point may run if the follow-on ingest cannot possibly succeed.
+  const nativeProblem = preflight(ctx.paths.repoRoot);
+  if (nativeProblem !== null) {
+    process.stderr.write(
+      `error: cannot reindex — ${nativeProblem}\n` +
+        "The index was NOT touched (nothing was dropped). Install or build hayven-native " +
+        "(or set $HAYVEN_NATIVE_BIN) and re-run `hayven reindex`.\n",
+    );
+    return 1;
   }
 
   const db = new Db(sqlitePath);

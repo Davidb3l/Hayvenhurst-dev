@@ -16,11 +16,36 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
  * Falls back to `resolve` when the path doesn't exist yet (realpath throws on ENOENT).
  */
 export function canonicalRoot(p: string): string {
+  const abs = resolve(p);
   try {
-    return realpathSync(resolve(p));
+    // `.native` = the OS's own resolution. The JS-implemented `realpathSync`
+    // returns the CALLER'S spelling on Windows, so `c:/users/me/repo` and
+    // `C:\Users\Me\Repo` named one directory but canonicalised to two strings
+    // and registered as two projects (two writers on one WAL). The native call
+    // returns the on-disk casing and an uppercase drive letter.
+    return realpathSync.native(abs);
   } catch {
-    return resolve(p);
+    return abs;
   }
+}
+
+/**
+ * Comparison/hash form of {@link canonicalRoot}: identical, except lowercased on
+ * Windows, whose filesystems are case-insensitive. `canonicalRoot` alone cannot
+ * case-fold a path that does not exist yet (the native realpath throws ENOENT),
+ * so two spellings of a not-yet-created or offline root would still differ. Use
+ * this, never a raw `===` on two canonical roots, as the key for dedupe maps,
+ * "is this the same project" checks, and anything hashed. `platform` is
+ * injectable for tests.
+ */
+export function rootKey(p: string, platform: NodeJS.Platform = process.platform): string {
+  const c = canonicalRoot(p);
+  return platform === "win32" ? c.toLowerCase() : c;
+}
+
+/** True when two paths name the same project root (see {@link rootKey}). */
+export function sameRoot(a: string, b: string, platform: NodeJS.Platform = process.platform): boolean {
+  return rootKey(a, platform) === rootKey(b, platform);
 }
 
 export interface HayvenPaths {

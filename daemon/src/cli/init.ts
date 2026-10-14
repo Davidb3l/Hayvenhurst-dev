@@ -20,7 +20,7 @@ import { join, relative } from "node:path";
 import { DEFAULT_CONFIG } from "../config/defaults.ts";
 import { loadConfig, writeConfig } from "../config/load.ts";
 import { isRegistrableRoot, registerProject } from "../daemon/registry.ts";
-import { hotAddToRunningDaemon } from "./_shared.ts";
+import { hotAddToRunningDaemon, staleDaemonNote } from "./_shared.ts";
 import { Db } from "../db/queries.ts";
 import {
   countIndexableFiles,
@@ -370,7 +370,14 @@ export async function runInit(args: ParsedArgs): Promise<number> {
       const cfg = loadConfig(root).config;
       const hot = await hotAddToRunningDaemon(root, `http://${cfg.daemon_host}:${cfg.daemon_port}`);
       if (hot.kind === "added") {
-        process.stdout.write("  daemon:         added live to the running daemon (no restart needed)\n");
+        const stale = staleDaemonNote(hot.daemonVersion);
+        // "no restart needed" is only true when the daemon is this CLI's build.
+        process.stdout.write(
+          stale === null
+            ? "  daemon:         added live to the running daemon (no restart needed)\n"
+            : `  daemon:         added live to the running daemon (v${hot.daemonVersion})\n`,
+        );
+        if (stale !== null) process.stderr.write(`${stale}\n`);
       } else if (hot.kind === "foreign-home") {
         // A SKIP, not a failure. The daemon on this port keeps its global state
         // under a different home, so registering into it would put the row in a

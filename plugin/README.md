@@ -35,6 +35,25 @@ claude plugin install hayvenhurst@hayvenhurst
 `hayvenhurst@hayvenhurst` is `<plugin-name>@<marketplace-name>` — both are
 `hayvenhurst` here.
 
+### As part of the Sothis suite
+
+If you run the whole [Sothis](https://github.com/Davidb3l/Sothis) suite, install
+Hayvenhurst from the suite marketplace instead (pick one route, not both):
+
+```
+/plugin marketplace add Davidb3l/Sothis
+/plugin install hayvenhurst@sothis
+```
+
+```sh
+claude plugin marketplace add Davidb3l/Sothis
+claude plugin install hayvenhurst@sothis
+```
+
+`sirius@sothis` and `catryna@sothis` come from the same marketplace, and the
+`sothis` CLI installs the whole set. The standalone `hayvenhurst@hayvenhurst`
+route above keeps working.
+
 ## Two-step install: plugin, then binary
 
 Installing the plugin is **step 1 of 2**. A Claude Code plugin is distributed over

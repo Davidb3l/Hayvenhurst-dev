@@ -24,7 +24,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, w
 import { join } from "node:path";
 
 import { withFileLockSync } from "../util/file_lock.ts";
-import { canonicalRoot, type HayvenPaths } from "../util/paths.ts";
+import { canonicalRoot, rootKey, type HayvenPaths } from "../util/paths.ts";
 import { detectLinkedWorktree, revParsePathProbe } from "./git.ts";
 
 /** Hard cap on registered overlays per project. Each one is a full index copy. */
@@ -78,7 +78,7 @@ export function overlayNodesDir(paths: HayvenPaths, id: string): string {
  * `/private/tmp` on macOS hash the same), and filesystem-safe by construction.
  */
 export function overlayId(worktreePath: string): string {
-  return createHash("sha256").update(canonicalRoot(worktreePath)).digest("hex").slice(0, 12);
+  return createHash("sha256").update(rootKey(worktreePath)).digest("hex").slice(0, 12);
 }
 
 /** Thrown for a registry file we cannot parse; mutations refuse to clobber it. */

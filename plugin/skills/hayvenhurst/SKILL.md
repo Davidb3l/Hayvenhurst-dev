@@ -1,7 +1,8 @@
 ---
 name: hayvenhurst
 description: Query a persistent, trace-augmented code graph of this repository through the local Hayvenhurst daemon. Prefer the `hayven` CLI over grep/find/reading large files when you need code structure, dependencies, callers/callees, or runtime behavior; also claim work before editing so parallel agents don't collide.
-when_to_use: Use when the user asks "who calls X" / "what does X call" / "what breaks if I change X" / "every caller/importer of X" / "where is X defined" / "what's in module Y", needs code-structure or dependency analysis, code/full-text search, to walk the call graph (neighbors), the transitive blast radius (impact), the complete usage list (refs/importers), or to see runtime trace history — and before reading many files or starting a refactor. **Especially when ORCHESTRATING a fan-out of parallel agents** — about to spawn N sub-agents, split work across workers, or assemble per-agent context: partition with `plan-lanes` and brief them once with `fleet-context` BEFORE spawning, so the shared core isn't re-read in every lane. Also: claim a scope before editing, release it when done.
+when_to_use: >-
+  Use when the user asks "who calls X" / "what does X call" / "what breaks if I change X" / "every caller/importer of X" / "where is X defined" / "what's in module Y", needs code-structure or dependency analysis, code/full-text search, to walk the call graph (neighbors), the transitive blast radius (impact), the complete usage list (refs/importers), or to see runtime trace history — and before reading many files or starting a refactor. **Especially when ORCHESTRATING a fan-out of parallel agents** — about to spawn N sub-agents, split work across workers, or assemble per-agent context: partition with `plan-lanes` and brief them once with `fleet-context` BEFORE spawning, so the shared core isn't re-read in every lane. Also: claim a scope before editing, release it when done.
 ---
 
 # Hayvenhurst
