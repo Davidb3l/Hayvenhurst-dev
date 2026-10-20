@@ -616,12 +616,12 @@ mod tests {
         let mut matches = cursor.matches(&query, tree.root_node(), src);
         while let Some(m) = matches.next() {
             let name_node = m
-                .captures
+                .captures()
                 .iter()
                 .find(|c| Some(c.index) == name_idx)
                 .map(|c| c.node);
             let def_node = m
-                .captures
+                .captures()
                 .iter()
                 .find(|c| def_idxs.contains(&c.index))
                 .map(|c| c.node);

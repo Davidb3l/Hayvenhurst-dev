@@ -226,7 +226,7 @@ pub fn extract_file_opts(
             // We dispatch on capture id rather than pattern index so
             // re-ordering query.scm doesn't break us.
             let mut found: Option<(u32, &'static str)> = None;
-            for cap in m.captures.iter() {
+            for cap in m.captures().iter() {
                 if Some(cap.index) == cap_def_function {
                     found = Some((cap.index, "function"));
                     break;
@@ -276,12 +276,12 @@ pub fn extract_file_opts(
 
         // Find the corresponding name node within the same match.
         let def_node = m
-            .captures
+            .captures()
             .iter()
             .find(|c| c.index == def_capture)
             .map(|c| c.node);
         let name_node = m
-            .captures
+            .captures()
             .iter()
             .find(|c| Some(c.index) == cap_name)
             .map(|c| c.node);
@@ -427,7 +427,7 @@ pub fn extract_file_opts(
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&query, tree.root_node(), parse_source);
     while let Some(m) = matches.next() {
-        for cap in m.captures.iter() {
+        for cap in m.captures().iter() {
             if Some(cap.index) == cap_call {
                 // CommonJS `require("<string literal>")` is an IMPORT, not a
                 // call (JS-family grammars only). The `(call_expression) @call`
@@ -1798,7 +1798,7 @@ fn target_identifier(node: Node, source: &[u8]) -> Option<String> {
             if n == 0 {
                 return None;
             }
-            let last = node.named_child(n - 1)?;
+            let last = node.named_child(u32::try_from(n - 1).ok()?)?;
             target_identifier(last, source)
         }
         // Rust `Mod::foo` / `Mod::SubMod::foo` — last segment is the
