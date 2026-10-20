@@ -74,7 +74,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           # If workflow_dispatch, check out the requested tag; otherwise the
           # tag that triggered the workflow is already the ref.
@@ -92,7 +92,7 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3.0
+          bun-version: 1.4.3
 
       - name: Setup Rust toolchain (${{ matrix.rust_target }})
         uses: dtolnay/rust-toolchain@stable
@@ -240,7 +240,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
@@ -252,18 +252,27 @@ jobs:
           pattern: release-*
           merge-multiple: true
 
+      # The release body is this version's CHANGELOG.md section. The script fails
+      # the job (before anything is published) when the `## [X.Y.Z]` heading for
+      # the tag is missing or empty, so a release can no longer ship with another
+      # version's notes (v0.0.8 and v0.0.9 both published the v0.0.6 notes from a
+      # hard-coded file). The tag goes through env, not inline ${{ }} in the script.
+      - name: Extract release notes from CHANGELOG.md
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: bash ci/release-notes.sh "$RELEASE_TAG" > release-notes.md
+
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           name: ${{ inputs.tag || github.ref_name }}
-          # Auto-generate notes from CHANGELOG.md (latest section) and from
-          # commits since the previous tag. softprops uses GitHub's native
-          # generator when `generate_release_notes: true`.
+          # GitHub's generated notes (commits since the previous tag) are appended
+          # after the curated body: the CHANGELOG.md section for this exact version,
+          # extracted by the step above. No per-release path to bump.
           generate_release_notes: true
-          # Curated, user-facing notes for this version (not the full CHANGELOG).
-          # Bump this path when cutting a new version (or rename to a generic file).
-          body_path: docs/RELEASE_NOTES_v0.0.6.md
+          body_path: release-notes.md
           files: release-artifacts/*
           draft: false
           prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
