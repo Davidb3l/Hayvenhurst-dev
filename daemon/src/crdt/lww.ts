@@ -4,7 +4,7 @@
 // op whose key is greater; ties on the key are mathematically impossible by
 // the §11 monotonicity rule (an HLC counter never repeats for a single writer
 // and a writer ID is unique per replica).
-import { blake3 } from "@noble/hashes/blake3";
+import { blake3 } from "@noble/hashes/blake3.js";
 
 import {
   compareComposite,

@@ -9,9 +9,8 @@
     "jsx": "react-jsx",
     "jsxImportSource": "preact",
     "types": ["astro/client", "@types/bun"],
-    "baseUrl": ".",
     "paths": {
-      "~/*": ["src/*"]
+      "~/*": ["./src/*"]
     }
   },
   "include": ["src", "astro.config.mjs"],

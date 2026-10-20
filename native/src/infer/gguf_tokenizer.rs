@@ -326,7 +326,9 @@ fn build_unigram_tokenizer(vocab: &GgufVocab, arch: &ModelArch) -> Result<Tokeni
     let collapse_spaces =
         Replace::new(" {2,}", " ").map_err(|e| anyhow!("build space-collapse normalizer: {e}"))?;
     let normalizer = NormalizerSequence::new(vec![NormalizerWrapper::Replace(collapse_spaces)]);
-    tokenizer.with_normalizer(Some(normalizer));
+    tokenizer
+        .with_normalizer(Some(normalizer))
+        .map_err(|e| anyhow!("set normalizer: {e}"))?;
 
     // Pre-tokenizer + decoder: Metaspace with the '▁' marker. `split = true`
     // matches the HF Metaspace default used by from_spm.
@@ -403,7 +405,9 @@ fn build_unigram_tokenizer(vocab: &GgufVocab, arch: &ModelArch) -> Result<Tokeni
     // id; AddedToken (special=true) marks them special without changing ids.
     let specials = special_tokens(vocab);
     if !specials.is_empty() {
-        tokenizer.add_special_tokens(&specials);
+        tokenizer
+            .add_special_tokens(specials)
+            .map_err(|e| anyhow!("register special tokens: {e}"))?;
     }
 
     Ok(tokenizer)

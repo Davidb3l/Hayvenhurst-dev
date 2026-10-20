@@ -30,7 +30,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       # cosign 3.x (the installer's default here) is what can read
       # sigstore-python v3 bundles; without a verifier every step below would

@@ -24,9 +24,8 @@
     "isolatedModules": true,
     "allowJs": false,
     "types": [],
-    "baseUrl": ".",
     "paths": {
-      "@/*": ["src/*"]
+      "@/*": ["./src/*"]
     }
   },
   "include": ["src/**/*", "tests/**/*"],
