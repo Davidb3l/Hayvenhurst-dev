@@ -5,7 +5,7 @@
  * into SQLite (1000 records per transaction), resolves raw edge `dst_name`s to
  * entity IDs in a second pass, and writes markdown files in parallel.
  */
-import { blake3 } from "@noble/hashes/blake3";
+import { blake3 } from "@noble/hashes/blake3.js";
 
 import { EdgeResolver } from "./edgeResolver.ts";
 import type { CallSite, ImportAliasPair, RawEdgeWithChain } from "./edgeResolver.ts";

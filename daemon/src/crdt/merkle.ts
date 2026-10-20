@@ -28,7 +28,7 @@
 // inside `OpLog.segmentStat`). This also makes §15.1's implicit cache
 // invalidation correct without an explicit `invalidate()` hook (see BL-6).
 
-import { blake3 } from "@noble/hashes/blake3";
+import { blake3 } from "@noble/hashes/blake3.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
