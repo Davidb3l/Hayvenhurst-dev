@@ -4,6 +4,8 @@ All notable user-facing changes. The format follows [Keep a Changelog](https://k
 
 ## [Unreleased]
 
+## [0.0.10]
+
 - **Fixed: `hayven doctor --json` never carried the `gating` field (HD-7).** The check rows were `{name, ok, detail}` in 0.0.8, so a suite consumer could not tell an advisory row (`tier3_model`, `index_integrity`) from a broken-install row without hardcoding names. Every row now carries a boolean `gating`, and the envelope's `ok` is exactly the fold over the gating rows (a `gating:false` row can never drag it unhealthy). Additive; `schemaVersion` stays 1.
 - **Fixed (Windows): the compiled `hayven.exe` could not find its `hayven-native.exe` companion (SOT-19a).** Inside a `bun build --compile` exe `process.argv[1]` is the virtual `B:/~BUN/root/...` path, so the "sibling of the CLI" lookup searched a directory that does not exist. The real executable's directory (`dirname(process.execPath)`) is now searched, first when `argv[1]` is a compiled-virtual path. `doctor --json` from a copied-out `hayven.exe` + `hayven-native.exe` pair with a minimal `PATH` now reports `hayven_native` ok.
 - **Fixed: `hayven reindex` destroyed the index before checking that it could rebuild it (SOT-19b).** The native companion was first looked for by the follow-on ingest, AFTER the graph had been dropped and the index marked broken, so a missing or unrunnable `hayven-native` left an empty, broken index. Reindex now locates the binary and runs a `--version` probe first, and on failure exits 1 with the index untouched.

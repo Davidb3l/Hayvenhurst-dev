@@ -7,7 +7,7 @@
     },
     "daemon": {
       "name": "@hayvenhurst/daemon",
-      "version": "0.0.9",
+      "version": "0.0.10",
       "bin": {
         "hayven": "./src/cli.ts",
         "hayvend": "./src/cli.ts",
@@ -27,7 +27,7 @@
     },
     "viewer": {
       "name": "@hayvenhurst/viewer",
-      "version": "0.0.9",
+      "version": "0.0.10",
       "dependencies": {
         "@astrojs/preact": "^6.1.0",
         "astro": "^7.4.1",
